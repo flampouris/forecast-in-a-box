@@ -10,24 +10,28 @@
 
 /**
  * Best-effort mapping from backend block-level error strings to individual
- * config keys. The backend currently returns block errors as flat strings
- * (see backend/src/forecastbox/domain/blueprint/service.py), so the frontend
- * parses known message shapes to provide per-field UI highlights.
+ * config keys. The backend returns block errors as flat strings, so the
+ * frontend parses known message shapes to provide per-field UI highlights.
+ * Unknown-glyph references arrive structured (not as strings) and are
+ * attributed via the optional `missingGlyphs` parameter.
  */
-
-import {
-  containsGlyphs,
-  extractGlyphKey,
-} from '@/features/fable-builder/utils/glyph-display'
 
 export interface MappedBlockErrors {
   /** Field-level errors keyed by configuration option key. */
   byConfigKey: Record<string, Array<string>>
   /** Errors that could not be attributed to a specific field. */
   unmapped: Array<string>
+  /** Glyph names the backend rejected outright — defining them cannot succeed. */
+  invalidGlyphNames: Array<string>
 }
 
-const GLYPH_PATTERN = /\$\{(\w+)\}/g
+/** Pre-translated messages — callers resolve via i18next so this util stays pure. */
+export interface FieldErrorMessages {
+  unknownConfigKey: string
+  missingRequiredValue: string
+  unknownGlyph: (name: string) => string
+  jinjaReservedReference: (name: string) => string
+}
 
 /**
  * Parse a Python-style set-of-strings literal like `{'foo', 'bar'}` into
@@ -50,17 +54,8 @@ function parsePythonStringSet(input: string): Set<string> | null {
   return names.size > 0 ? names : null
 }
 
-/**
- * Return the set of glyph names referenced inside a config value
- * (e.g. `${runId}-foo` → {"runId"}).
- */
-function referencedGlyphs(value: string): Set<string> {
-  const names = new Set<string>()
-  if (!containsGlyphs(value)) return names
-  for (const match of value.matchAll(GLYPH_PATTERN)) {
-    names.add(extractGlyphKey(match[0]))
-  }
-  return names
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function pushError(
@@ -69,57 +64,52 @@ function pushError(
   message: string,
 ): void {
   const existing = (out as Record<string, Array<string> | undefined>)[configKey]
+  // Frontend and backend may both report an empty required value.
   if (existing) {
-    existing.push(message)
+    if (!existing.includes(message)) existing.push(message)
   } else {
     out[configKey] = [message]
   }
 }
 
 /**
- * Map block-level backend errors onto specific configuration keys.
+ * Map block-level backend errors and structured missing glyphs onto specific
+ * configuration keys.
  *
- * Recognised message shapes:
- * - "Unknown glyphs referenced: {'foo', 'bar'}" — each unknown glyph is
- *   attached to every config key whose value references it.
- * - "Block contains extra config: {'foo', 'bar'}" — attached as "Unknown
- *   configuration key" to each listed key.
- * - "Block contains missing config: {'foo', 'bar'}" — attached as
- *   "Missing required value" to each listed key.
+ * Recognised `errors` shapes:
+ * - "Block contains extra config: {...}" → messages.unknownConfigKey
+ * - "Block contains missing config: {...}" → messages.missingRequiredValue
+ * - "Configuration option 'x' is missing for block factory ..." or
+ *   "... 'x' cannot be empty" → messages.missingRequiredValue
+ * - "Invalid value for configuration option 'x': ..." → verbatim, on `x`
+ * - "Invalid glyph name: g (due to r); appears in [a, b]" → verbatim, on the
+ *   keys it names
+ * - "Jinja expression error: 'x' is undefined" → attributed to the config
+ *   keys whose value references `x` inside a `${...}` expression; when `x`
+ *   is jinja-reserved the clearer messages.jinjaReservedReference is shown
  *
- * Everything else is returned as `unmapped`.
+ * `missingGlyphs[configKey] = [name, ...]` → messages.unknownGlyph(name) per name.
+ * Missing-config errors for a key that also has unknown glyphs are dropped —
+ * the unresolvable glyph is the root cause and gets the one message.
+ * Anything else in `errors` is returned as `unmapped`.
  */
 export function mapBlockErrorsToFields(
   errors: ReadonlyArray<string>,
-  configurationValues: Record<string, string>,
+  missingGlyphs: Record<string, ReadonlyArray<string>>,
+  messages: FieldErrorMessages,
+  configurationValues: Record<string, string> = {},
+  isJinjaReserved?: (name: string) => boolean,
 ): MappedBlockErrors {
   const byConfigKey: Record<string, Array<string>> = {}
   const unmapped: Array<string> = []
+  const invalidGlyphNames: Array<string> = []
+  const keysWithUnknownGlyphs = new Set(
+    Object.entries(missingGlyphs)
+      .filter(([, names]) => names.length > 0)
+      .map(([key]) => key),
+  )
 
   for (const error of errors) {
-    const unknownGlyphs = error.match(/^Unknown glyphs referenced:\s*(.+)$/)
-    if (unknownGlyphs) {
-      const set = parsePythonStringSet(unknownGlyphs[1])
-      if (!set || set.size === 0) {
-        unmapped.push(error)
-        continue
-      }
-      let attributed = false
-      for (const [configKey, value] of Object.entries(configurationValues)) {
-        const refs = referencedGlyphs(value)
-        for (const name of refs) {
-          if (set.has(name)) {
-            pushError(byConfigKey, configKey, `Unknown glyph: \${${name}}`)
-            attributed = true
-          }
-        }
-      }
-      if (!attributed) {
-        unmapped.push(error)
-      }
-      continue
-    }
-
     const extraConfig = error.match(/^Block contains extra config:\s*(.+)$/)
     if (extraConfig) {
       const set = parsePythonStringSet(extraConfig[1])
@@ -128,7 +118,7 @@ export function mapBlockErrorsToFields(
         continue
       }
       for (const key of set) {
-        pushError(byConfigKey, key, 'Unknown configuration key')
+        pushError(byConfigKey, key, messages.unknownConfigKey)
       }
       continue
     }
@@ -141,13 +131,81 @@ export function mapBlockErrorsToFields(
         continue
       }
       for (const key of set) {
-        pushError(byConfigKey, key, 'Missing required value')
+        if (keysWithUnknownGlyphs.has(key)) continue
+        pushError(byConfigKey, key, messages.missingRequiredValue)
       }
       continue
+    }
+
+    const missingOption = error.match(
+      /^Configuration option '([^']+)' (?:is missing for block factory\b|cannot be empty)/,
+    )
+    if (missingOption) {
+      if (!keysWithUnknownGlyphs.has(missingOption[1])) {
+        pushError(byConfigKey, missingOption[1], messages.missingRequiredValue)
+      }
+      continue
+    }
+
+    const invalidValue = error.match(
+      /^Invalid value for configuration option '([^']+)':/,
+    )
+    if (invalidValue) {
+      pushError(byConfigKey, invalidValue[1], error)
+      continue
+    }
+
+    // Backend names the offending options, so no usage lookup is needed.
+    const invalidGlyphName = error.match(
+      /^Invalid glyph name: (\S+) .*appears in \[(.*)\]$/,
+    )
+    if (invalidGlyphName) {
+      invalidGlyphNames.push(invalidGlyphName[1])
+      const keys = invalidGlyphName[2]
+        .split(',')
+        .map((key) => key.trim())
+        .filter(Boolean)
+      if (keys.length > 0) {
+        for (const key of keys) pushError(byConfigKey, key, error)
+        continue
+      }
+    }
+
+    const jinjaUndefined = error.match(
+      /^Jinja expression error: '([^']+)' is undefined/,
+    )
+    if (jinjaUndefined) {
+      const name = jinjaUndefined[1]
+      // "undefined" is misleading when the name is unusable by construction.
+      const message = isJinjaReserved?.(name)
+        ? messages.jinjaReservedReference(name)
+        : error
+      // Attribute by usage: the message names the glyph but not the field.
+      const usage = new RegExp(`\\$\\{[^}]*\\b${escapeRegExp(name)}\\b[^}]*\\}`)
+      const keys = Object.entries(configurationValues)
+        .filter(([, value]) => usage.test(value))
+        .map(([key]) => key)
+      if (keys.length > 0) {
+        for (const key of keys) pushError(byConfigKey, key, message)
+        continue
+      }
+      if (isJinjaReserved?.(name)) {
+        unmapped.push(message)
+        continue
+      }
     }
 
     unmapped.push(error)
   }
 
-  return { byConfigKey, unmapped }
+  const invalid = new Set(invalidGlyphNames)
+  for (const [configKey, glyphNames] of Object.entries(missingGlyphs)) {
+    for (const name of glyphNames) {
+      // An invalid name is not merely unknown; its own error already says so.
+      if (invalid.has(name)) continue
+      pushError(byConfigKey, configKey, messages.unknownGlyph(name))
+    }
+  }
+
+  return { byConfigKey, unmapped, invalidGlyphNames }
 }

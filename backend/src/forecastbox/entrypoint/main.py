@@ -10,6 +10,12 @@
 """Entrypoint for the standalone fiab execution (frontend, backend and cascade spawned by a single process).
 Also used in case backend+cascade were launched by the OS as a service, in which case we only check the service
 for liveness and open the browser window here, with the rest logic happening in standalone.service
+
+The responsibility of this module is to spawn the backend process, and do post-start health checks and setup
+endpoint calls (like http call to install default plugins), and register sigterm handlers.
+
+The actual logic of instantiating the backend (the FastAPI app, the background threads, etc) happens in
+entrypoint/app.py, as it is coupled to FastAPI's API
 """
 
 import logging
@@ -19,6 +25,8 @@ import types
 import webbrowser
 from multiprocessing import Process, get_context
 
+import earthkit.data as ekd
+import httpx
 from fiab_core.fable import PluginCompositeId
 
 import forecastbox.entrypoint.bootstrap.service
@@ -35,9 +43,11 @@ logger = logging.getLogger(__name__ if __name__ != "__main__" else __package__)
 def launch_all(config: FIABConfig, attempts: int = 20) -> ChildProcessGroup:
     setup_process()
     logger.info("main process starting")
-    logger.debug(f"loaded config {config.model_dump()}")
+    logger.debug(f"loaded fiab config {config.model_dump()}")
+    ekd_config = repr(ekd.config).replace("\n", ", ")
+    logger.debug(f"loedad earthkit config {ekd_config}")
 
-    if not config.api.allow_service:
+    if not config.backend.allow_service:
         previous_cleanup()
         export_recursive(
             config.model_dump(exclude_defaults=True),
@@ -47,20 +57,19 @@ def launch_all(config: FIABConfig, attempts: int = 20) -> ChildProcessGroup:
         # TODO migrate to cascade_platform -- but we *need* forkserver for linux. Mind service.py here as well
         backend = get_context("forkserver").Process(target=launch_backend)
         backend.start()
-        handle = ChildProcessGroup([backend])
-        spawn_gateway = config.cascade.spawn_gateway
+        handle = ChildProcessGroup((backend,))
     else:
         if not forecastbox.entrypoint.bootstrap.service.is_running():
             raise ValueError("configured to use service, but is not running!")
-        handle = ChildProcessGroup([])
-        spawn_gateway = False
+        handle = ChildProcessGroup(())
 
-    check_backend_ready(config, handle, attempts, spawn_gateway)
+    check_backend_ready(config, handle, attempts)
     if should_install_default_plugin():
+        logger.debug("will install default plugins")
         install_default_plugins(config)
 
-    if config.general.launch_browser:
-        webbrowser.open(config.api.local_url())
+    if config.backend.launch_browser:
+        webbrowser.open(config.backend.local_url())
 
     return handle
 
@@ -72,6 +81,7 @@ if __name__ == "__main__":
     handles = launch_all(config)
 
     def sigterm_handler(_signo: int, _stack_frame: types.FrameType | None) -> None:
+        # when receiving sigterm, we need to explicitly propagate it, otherwise we'd get zombies
         handles.shutdown()
         sys.exit(0)
 
@@ -80,4 +90,5 @@ if __name__ == "__main__":
         handles.wait()
     except KeyboardInterrupt:
         logger.info("keyboard interrupt, application shutting down")
+        # NOTE the Keyboard Interrupt propagates to all subprocesses, we dont really need to do anything except await them
         handles.wait()

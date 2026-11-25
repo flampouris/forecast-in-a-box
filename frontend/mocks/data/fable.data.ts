@@ -19,6 +19,7 @@
  */
 
 import type {
+  BlockExpansion,
   BlockFactory,
   BlockFactoryCatalogue,
   FableBuilderV1,
@@ -26,6 +27,12 @@ import type {
 } from '@/api/types/fable.types'
 import type { PluginCompositeId } from '@/api/types/plugins.types'
 import { getFactory } from '@/api/types/fable.types'
+import {
+  closedEnum,
+  gridType,
+  openEnum,
+  serializeValueType,
+} from '@/components/base/fields/fable-type'
 
 /**
  * Helper to create a PluginCompositeId
@@ -45,43 +52,88 @@ export const mockCatalogue: BlockFactoryCatalogue = {
   // ECMWF base plugin - matches live backend exactly
   ['ecmwf/ecmwf-base']: {
     factories: {
-      ekdSource: {
+      operationalForecastSource: {
         kind: 'source',
-        title: 'Earthkit Data Source',
-        description: 'Fetch data from mars or ecmwf open data',
+        title: 'Operational forecast source',
+        description:
+          'Fetch operational forecast data from mars or ecmwf open data',
         configuration_options: {
           source: {
             title: 'Source',
             description: 'Top level source for earthkit data',
-            value_type: "enum['mars', 'ecmwf-open-data']",
+            value_type: serializeValueType(
+              closedEnum(['mars', 'ecmwf-open-data']),
+            ),
           },
-          date: {
-            title: 'Date',
-            description: 'The date dimension of the data',
-            value_type: 'date-iso8601',
+          forecast: {
+            title: 'Forecast model',
+            description: 'Name of forecast',
+            value_type: serializeValueType(closedEnum(['aifs-ens', 'ifs-ens'])),
+            default_value: 'aifs-ens',
           },
-          expver: {
-            title: 'Expver',
-            description: 'The expver value of the forecast',
-            value_type: 'str',
+          base_time: {
+            title: 'Base time',
+            description: 'Base time of the forecast',
+            value_type: 'datetime',
           },
         },
         inputs: [],
+      },
+      select: {
+        kind: 'transform',
+        title: 'Select',
+        description: 'Select values from one dimension of the input dataset',
+        configuration_options: {
+          dimension: {
+            title: 'Dimension',
+            description: 'Dimension to select from the dataset',
+            value_type: 'str',
+          },
+          values: {
+            title: 'Values',
+            description: 'Values to select from the chosen dimension',
+            value_type: 'list[str]',
+          },
+        },
+        inputs: ['dataset'],
+      },
+      // ecmwf#667, title and texts verbatim.
+      geographicalTransform: {
+        kind: 'transform',
+        title: 'Geographical Transform',
+        description: 'Transform the data to a different grid or area',
+        configuration_options: {
+          grid: {
+            title: 'Grid',
+            description:
+              "Regrid data to:\n- a resolution in degrees such as '0.25'\n- a west-east/south-north pair such as '0.25/0.5'\n- a Gaussian grid such as 'O96', 'N320' or 'F80'\n- auto: no regridding",
+            value_type: serializeValueType(
+              openEnum(
+                ['auto', '0.25', '0.5', '1', 'O96', 'O320', 'N320'],
+                gridType,
+              ),
+            ),
+            default_value: 'auto',
+          },
+          domain: {
+            title: 'Domain',
+            description:
+              'Area the data is cut out to: everything outside the area is dropped for all downstream blocks.\n- auto or global: no cut-out\n- named regions/countries: the smallest lat/lon box containing all of them\n- a drawn bounding box',
+            value_type: 'geodomain',
+            default_value: 'auto',
+          },
+        },
+        inputs: ['dataset'],
       },
       ensembleStatistics: {
         kind: 'product',
         title: 'Ensemble Statistics',
         description: 'Computes ensemble mean or standard deviation',
         configuration_options: {
-          variable: {
-            title: 'Variable',
-            description: "Variable name like '2t'",
-            value_type: 'str',
-          },
           statistic: {
             title: 'Statistic',
             description: 'Statistic to compute over the ensemble',
-            value_type: "enum['mean', 'std']",
+            value_type: serializeValueType(closedEnum(['mean', 'std'])),
           },
         },
         inputs: ['dataset'],
@@ -91,15 +143,17 @@ export const mockCatalogue: BlockFactoryCatalogue = {
         title: 'Temporal Statistics',
         description: 'Computes temporal statistics',
         configuration_options: {
-          variable: {
-            title: 'Variable',
-            description: "Variable name like '2t'",
+          param: {
+            title: 'param',
+            description: "Param name like '2t'",
             value_type: 'str',
           },
           statistic: {
             title: 'Statistic',
             description: 'Statistic to compute over steps',
-            value_type: "enum['mean', 'std', 'min', 'max']",
+            value_type: serializeValueType(
+              closedEnum(['mean', 'std', 'min', 'max']),
+            ),
           },
         },
         inputs: ['dataset'],
@@ -113,6 +167,91 @@ export const mockCatalogue: BlockFactoryCatalogue = {
             title: 'Zarr Path',
             description: 'Filesystem path where the zarr should be written',
             value_type: 'str',
+          },
+        },
+        inputs: ['dataset'],
+      },
+      mapPlotSink: {
+        kind: 'sink',
+        title: 'Map Plot',
+        description: 'Render a geographic map using earthkit-plots',
+        configuration_options: {
+          param: {
+            title: 'Parameters',
+            description: "Parameters to select and plot (e.g. '2t', 'msl')",
+            value_type: 'list[param]',
+          },
+          domain: {
+            title: 'Domain',
+            description: 'Area to display: auto, global, or a named region',
+            value_type: 'geodomain',
+          },
+          format: {
+            title: 'Format',
+            description: 'Output image format',
+            value_type: serializeValueType(closedEnum(['png', 'pdf', 'svg'])),
+          },
+          groupby: {
+            title: 'Group By',
+            description: 'Dimension to create subplots over',
+            value_type: serializeValueType(
+              closedEnum(['valid_datetime', 'step', 'number', 'none']),
+            ),
+          },
+          splitby: {
+            title: 'Split By',
+            description: 'Dimensions to separate plots by',
+            value_type: 'list[str]',
+          },
+        },
+        inputs: ['dataset'],
+      },
+    },
+  },
+  // Second plugin whose titles clash with ecmwf-base.
+  ['demo/demo-plots']: {
+    factories: {
+      mapPlot: {
+        kind: 'sink',
+        title: 'Map Plot',
+        description: 'Quick-look map from the demo plugin',
+        configuration_options: {
+          param: {
+            title: 'Parameters',
+            description: "Parameters to plot (e.g. '2t')",
+            value_type: 'list[str]',
+          },
+        },
+        inputs: ['dataset'],
+      },
+      select: {
+        kind: 'transform',
+        title: 'Select',
+        description: 'Demo variant of the select transform',
+        configuration_options: {
+          dimension: {
+            title: 'Dimension',
+            description: 'Dimension to select from the dataset',
+            value_type: 'str',
+          },
+        },
+        inputs: ['dataset'],
+      },
+      histogram: {
+        kind: 'product',
+        title: 'Histogram',
+        description: 'Value distribution of a field',
+        configuration_options: {
+          // Mirrors fiab-plugin-ecmwf's AnemoiSource.ENSEMBLE: a trait-bearing
+          // int (`int{positive}`), to exercise the traits suffix in the fable
+          // type grammar. The trait itself is not yet surfaced in the UI.
+          // No test builds a 'histogram' block, so adding this required
+          // option here cannot break existing fixtures.
+          bins: {
+            title: 'Bins',
+            description: 'Number of histogram bins',
+            value_type: 'int{positive}',
+            default_value: '10',
           },
         },
         inputs: ['dataset'],
@@ -173,6 +312,18 @@ export function getBlocksByKind(
   return result
 }
 
+/** resolveDisplay strings per GRIB param id. */
+export const mockParamDisplays: Record<string, string> = {
+  '129': 'Geopotential [m**2 s**-2] (z)',
+  '130': 'Temperature [K] (t)',
+  '151': 'Mean sea level pressure [Pa] (msl)',
+  '165': '10 metre U wind component [m s**-1] (10u)',
+  '166': '10 metre V wind component [m s**-1] (10v)',
+  '167': '2 metre temperature [K] (2t)',
+  '168': '2 metre dewpoint temperature [K] (2d)',
+  '228': 'Total precipitation [m] (tp)',
+}
+
 /**
  * Mock saved fables with new PluginBlockFactoryId format
  */
@@ -193,12 +344,12 @@ export const mockSavedFables: Record<
         block_source_1: {
           factory_id: {
             plugin: pluginId('ecmwf', 'ecmwf-base'),
-            factory: 'ekdSource',
+            factory: 'operationalForecastSource',
           },
           configuration_values: {
             source: 'mars',
-            date: '2024-01-15',
-            expver: '0001',
+            forecast: 'aifs-ens',
+            base_time: '2024-01-15T00:00:00',
           },
           input_ids: {},
         },
@@ -208,7 +359,7 @@ export const mockSavedFables: Record<
             factory: 'ensembleStatistics',
           },
           configuration_values: {
-            variable: '2t',
+            param: '2t',
             statistic: 'mean',
           },
           input_ids: {
@@ -232,8 +383,8 @@ export const mockSavedFables: Record<
     name: 'European Temperature Forecast',
     tags: ['europe', 'temperature', 'daily'],
     user_id: 'user-123',
-    created_at: '2024-01-10T10:00:00Z',
-    updated_at: '2024-01-15T14:30:00Z',
+    created_at: '2024-01-10 10:00:00+00:00',
+    updated_at: '2024-01-15 14:30:00+00:00',
   },
 
   'fable-002': {
@@ -242,12 +393,12 @@ export const mockSavedFables: Record<
         block_source_1: {
           factory_id: {
             plugin: pluginId('ecmwf', 'ecmwf-base'),
-            factory: 'ekdSource',
+            factory: 'operationalForecastSource',
           },
           configuration_values: {
             source: 'ecmwf-open-data',
-            date: '2024-01-14',
-            expver: '0001',
+            forecast: 'aifs-ens',
+            base_time: '2024-01-14T00:00:00',
           },
           input_ids: {},
         },
@@ -268,8 +419,8 @@ export const mockSavedFables: Record<
     name: 'Open Data Archive',
     tags: ['open-data', 'archive'],
     user_id: 'user-123',
-    created_at: '2024-01-12T08:00:00Z',
-    updated_at: '2024-01-12T08:00:00Z',
+    created_at: '2024-01-12 08:00:00+00:00',
+    updated_at: '2024-01-12 08:00:00+00:00',
   },
 }
 
@@ -282,28 +433,73 @@ export function calculateExpansion(fable: FableBuilderV1): {
   global_errors: Array<string>
   block_errors: Record<string, Array<string>>
   possible_sources: Array<PluginBlockFactoryId>
-  possible_expansions: Record<string, Array<PluginBlockFactoryId>>
+  possible_expansions: Record<string, Array<BlockExpansion>>
+  resolved_configuration_options: Record<string, Record<string, string>>
+  missing_glyphs: Record<string, Record<string, Array<string>>>
 } {
   const block_errors: Record<string, Array<string>> = {}
-  const possible_expansions: Record<string, Array<PluginBlockFactoryId>> = {}
+  const possible_expansions: Record<string, Array<BlockExpansion>> = {}
+  const resolved_configuration_options: Record<
+    string,
+    Record<string, string>
+  > = {}
+  const localGlyphs = fable.local_glyphs ?? {}
 
   // Available blocks by kind (using new PluginCompositeId format)
-  // Only ecmwf-base plugin is loaded
   const sourceBlocks: Array<PluginBlockFactoryId> = [
-    { plugin: pluginId('ecmwf', 'ecmwf-base'), factory: 'ekdSource' },
+    {
+      plugin: pluginId('ecmwf', 'ecmwf-base'),
+      factory: 'operationalForecastSource',
+    },
   ]
-  const productBlocks: Array<PluginBlockFactoryId> = [
+  const qubedBlocks: Array<BlockExpansion> = [
+    {
+      plugin: pluginId('ecmwf', 'ecmwf-base'),
+      factory: 'select',
+      restrictions: {},
+    },
+    {
+      plugin: pluginId('ecmwf', 'ecmwf-base'),
+      factory: 'geographicalTransform',
+      restrictions: {},
+    },
     {
       plugin: pluginId('ecmwf', 'ecmwf-base'),
       factory: 'ensembleStatistics',
+      restrictions: {},
     },
     {
       plugin: pluginId('ecmwf', 'ecmwf-base'),
       factory: 'temporalStatistics',
+      restrictions: {},
+    },
+    {
+      plugin: pluginId('demo', 'demo-plots'),
+      factory: 'select',
+      restrictions: {},
+    },
+    {
+      plugin: pluginId('demo', 'demo-plots'),
+      factory: 'histogram',
+      restrictions: {},
     },
   ]
-  const sinkBlocks: Array<PluginBlockFactoryId> = [
-    { plugin: pluginId('ecmwf', 'ecmwf-base'), factory: 'zarrSink' },
+  const sinkBlocks: Array<BlockExpansion> = [
+    {
+      plugin: pluginId('ecmwf', 'ecmwf-base'),
+      factory: 'zarrSink',
+      restrictions: {},
+    },
+    {
+      plugin: pluginId('ecmwf', 'ecmwf-base'),
+      factory: 'mapPlotSink',
+      restrictions: {},
+    },
+    {
+      plugin: pluginId('demo', 'demo-plots'),
+      factory: 'mapPlot',
+      restrictions: {},
+    },
   ]
 
   for (const [blockId, instance] of Object.entries(fable.blocks)) {
@@ -319,11 +515,13 @@ export function calculateExpansion(fable: FableBuilderV1): {
       continue
     }
 
-    // Check for missing required config
-    for (const configKey of Object.keys(factory.configuration_options)) {
-      const value = instance.configuration_values[configKey]
-      if (!value || value.trim() === '') {
-        errors.push(`Missing required configuration: ${configKey}`)
+    // Empty closed enums fail like the backend; other fields stay lenient.
+    for (const [key, option] of Object.entries(factory.configuration_options)) {
+      const value = instance.configuration_values[key] ?? ''
+      if (value === '' && option.value_type.startsWith('enumClosed')) {
+        errors.push(
+          `Invalid value for configuration option '${key}': expected ${option.value_type}. '' is not a valid option`,
+        )
       }
     }
 
@@ -342,9 +540,25 @@ export function calculateExpansion(fable: FableBuilderV1): {
       block_errors[blockId] = errors
     }
 
-    // Calculate possible expansions based on block kind
-    if (factory.kind === 'source') {
-      possible_expansions[blockId] = productBlocks
+    // Substitute `${name}` from local_glyphs like the backend; unresolved stay put.
+    const resolvedForBlock: Record<string, string> = {}
+    for (const [optionId, value] of Object.entries(
+      instance.configuration_values,
+    )) {
+      if (!value.includes('${')) continue
+      const substituted = value.replace(
+        /\$\{\s*(\w+)[^}]*\}/g,
+        (match, name: string) => localGlyphs[name] ?? match,
+      )
+      if (substituted !== value) resolvedForBlock[optionId] = substituted
+    }
+    if (Object.keys(resolvedForBlock).length > 0) {
+      resolved_configuration_options[blockId] = resolvedForBlock
+    }
+
+    // Like the backend: sinks may follow any block with an output.
+    if (factory.kind === 'source' || factory.kind === 'transform') {
+      possible_expansions[blockId] = [...qubedBlocks, ...sinkBlocks]
     } else if (factory.kind === 'product') {
       possible_expansions[blockId] = sinkBlocks
     }
@@ -355,5 +569,7 @@ export function calculateExpansion(fable: FableBuilderV1): {
     block_errors,
     possible_sources: sourceBlocks,
     possible_expansions,
+    resolved_configuration_options,
+    missing_glyphs: {},
   }
 }

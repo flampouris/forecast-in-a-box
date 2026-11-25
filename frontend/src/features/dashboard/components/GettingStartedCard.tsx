@@ -14,8 +14,13 @@
  * Individual card for getting started options
  */
 
+import { useTranslation } from 'react-i18next'
 import type { ReactNode } from 'react'
+import type { FableBuilderV1 } from '@/api/types/fable.types'
+import { FableMiniFlow } from '@/features/journal/components/FableMiniFlow'
+import { FileDropOverlay } from '@/components/base/FileDropOverlay'
 import { H3, P } from '@/components/base/typography'
+import { useFileDrop } from '@/hooks/useFileDrop'
 import {
   Tooltip,
   TooltipContent,
@@ -28,12 +33,21 @@ interface GettingStartedCardProps {
   title: string
   description: string
   tags: Array<string>
+  /** Accessible name; without it the whole subtree is read out on focus. */
+  ariaLabel?: string
+  testId?: string
   isRecommended?: boolean
   disabled?: boolean
   disabledMessage?: string
   iconColor?: string
   borderColor?: string
+  /** When provided, renders a colour mini-flow preview under the description. */
+  previewFable?: FableBuilderV1
   onClick?: () => void
+  /** When provided, a file dropped on the card is handed over. */
+  onFileDrop?: (file: File) => void
+  /** Shown over the card while a file is dragged over it. */
+  dropLabel?: string
 }
 
 export function GettingStartedCard({
@@ -41,19 +55,37 @@ export function GettingStartedCard({
   title,
   description,
   tags,
+  ariaLabel,
+  testId,
   isRecommended = false,
   disabled = false,
   disabledMessage,
   iconColor = 'bg-primary/10 text-primary',
   borderColor = 'border-border hover:border-blue-400',
+  previewFable,
   onClick,
+  onFileDrop,
+  dropLabel,
 }: GettingStartedCardProps) {
+  const { t } = useTranslation('dashboard')
+  const { isDragOver, dropHandlers } = useFileDrop(
+    disabled ? undefined : onFileDrop,
+  )
   const card = (
     <div
       role="button"
+      aria-label={ariaLabel}
+      data-testid={testId}
       tabIndex={disabled ? -1 : 0}
       onClick={disabled ? undefined : onClick}
-      onKeyDown={(e) => !disabled && e.key === 'Enter' && onClick?.()}
+      {...dropHandlers}
+      onKeyDown={(e) => {
+        if (disabled) return
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault() // Space scrolls the page by default
+          onClick?.()
+        }
+      }}
       className={cn(
         'relative flex h-full flex-col rounded-lg border p-5 transition-colors',
         'bg-card',
@@ -63,11 +95,13 @@ export function GettingStartedCard({
           : isRecommended
             ? 'border-2 border-primary/20 bg-muted/50 hover:border-primary'
             : borderColor,
+        isDragOver && 'border-dashed border-primary',
       )}
     >
+      {isDragOver && dropLabel && <FileDropOverlay label={dropLabel} />}
       {isRecommended && (
         <div className="absolute top-4 right-4 rounded-full bg-primary px-2 py-0.5 text-[10px] font-bold text-primary-foreground">
-          Recommended
+          {t('gettingStarted.recommended')}
         </div>
       )}
 
@@ -81,16 +115,23 @@ export function GettingStartedCard({
       </div>
 
       <H3 className="mb-2 text-base font-bold">{title}</H3>
-      <P className="mb-4 leading-relaxed text-muted-foreground">
+      {/* Clamped so plugin-authored copy of any length keeps the grid aligned. */}
+      <P className="mb-4 line-clamp-2 leading-relaxed text-muted-foreground">
         {description}
       </P>
+
+      {previewFable && !disabled && (
+        <div className="mb-4">
+          <FableMiniFlow builder={previewFable} monochrome={false} />
+        </div>
+      )}
 
       <div className="mt-auto flex flex-wrap gap-2">
         {tags.map((tag) => (
           <span
             key={tag}
             className={cn(
-              'rounded px-2 py-1 text-sm text-muted-foreground',
+              'rounded-md px-2 py-1 text-sm text-muted-foreground',
               isRecommended
                 ? 'border border-border bg-card dark:bg-card'
                 : 'bg-muted',

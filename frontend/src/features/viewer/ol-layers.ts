@@ -1,0 +1,331 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * OpenLayers layer factories and constants shared by the WMS viewers.
+ *
+ * INVARIANTS (breaking these silently kills swipe clipping and PNG export):
+ * - Never set `className` on any layer. All canvas-renderer layers must
+ *   share OL's single composited canvas — the compare viewer's
+ *   prerender/postrender clipping and `querySelector('canvas')` PNG export
+ *   both rely on it.
+ * - Data/WMS sources keep `hidpi: false, ratio: 1, crossOrigin: 'anonymous'`
+ *   (see makeDataLayerSource for why).
+ */
+
+import ImageLayer from 'ol/layer/Image'
+import { HALF_SIZE } from 'ol/proj/epsg3857'
+import ImageWMS from 'ol/source/ImageWMS'
+import { toWmsEndpoint } from './wms-capabilities'
+import type { LoadFunction } from 'ol/Image'
+import type { Extent } from 'ol/extent'
+import type LayerGroup from 'ol/layer/Group'
+import type Projection from 'ol/proj/Projection'
+import type VectorTileLayer from 'ol/layer/VectorTile'
+import type { ViewerProjection } from './projections'
+import {
+  CARTO_DARK_MATTER_STYLE_URL,
+  CARTO_POSITRON_STYLE_URL,
+  makeVectorBasemapLayer,
+} from '@/lib/map/ol-basemap'
+
+// External web basemap (Carto vector); the SkinnyWMS native basemap is separate.
+export interface ExternalBasemapOption {
+  type: 'vector'
+  id: string
+  labelKey: BasemapLabelKey
+  // Mapbox-style JSON URL; ol-mapbox-style fetches it, builds the
+  // source from its `sources` block, and applies styling.
+  styleUrl: string
+  /** Dark-theme variant; absent = `styleUrl` in both themes. */
+  darkStyleUrl?: string
+}
+
+/** `visualise`-namespace keys — resolved with `t()` at render. */
+type BasemapLabelKey =
+  'basemaps.cartoPositron' | 'basemaps.outline' | 'basemaps.skinnywms'
+
+// SkinnyWMS's own map — `background` as the base, borders overlaid.
+export interface SkinnyWmsBasemapOption {
+  type: 'skinnywms'
+  id: string
+  labelKey: BasemapLabelKey
+}
+
+// Bundled coast/border strokes + graticule — any projection, offline.
+export interface OutlineBasemapOption {
+  type: 'outline'
+  id: string
+  labelKey: BasemapLabelKey
+}
+
+export type BasemapOption =
+  ExternalBasemapOption | OutlineBasemapOption | SkinnyWmsBasemapOption
+
+/** Web-Mercator tile basemaps need a Mercator view. */
+export function basemapFitsProjection(
+  opt: BasemapOption,
+  projection: ViewerProjection,
+): boolean {
+  return opt.type !== 'vector' || projection.mercator
+}
+
+// Satellite-imagery basemaps removed pending licensing review — the
+// wms-image machinery lives in git history.
+export const BASEMAPS: ReadonlyArray<ExternalBasemapOption> = [
+  {
+    type: 'vector',
+    id: 'carto-positron-vector',
+    labelKey: 'basemaps.cartoPositron',
+    styleUrl: CARTO_POSITRON_STYLE_URL,
+    darkStyleUrl: CARTO_DARK_MATTER_STYLE_URL,
+  },
+]
+
+// Fixed identity; the actual layers come from the lens capabilities.
+export const SKINNYWMS_BASEMAP: SkinnyWmsBasemapOption = {
+  type: 'skinnywms',
+  id: 'skinnywms-native',
+  labelKey: 'basemaps.skinnywms',
+}
+
+export const OUTLINE_BASEMAP: OutlineBasemapOption = {
+  type: 'outline',
+  id: 'outline',
+  labelKey: 'basemaps.outline',
+}
+
+export const DEFAULT_BASEMAP_ID = BASEMAPS[0].id
+export const DEFAULT_LAYER_OPACITY = 0.85
+// SkinnyWMS border overlay sits above every data layer.
+export const REFERENCE_OVERLAY_Z = 1000
+
+/** What a freshly built map mounts: Carto, or Outline off-Mercator. */
+export function defaultBasemapFor(projection: ViewerProjection): BasemapOption {
+  return projection.mercator ? BASEMAPS[0] : OUTLINE_BASEMAP
+}
+
+export type ExternalBasemapLayer = VectorTileLayer
+export type BasemapLayer =
+  ExternalBasemapLayer | LayerGroup | ImageLayer<ImageWMS>
+
+/** The style URL for the app theme. */
+export function vectorStyleUrl(
+  opt: ExternalBasemapOption,
+  theme: 'light' | 'dark',
+): string {
+  return theme === 'dark' ? (opt.darkStyleUrl ?? opt.styleUrl) : opt.styleUrl
+}
+
+export function makeBasemapLayer(
+  opt: ExternalBasemapOption,
+  theme: 'light' | 'dark',
+): ExternalBasemapLayer {
+  return makeVectorBasemapLayer(vectorStyleUrl(opt, theme))
+}
+
+/**
+ * ImageWMS source for lens data layers (and SkinnyWMS decoration layers).
+ * Single-image mode (vs. TileWMS) so OL atomically swaps to the new image
+ * when params change — avoids the staggered per-tile sweep that flickers
+ * during time-slider scrubbing.
+ *
+ * hidpi: false keeps Magics-rendered symbols (wind barbs, contour widths,
+ * isobar labels) at full visual size on retina — the default 2× DPI request
+ * halves them. ratio: 1 disables the 1.5× pan-slack oversampling for cleaner
+ * cache keys. crossOrigin: 'anonymous' keeps the shared canvas untainted so
+ * PNG export works.
+ */
+/** Decode failure → error state for real load failures. */
+const FAILED_IMAGE_SRC = 'data:image/gif;base64,invalid'
+
+/** Valid 1×1 transparent PNG — settles superseded wrappers as LOADED. */
+const BLANK_IMAGE_SRC =
+  'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+
+/** The GetMap URL a load was issued for — `img.src` becomes a blob URL. */
+export function loadRequestUrl(img: unknown): string | null {
+  return img instanceof HTMLImageElement
+    ? (img.dataset.fiabRequestUrl ?? null)
+    : null
+}
+
+/** Did this load settle as a superseded (aborted) request? */
+export function loadWasAborted(img: unknown): boolean {
+  return img instanceof HTMLImageElement && img.dataset.fiabAborted === '1'
+}
+
+/** BBOX bounds per CRS as [minX, minY, maxX, maxY] in request axis order. */
+function crsBounds(
+  crs: string,
+  version: string,
+): [number, number, number, number] | null {
+  switch (crs.toUpperCase()) {
+    case 'EPSG:3857':
+    case 'EPSG:900913':
+      return [-HALF_SIZE, -HALF_SIZE, HALF_SIZE, HALF_SIZE]
+    case 'EPSG:4326':
+      return version.startsWith('1.3')
+        ? [-90, -180, 90, 180]
+        : [-180, -90, 180, 90]
+    case 'CRS:84':
+      return [-180, -90, 180, 90]
+    default:
+      return null
+  }
+}
+
+/** Trims a GetMap BBOX to its CRS bounds; whole-pixel rounding can push a
+ *  world-clamped box past +-180, which SkinnyWMS draws wrapped or blank. */
+export function clampGetMapBbox(src: string): string {
+  const param = (name: string) =>
+    new RegExp(`([?&]${name}=)([^&]*)`, 'i').exec(src)
+  const bbox = param('BBOX')
+  const crs = param('CRS') ?? param('SRS')
+  if (!bbox || !crs) return src
+  const version = decodeURIComponent(param('VERSION')?.[2] ?? '1.3.0')
+  const bounds = crsBounds(decodeURIComponent(crs[2]), version)
+  const values = decodeURIComponent(bbox[2]).split(',').map(Number)
+  if (!bounds || values.length !== 4 || !values.every(Number.isFinite)) {
+    return src
+  }
+  const clamped = values.map((v, i) =>
+    Math.min(Math.max(v, bounds[i % 2]), bounds[(i % 2) + 2]),
+  )
+  if (clamped.every((v, i) => v === values[i])) return src
+  return (
+    src.slice(0, bbox.index) +
+    bbox[1] +
+    encodeURIComponent(clamped.join(',')) +
+    src.slice(bbox.index + bbox[0].length)
+  )
+}
+
+/** Transient proxy answers worth another try. */
+const RETRY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504])
+/** Backoff before each GetMap retry. */
+const RETRY_DELAYS_MS = [300, 1000] as const
+
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason)
+      return
+    }
+    const timer = window.setTimeout(resolve, ms)
+    signal.addEventListener(
+      'abort',
+      () => {
+        window.clearTimeout(timer)
+        reject(signal.reason)
+      },
+      { once: true },
+    )
+  })
+}
+
+/** Retries network errors and transient statuses until superseded. */
+async function fetchWithRetry(
+  url: string,
+  signal: AbortSignal,
+): Promise<Response> {
+  for (let attempt = 0; ; attempt++) {
+    const retriesLeft = attempt < RETRY_DELAYS_MS.length
+    try {
+      const res = await fetch(url, { signal })
+      if (res.ok || !RETRY_STATUSES.has(res.status) || !retriesLeft) {
+        return res
+      }
+    } catch (err) {
+      if (signal.aborted || !retriesLeft) throw err
+    }
+    await abortableDelay(RETRY_DELAYS_MS[attempt], signal)
+  }
+}
+
+/** Fetch-based GetMap loader: a superseded request (pan/zoom/scrub) aborts
+ *  the previous one — at most one in flight per source, always the latest. */
+export function cancellingImageLoader(): LoadFunction {
+  let inFlight: AbortController | null = null
+  return (image, src) => {
+    inFlight?.abort()
+    const controller = new AbortController()
+    inFlight = controller
+    const img = image.getImage() as HTMLImageElement
+    img.dataset.fiabRequestUrl = src
+    delete img.dataset.fiabAborted
+    fetchWithRetry(clampGetMapBbox(src), controller.signal)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`GetMap ${res.status}`)
+        const blob = await res.blob()
+        const url = URL.createObjectURL(blob)
+        const revoke = () => URL.revokeObjectURL(url)
+        img.addEventListener('load', revoke, { once: true })
+        img.addEventListener('error', revoke, { once: true })
+        img.src = url
+      })
+      .catch(() => {
+        if (controller.signal.aborted) {
+          // Superseded. The source already replaced this wrapper, but OL
+          // keeps `source.loading` true (blocking rendercomplete and the
+          // panel loading counters) until it settles — settle it as a
+          // blank LOADED pixel (an error src would console.error inside
+          // OL), flagged so load accounting ignores it.
+          img.dataset.fiabAborted = '1'
+          img.src = BLANK_IMAGE_SRC
+          return
+        }
+        img.src = FAILED_IMAGE_SRC
+      })
+  }
+}
+
+export function makeDataLayerSource(
+  baseUrl: string,
+  params: Record<string, string>,
+  /** Request-side projection twin (BBOX axis order); default: the view's. */
+  projection?: Projection,
+): ImageWMS {
+  return new ImageWMS({
+    // OL appends its own params with the correct separator, so full
+    // endpoints with an existing query string are safe here.
+    url: toWmsEndpoint(baseUrl),
+    params,
+    projection,
+    serverType: 'mapserver',
+    crossOrigin: 'anonymous',
+    hidpi: false,
+    ratio: 1,
+    imageLoadFunction: cancellingImageLoader(),
+  })
+}
+
+// SkinnyWMS's `background` layer as a basemap — ImageWMS, like the data layers.
+export function makeSkinnyWmsBasemap(
+  baseUrl: string,
+  backgroundLayerName: string,
+  /** View projection extent — clips out-of-world BBOXes (→ stretched). */
+  extent: Extent | undefined,
+  /** SkinnyWMS reads BBOXes easting-first (see requestProjection). */
+  projection?: Projection,
+): ImageLayer<ImageWMS> {
+  const source = makeDataLayerSource(
+    baseUrl,
+    {
+      LAYERS: backgroundLayerName,
+      STYLES: '',
+      FORMAT: 'image/png',
+      // Opaque — it's the base layer.
+      TRANSPARENT: 'FALSE',
+    },
+    projection,
+  )
+  return new ImageLayer({ source, extent })
+}

@@ -16,8 +16,9 @@
 import { FileText } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useJobResultBlob } from '../useJobResult'
+import { useInViewOnce } from './useInViewOnce'
 import type { ThumbnailProps } from '../types'
-import { getJobResult } from '@/api/endpoints/job'
 import { createLogger } from '@/lib/logger'
 
 const log = createLogger('PdfThumbnail')
@@ -28,34 +29,26 @@ export function PdfThumbnail({ item }: ThumbnailProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const [pageCount, setPageCount] = useState<number | null>(null)
   const [rendered, setRendered] = useState(false)
-  const [shouldRender, setShouldRender] = useState(false)
+  const shouldRender = useInViewOnce(ref)
+
+  // Deferred until the card scrolls into view; shares the blob cache with the
+  // full PDF viewer for this same output.
+  const { data } = useJobResultBlob(
+    item.jobId,
+    item.taskId,
+    shouldRender && item.isAvailable,
+  )
+  const blob = data?.blob
 
   useEffect(() => {
-    if (!ref.current) return
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          setShouldRender(true)
-          observer.disconnect()
-        }
-      },
-      { rootMargin: '200px' },
-    )
-    observer.observe(ref.current)
-    return () => observer.disconnect()
-  }, [])
-
-  useEffect(() => {
-    if (!shouldRender || !item.isAvailable) return
+    if (!blob) return
     const state: { cancelled: boolean } = { cancelled: false }
     void (async () => {
       try {
         const { pdfjs } = await import('./pdfjs')
-        const { blob } = await getJobResult(item.jobId, item.taskId)
 
-        if (state.cancelled) return
         const buf = await blob.arrayBuffer()
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- mutated by cleanup
+
         if (state.cancelled) return
         const doc = await pdfjs.getDocument({ data: buf }).promise
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- mutated by cleanup
@@ -66,8 +59,16 @@ export function PdfThumbnail({ item }: ThumbnailProps) {
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- mutated by cleanup
         if (state.cancelled || !canvas) return
         const viewport = page.getViewport({ scale: 1 })
-        const targetWidth = canvas.parentElement?.clientWidth ?? 240
-        const scale = targetWidth / viewport.width
+        // Fit within both parent dimensions so portrait pages don't overflow
+        // the aspect-video container (which would otherwise produce
+        // asymmetric whitespace on the side).
+        const parent = canvas.parentElement
+        const targetWidth = parent?.clientWidth ?? 240
+        const targetHeight = parent?.clientHeight ?? 135
+        const scale = Math.min(
+          targetWidth / viewport.width,
+          targetHeight / viewport.height,
+        )
         const scaled = page.getViewport({ scale })
         canvas.width = scaled.width
         canvas.height = scaled.height
@@ -87,19 +88,19 @@ export function PdfThumbnail({ item }: ThumbnailProps) {
     return () => {
       state.cancelled = true
     }
-  }, [shouldRender, item.isAvailable, item.jobId, item.taskId])
+  }, [blob, item.taskId])
 
   return (
     <div
       ref={ref}
-      className="relative flex aspect-video items-center justify-center overflow-hidden rounded bg-muted"
+      className="relative flex aspect-video items-center justify-center overflow-hidden rounded-md bg-muted"
     >
       <canvas ref={canvasRef} className="max-h-full max-w-full" />
       {!rendered && (
         <FileText className="absolute h-8 w-8 text-muted-foreground" />
       )}
       {pageCount !== null && (
-        <span className="absolute right-1 bottom-1 rounded bg-black/50 px-1.5 py-0.5 font-mono text-xs text-white">
+        <span className="absolute right-1 bottom-1 rounded-md bg-black/50 px-1.5 py-0.5 font-mono text-sm text-white">
           {t('outputs.viewer.pdfPageCount', { count: pageCount })}
         </span>
       )}

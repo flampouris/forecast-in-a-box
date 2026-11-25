@@ -13,17 +13,23 @@
  */
 
 import type {
+  CompilationDetailResponse,
   JobExecuteRequest,
   JobExecuteResponse,
   JobExecutionDetail,
+  RunOutputMetadata,
 } from '@/api/types/job.types'
 
 const now = new Date()
-const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000).toISOString()
-const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString()
-const threeDaysAgo = new Date(
-  now.getTime() - 3 * 24 * 60 * 60 * 1000,
-).toISOString()
+const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000)
+  .toISOString()
+  .replace(/\.\d{3}Z$/, '+00:00')
+const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000)
+  .toISOString()
+  .replace(/\.\d{3}Z$/, '+00:00')
+const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000)
+  .toISOString()
+  .replace(/\.\d{3}Z$/, '+00:00')
 
 // ─── Execution mock state ─────────────────────────────────────────────────
 
@@ -43,6 +49,7 @@ const seedExecutions: Array<JobExecutionDetail> = [
     error: null,
     progress: '100',
     cascade_job_id: 'cascade-001',
+    lost_task_ids: {},
     outputs: {
       'task-out-1': {
         mime_type: 'image/png',
@@ -50,16 +57,25 @@ const seedExecutions: Array<JobExecutionDetail> = [
         is_available: true,
       },
       'task-out-2': {
-        mime_type: 'image/png',
+        mime_type: 'application/pdf',
         original_block: 'sink_temperature_map',
         is_available: true,
       },
       'task-out-3': {
-        mime_type: 'image/png',
+        mime_type: 'image/svg+xml',
         original_block: 'sink_wind_map',
         is_available: true,
       },
+      // GribSink marker: payload is the run-private output directory.
+      'task-out-grib': {
+        mime_type: 'text/plain; fiab-format=gribdir; fiab-fetchable=1',
+        original_block: 'block_sink_1',
+        is_available: true,
+      },
     },
+    // Cache is popped on terminal status; both arrays come back null.
+    completed_block_ids: null,
+    planned_block_ids: null,
   },
   {
     run_id: 'job-running-002',
@@ -72,6 +88,7 @@ const seedExecutions: Array<JobExecutionDetail> = [
     error: null,
     progress: '45',
     cascade_job_id: 'cascade-002',
+    lost_task_ids: {},
     outputs: {
       'task-out-4': {
         mime_type: 'image/png',
@@ -79,6 +96,8 @@ const seedExecutions: Array<JobExecutionDetail> = [
         is_available: false,
       },
     },
+    completed_block_ids: ['block_source_1'],
+    planned_block_ids: ['block_source_1', 'block_product_1', 'block_sink_1'],
   },
   {
     run_id: 'job-errored-003',
@@ -91,22 +110,53 @@ const seedExecutions: Array<JobExecutionDetail> = [
     error: 'Worker process exited with code 137 (OOM killed)',
     progress: '62',
     cascade_job_id: 'cascade-003',
+    lost_task_ids: {},
     outputs: {},
+    completed_block_ids: null,
+    planned_block_ids: null,
   },
   {
     run_id: 'job-submitted-004',
     attempt_count: 1,
     status: 'submitted',
-    created_at: now.toISOString(),
-    updated_at: now.toISOString(),
+    created_at: now.toISOString().replace(/\.\d{3}Z$/, '+00:00'),
+    updated_at: now.toISOString().replace(/\.\d{3}Z$/, '+00:00'),
     blueprint_id: 'def-004',
     blueprint_version: 1,
     error: null,
     progress: '0',
     cascade_job_id: null,
+    lost_task_ids: {},
     outputs: null,
   },
 ]
+
+/** Test-only fixture: a second completed run with a stored GRIB output —
+ * comparison tests pair it with job-completed-001. Not part of the default
+ * seed (list-driven tests assume a single completed run); inject it via
+ * {@link injectMockExecution}. */
+export const secondGribRunExecution: JobExecutionDetail = {
+  run_id: 'job-grib-b-008',
+  attempt_count: 1,
+  status: 'completed',
+  created_at: twoHoursAgo,
+  updated_at: twoHoursAgo,
+  blueprint_id: 'def-001',
+  blueprint_version: 1,
+  error: null,
+  progress: '100',
+  cascade_job_id: 'cascade-008',
+  lost_task_ids: {},
+  outputs: {
+    'task-out-grib-b': {
+      mime_type: 'text/plain; fiab-format=gribdir',
+      original_block: 'block_sink_1',
+      is_available: true,
+    },
+  },
+  completed_block_ids: null,
+  planned_block_ids: null,
+}
 
 /** Test-only fixture for the mixed-availability filter case. Not added to
  * the default seed — inject it via {@link injectMockExecution} from the test
@@ -122,6 +172,7 @@ export const mixedAvailabilityExecution: JobExecutionDetail = {
   error: null,
   progress: '70',
   cascade_job_id: 'cascade-005',
+  lost_task_ids: {},
   outputs: {
     'task-out-5a': {
       mime_type: 'image/png',
@@ -136,8 +187,134 @@ export const mixedAvailabilityExecution: JobExecutionDetail = {
   },
 }
 
+/** Test-only fixture: an available output whose wire mime is the opaque
+ * `application/octet-stream` cascade uses for raw bytes. Its real type is
+ * knowable only by sniffing the content — covers the sniff-then-filter path.
+ * Inject it via {@link injectMockExecution}. */
+export const opaqueMimeExecution: JobExecutionDetail = {
+  run_id: 'job-opaque-006',
+  attempt_count: 1,
+  status: 'completed',
+  created_at: oneHourAgo,
+  updated_at: oneHourAgo,
+  blueprint_id: 'def-006',
+  blueprint_version: 1,
+  error: null,
+  progress: '100',
+  cascade_job_id: 'cascade-006',
+  lost_task_ids: {},
+  outputs: {
+    'task-out-6': {
+      mime_type: 'application/octet-stream',
+      original_block: 'sink_opaque',
+      is_available: true,
+    },
+  },
+  completed_block_ids: null,
+  planned_block_ids: null,
+}
+
+function splitPlotOutput(
+  param: string,
+  short: string,
+  step: string,
+  isAvailable: boolean,
+): RunOutputMetadata {
+  return {
+    mime_type: 'image/png',
+    display_name: `Map Plot (param=${short}, step=${step})`,
+    dimension_kvs: [
+      ['param', param],
+      ['step', step],
+    ],
+    original_block: 'map_plot',
+    is_available: isAvailable,
+  }
+}
+
+/** Test-only split Map Plot (param x step); see {@link injectMockExecution}. */
+export const splitPlotExecution: JobExecutionDetail = {
+  run_id: 'job-split-007',
+  attempt_count: 1,
+  status: 'running',
+  created_at: oneHourAgo,
+  updated_at: oneHourAgo,
+  blueprint_id: 'def-007',
+  blueprint_version: 1,
+  error: null,
+  progress: '80',
+  cascade_job_id: 'cascade-007',
+  lost_task_ids: {},
+  outputs: {
+    'map_plot:9c': splitPlotOutput('167', '2t', '24', true),
+    'map_plot:1a': splitPlotOutput('151', 'msl', '12', true),
+    'map_plot:f0': splitPlotOutput('167', '2t', '0', true),
+    'map_plot:4b': splitPlotOutput('151', 'msl', '0', true),
+    'map_plot:77': splitPlotOutput('167', '2t', '12', true),
+    'map_plot:d8': splitPlotOutput('167', '2t', '36', true),
+    'map_plot:5e': splitPlotOutput('151', 'msl', '24', true),
+    'map_plot:c3': splitPlotOutput('151', 'msl', '36', false),
+  },
+  completed_block_ids: [],
+  planned_block_ids: ['map_plot'],
+}
+
+/** Test-only fixture: completed run of the glyphed `template-typed-inputs`
+ * fable with an as-run `resolution` (#640, glyphed options only). Inject via
+ * {@link injectMockExecution}. */
+export const resolvedConfigExecution: JobExecutionDetail = {
+  run_id: 'job-resolved-009',
+  attempt_count: 1,
+  status: 'completed',
+  created_at: oneHourAgo,
+  updated_at: oneHourAgo,
+  blueprint_id: 'template-typed-inputs',
+  blueprint_version: 1,
+  error: null,
+  progress: '100',
+  cascade_job_id: 'cascade-009',
+  lost_task_ids: {},
+  outputs: null,
+  completed_block_ids: null,
+  planned_block_ids: null,
+  resolution: {
+    block_source_1: {
+      forecast: 'grib',
+      base_time: '72 Europe',
+    },
+  },
+}
+
+/** Terminal run with `outputs: null` — drives the backend's "no recorded
+ * outputs yet" 500 from /run/outputContent. Inject via injectMockExecution. */
+export const noStoredOutputsExecution: JobExecutionDetail = {
+  run_id: 'job-no-outputs-007',
+  attempt_count: 1,
+  status: 'completed',
+  created_at: oneHourAgo,
+  updated_at: oneHourAgo,
+  blueprint_id: 'def-007',
+  blueprint_version: 1,
+  error: null,
+  progress: '100',
+  cascade_job_id: 'cascade-007',
+  lost_task_ids: {},
+  outputs: null,
+  completed_block_ids: null,
+  planned_block_ids: null,
+}
+
+/** GribSink directory per run, when a test needs runs to share one. */
+let gribDirOverrides: Record<string, string> = {}
+
+/** Point a run's GribSink markers at `dir` (e.g. a folder shared by runs). */
+export function setMockGribDir(runId: string, dir: string): void {
+  gribDirOverrides[runId] = dir
+}
+
 export function resetJobsState(): void {
   executionsState = {}
+  gribDirOverrides = {}
   executionIdCounter = 200
   for (const exec of seedExecutions) {
     executionsState[exec.run_id] = JSON.parse(
@@ -150,7 +327,17 @@ resetJobsState()
 
 // ─── Execution accessors ──────────────────────────────────────────────────
 
+/** Test seam: seeded runs would grandfather every "fresh" onboarding visit. */
+function emptyRunsRequested(): boolean {
+  try {
+    return localStorage.getItem('fiab.mock.empty-runs') !== null
+  } catch {
+    return false
+  }
+}
+
 export function getAllExecutions(): Array<JobExecutionDetail> {
+  if (emptyRunsRequested()) return []
   return Object.values(executionsState).sort((a, b) => {
     return new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
   })
@@ -164,7 +351,7 @@ export function getExecution(
 
 export function addExecution(request: JobExecuteRequest): JobExecuteResponse {
   const run_id = `exec-mock-${String(executionIdCounter++).padStart(3, '0')}`
-  const timestamp = new Date().toISOString()
+  const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00')
   executionsState[run_id] = {
     run_id,
     attempt_count: 1,
@@ -176,6 +363,7 @@ export function addExecution(request: JobExecuteRequest): JobExecuteResponse {
     error: null,
     progress: '0',
     cascade_job_id: null,
+    lost_task_ids: {},
     outputs: null,
   }
   return { run_id, attempt_count: 1 }
@@ -193,8 +381,41 @@ export function restartExecution(
     status: 'submitted',
     progress: '0',
     updated_at: new Date().toISOString(),
+    completed_block_ids: null,
+    planned_block_ids: null,
   }
   return { run_id: executionId, attempt_count }
+}
+
+/** Mock settle time of a stop, as the backend's poll would reconcile it. */
+const STOP_SETTLE_MS = 1000
+
+/** Mirrors `/run/stop` (ecmwf#770): active runs stop, repeats are no-ops. */
+export function stopExecution(
+  executionId: string,
+): 'ok' | 'notFound' | 'notStoppable' {
+  const exec = executionsState[executionId] as JobExecutionDetail | undefined
+  if (!exec) return 'notFound'
+  if (exec.status === 'stopping' || exec.status === 'stopped') return 'ok'
+  if (!['submitted', 'preparing', 'running'].includes(exec.status)) {
+    return 'notStoppable'
+  }
+  executionsState[executionId] = {
+    ...exec,
+    status: 'stopping',
+    updated_at: new Date().toISOString(),
+  }
+  setTimeout(() => {
+    const current = executionsState[executionId] as
+      JobExecutionDetail | undefined
+    if (current?.status !== 'stopping') return
+    executionsState[executionId] = {
+      ...current,
+      status: 'stopped',
+      updated_at: new Date().toISOString(),
+    }
+  }, STOP_SETTLE_MS)
+  return 'ok'
 }
 
 export function deleteExecution(executionId: string): boolean {
@@ -228,6 +449,141 @@ export function setMockOutputAvailable(
   return true
 }
 
+// ─── Compilation detail fixtures ──────────────────────────────────────────
+//
+// Only some runs have a fixture; the rest exercise the 404 "not available"
+// path that the cross-panel highlight gracefully degrades to.
+
+/** Tasks for `job-completed-001` (def-001: source → product → sink),
+ * a fully cross-block DAG with leaf tasks under each block. */
+const compilationDetailJobCompleted001: CompilationDetailResponse = {
+  tasks: [
+    {
+      task_id:
+        'earthkit.workflows.plugins.anemoi.inference._get_initial_conditions_from_config:a1b2c3d4',
+      block: 'block_source_1',
+      display_name:
+        'earthkit.workflows.plugins.anemoi.inference._get_initial_conditions_from_config:a1b2c3d4',
+      parents: [],
+    },
+    {
+      task_id: '_empty_payload:e5f6a7b8',
+      block: 'block_source_1',
+      display_name: '_empty_payload:e5f6a7b8',
+      parents: [
+        'earthkit.workflows.plugins.anemoi.inference._get_initial_conditions_from_config:a1b2c3d4',
+      ],
+    },
+    {
+      task_id:
+        'earthkit.workflows.plugins.anemoi.inference.run_as_earthkit_from_config:c9d0e1f2',
+      block: 'block_source_1',
+      display_name:
+        'earthkit.workflows.plugins.anemoi.inference.run_as_earthkit_from_config:c9d0e1f2',
+      parents: ['_empty_payload:e5f6a7b8'],
+    },
+    {
+      task_id: 'take:33445566778899aa',
+      block: 'block_product_1',
+      display_name: 'take:33445566778899aa',
+      parents: [
+        'earthkit.workflows.plugins.anemoi.inference.run_as_earthkit_from_config:c9d0e1f2',
+      ],
+    },
+    {
+      task_id:
+        'fiab_plugin_ecmwf.runtime.statistics.ensemble_mean:bbccddeeff001122',
+      block: 'block_product_1',
+      display_name:
+        'fiab_plugin_ecmwf.runtime.statistics.ensemble_mean:bbccddeeff001122',
+      parents: ['take:33445566778899aa'],
+    },
+    {
+      task_id: 'take:33445566fedcba98',
+      block: 'block_sink_1',
+      display_name: 'take:33445566fedcba98',
+      parents: [
+        'fiab_plugin_ecmwf.runtime.statistics.ensemble_mean:bbccddeeff001122',
+      ],
+    },
+    {
+      task_id: 'fiab_plugin_ecmwf.runtime.plots.map_plot:01234567abcdef89',
+      block: 'block_sink_1',
+      display_name: 'fiab_plugin_ecmwf.runtime.plots.map_plot:01234567abcdef89',
+      parents: ['take:33445566fedcba98'],
+    },
+    {
+      task_id: 'take:8899aabbccddeeff',
+      block: 'block_sink_1',
+      display_name: 'take:8899aabbccddeeff',
+      parents: [
+        'fiab_plugin_ecmwf.runtime.statistics.ensemble_mean:bbccddeeff001122',
+      ],
+    },
+    {
+      task_id: 'fiab_plugin_ecmwf.runtime.plots.map_plot:fedcba9876543210',
+      block: 'block_sink_1',
+      display_name: 'fiab_plugin_ecmwf.runtime.plots.map_plot:fedcba9876543210',
+      parents: ['take:8899aabbccddeeff'],
+    },
+  ],
+}
+
+/** Tasks for `job-running-002` (def-002: source → sink) — partial DAG. */
+const compilationDetailJobRunning002: CompilationDetailResponse = {
+  tasks: [
+    {
+      task_id:
+        'earthkit.workflows.plugins.anemoi.inference._get_initial_conditions_from_config:11aa22bb',
+      block: 'block_source_1',
+      display_name:
+        'earthkit.workflows.plugins.anemoi.inference._get_initial_conditions_from_config:11aa22bb',
+      parents: [],
+    },
+    {
+      task_id:
+        'earthkit.workflows.plugins.anemoi.inference.run_as_earthkit_from_config:33cc44dd',
+      block: 'block_source_1',
+      display_name:
+        'earthkit.workflows.plugins.anemoi.inference.run_as_earthkit_from_config:33cc44dd',
+      parents: [
+        'earthkit.workflows.plugins.anemoi.inference._get_initial_conditions_from_config:11aa22bb',
+      ],
+    },
+    {
+      task_id: 'take:55ee66ff77001122',
+      block: 'block_sink_1',
+      display_name: 'take:55ee66ff77001122',
+      parents: [
+        'earthkit.workflows.plugins.anemoi.inference.run_as_earthkit_from_config:33cc44dd',
+      ],
+    },
+  ],
+}
+
+/** Lookup keyed by run_id. Absence ⇒ backend would return 404. */
+const compilationDetailByRunId: Record<string, CompilationDetailResponse> = {
+  'job-completed-001': compilationDetailJobCompleted001,
+  'job-running-002': compilationDetailJobRunning002,
+  // job-errored-003 deliberately omitted to exercise the empty-state path.
+}
+
+export function getCompilationDetailFixture(
+  runId: string,
+): CompilationDetailResponse | undefined {
+  return compilationDetailByRunId[runId]
+}
+
+/** Add or replace a compilation-detail fixture for a given run.
+ * Intended for tests that need to pair a custom execution (via
+ * {@link injectMockExecution}) with a matching compilation DAG. */
+export function injectCompilationDetail(
+  runId: string,
+  fixture: CompilationDetailResponse,
+): void {
+  compilationDetailByRunId[runId] = fixture
+}
+
 export function createMockPngBlob(): Blob {
   const pngBytes = new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
@@ -238,4 +594,54 @@ export function createMockPngBlob(): Blob {
     0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
   ])
   return new Blob([pngBytes], { type: 'image/png' })
+}
+
+/** Minimal PDF — `%PDF-` magic is enough to sniff; pdfjs may reject the body
+ * and PdfThumbnail then falls back to the FileText icon. */
+export function createMockPdfBlob(): Blob {
+  const body =
+    '%PDF-1.4\n' +
+    '1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n' +
+    '2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n' +
+    '3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]>>endobj\n' +
+    'trailer<</Size 4/Root 1 0 R>>\n' +
+    '%%EOF\n'
+  return new Blob([new TextEncoder().encode(body)], {
+    type: 'application/pdf',
+  })
+}
+
+export function createMockSvgBlob(): Blob {
+  const body =
+    '<?xml version="1.0" encoding="UTF-8"?>\n' +
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">' +
+    '<rect width="64" height="64" fill="#94a3b8"/></svg>\n'
+  return new Blob([new TextEncoder().encode(body)], {
+    type: 'image/svg+xml',
+  })
+}
+
+/** Mock blob for a stored mime. Opaque mimes return PNG bytes so the
+ * sniff-promotion path stays exercised; unknown mimes also fall back to PNG.
+ * GribSink markers resolve to a per-run directory path. */
+export function mockBlobForMime(mimeType: string, runId?: string): Blob {
+  // With or without extra mime parameters.
+  if (mimeType.startsWith('text/plain; fiab-format=gribdir')) {
+    const run = runId ?? 'job-completed-001'
+    const dir =
+      run in gribDirOverrides ? gribDirOverrides[run] : `/data/output/${run}_1`
+    return new Blob([dir], { type: 'text/plain' })
+  }
+  switch (mimeType) {
+    case 'application/pdf':
+      return createMockPdfBlob()
+    case 'image/svg+xml':
+      return createMockSvgBlob()
+    case 'image/png':
+    case 'application/octet-stream':
+    case 'application/pickle':
+    case 'application/clpkl':
+    default:
+      return createMockPngBlob()
+  }
 }

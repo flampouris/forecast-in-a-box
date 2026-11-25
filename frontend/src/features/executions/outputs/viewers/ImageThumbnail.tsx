@@ -9,63 +9,55 @@
  */
 
 import { ImageOff } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import type { ThumbnailProps } from '../types'
-import { getJobResult } from '@/api/endpoints/job'
-import { createLogger } from '@/lib/logger'
+import { useEffect, useRef, useState } from 'react'
+import { outputTitle } from '../dims'
+import { useJobResultBlob } from '../useJobResult'
+import { useInViewOnce } from './useInViewOnce'
+import type { OutputAdapter, OutputItem, ThumbnailProps } from '../types'
 
-const log = createLogger('ImageThumbnail')
-
-/** Resolve the MIME the browser should use to render the blob. The wire
- * Content-Type is unreliable (cascade may say `application/pickle` for raw
- * bytes); the adapter knows the truth. */
-function browserImageMime(adapterId: string): string {
-  if (adapterId === 'image-vector') return 'image/svg+xml'
-  return 'image/png'
+/** Browser-rendering mime: trust the stored mime if the adapter advertises it
+ * (real JPEG/WebP), else fall back to the adapter's primary mime (post-sniff
+ * adapter selection guarantees that's the right bucket). */
+function browserImageMime(item: OutputItem, adapter: OutputAdapter): string {
+  if (adapter.id === 'image-vector') return 'image/svg+xml'
+  if (adapter.mimeTypes.includes(item.mimeType)) return item.mimeType
+  return adapter.mimeTypes[0] ?? 'image/png'
 }
 
 export function ImageThumbnail({ item, adapter }: ThumbnailProps) {
+  const ref = useRef<HTMLDivElement>(null)
+  const inView = useInViewOnce(ref)
   const [url, setUrl] = useState<string | null>(null)
-  const [errored, setErrored] = useState(false)
+  // Fetched once near the viewport; the full viewer reuses this blob.
+  const { data, isError } = useJobResultBlob(
+    item.jobId,
+    item.taskId,
+    inView && item.isAvailable,
+  )
+  const blob = data?.blob
 
   useEffect(() => {
-    if (!item.isAvailable) return
-    let revoked = false
-    let createdUrl: string | null = null
-    getJobResult(item.jobId, item.taskId)
-      .then(({ blob }) => {
-        if (revoked) return
-        const tagged = new Blob([blob], { type: browserImageMime(adapter.id) })
-        createdUrl = URL.createObjectURL(tagged)
-        setUrl(createdUrl)
-      })
-      .catch((err) => {
-        log.error('Failed to fetch image thumbnail', {
-          taskId: item.taskId,
-          error: err,
-        })
-        if (!revoked) setErrored(true)
-      })
-    return () => {
-      revoked = true
-      if (createdUrl) URL.revokeObjectURL(createdUrl)
-    }
-  }, [adapter.id, item.isAvailable, item.jobId, item.taskId])
+    if (!blob) return
+    const tagged = new Blob([blob], { type: browserImageMime(item, adapter) })
+    const createdUrl = URL.createObjectURL(tagged)
+    setUrl(createdUrl)
+    return () => URL.revokeObjectURL(createdUrl)
+  }, [adapter, blob, item])
 
-  if (errored) {
+  if (isError) {
     return (
-      <div className="flex aspect-video items-center justify-center rounded bg-muted">
+      <div className="flex aspect-video items-center justify-center rounded-md bg-muted">
         <ImageOff className="h-8 w-8 text-muted-foreground" />
       </div>
     )
   }
 
   return (
-    <div className="aspect-video overflow-hidden rounded bg-muted">
+    <div ref={ref} className="aspect-video overflow-hidden rounded-md bg-muted">
       {url ? (
         <img
           src={url}
-          alt={item.originalBlock}
+          alt={outputTitle(item)}
           className="h-full w-full object-cover"
         />
       ) : (

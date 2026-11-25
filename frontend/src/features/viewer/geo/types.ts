@@ -1,0 +1,104 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+import type { BboxAxisOrder } from '../projections'
+import type { LayerRequestSettings, ParsedLayer } from '../wms-capabilities'
+import type { SourceSlot } from './layer-pairing'
+
+/** Everything a compare map needs to render one source's stack. */
+/** Fit the shared view to a WGS84 bbox. */
+export type FitBboxAction = (bbox: [number, number, number, number]) => void
+
+export interface CompareMapSource {
+  slot: SourceSlot
+  /** Stable source identity (basket entry ref) — annotations bind to it. */
+  id: string
+  baseUrl: string
+  label: string
+  /** Run submission time, null for external servers. */
+  submittedAt: string | null
+  layers: ReadonlyArray<ParsedLayer>
+  /** SkinnyWMS decoration layers (background/foreground) when lens-backed. */
+  decorationLayers: ReadonlyArray<ParsedLayer>
+  activeOrder: ReadonlyArray<string>
+  layerOpacities: ReadonlyMap<string, number>
+  /** Per-layer style and dimension choices; absent = server defaults. */
+  layerSettings: ReadonlyMap<string, LayerRequestSettings>
+  /** How this server reads a 1.3.0 BBOX in projected CRSs. */
+  bboxAxisOrder: BboxAxisOrder
+  /** Largest GetMap the server accepts, null when unadvertised. */
+  maxImageSize: readonly [number, number] | null
+  /** Raw TIME string THIS server advertised for the current instant. */
+  resolveTime: (layer: ParsedLayer) => string | null
+  /** Per-request load outcomes (feeds the GetMap failure cache). */
+  onLoadResult?: (layerName: string, time: string | null, ok: boolean) => void
+  /** All raw TIME strings of the active selection (prefetch). */
+  timeSteps: ReadonlyArray<string>
+  /** Capabilities still loading/retrying — the layer list is not final. */
+  layersLoading: boolean
+  /** Base stack opacity: global × per-source tier (mode factors and
+   *  time-gap hiding are applied by the map components on top). */
+  masterOpacity: number
+  /** True when the source lacks data at the selected valid time —
+   *  its stack is hidden and the panel shows a gap badge. */
+  hiddenAtTime: boolean
+  /** Signed offset tag ("+2 h") when the shown instant differs from the
+   *  requested one (nearest/offset time-link modes). */
+  timeTag: string | null
+  /** Human label of the instant this source displays ("06 Jul 12:00Z"). */
+  timeLabel: string | null
+  /** Model run in effect ("run 2026-09-04 03:00Z"), null when none. */
+  runLabel: string | null
+  /** Fit-to-globe target (WGS84), shared by both sides. */
+  bbox: [number, number, number, number] | null
+}
+
+export type SingleMapMode = 'swipe' | 'flicker' | 'spy' | 'blend'
+export type CompareMode = SingleMapMode | 'side'
+
+/** Toolbar order — also the 1–5 keyboard shortcut order. */
+export const COMPARE_MODES: readonly [
+  CompareMode,
+  CompareMode,
+  CompareMode,
+  CompareMode,
+  CompareMode,
+] = ['side', 'swipe', 'flicker', 'blend', 'spy']
+
+export type SwipeOrientation = 'vertical' | 'horizontal'
+export type SpyShape = 'circle' | 'rectangle'
+
+/** Per-mode tuning owned by the viewer, edited in the toolbar action row. */
+export interface CompareModeOptions {
+  swipeOrientation: SwipeOrientation
+  spyShape: SpyShape
+  /** Spy lens radius / half-extent in CSS pixels. */
+  spySizePx: number
+  /** B-over-A weight in blend mode (0..1). */
+  blend: number
+  /** Side-by-side: mirror the hold-Z loupe onto both panels (else only the hovered one). */
+  loupeMirror: boolean
+  /** Hold-Z loupe diameter in CSS pixels. */
+  loupeSizePx: number
+  /** Hold-Z loupe magnification factor. */
+  loupeZoom: number
+  /** Latch the loupe on (keyboard/touch path — Z is hold-only). */
+  loupeLatched: boolean
+}
+
+/** One captured map for export: raw composited canvas + metadata. The
+ *  export dialog bakes the title bar / legend strip on top. */
+export interface CaptureResult {
+  label: string
+  /** Which source this capture shows; null = both (single-map modes). */
+  slot: 'a' | 'b' | null
+  canvas: HTMLCanvasElement
+  timeLabel: string | null
+}

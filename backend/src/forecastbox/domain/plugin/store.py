@@ -7,24 +7,34 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-"""API for Plugin Stores -- data parsing and extractions"""
+"""API for Plugin Stores -- data retrieval and extractions.
+
+Owns a lock-protected state StoresManager which reflects what the configured
+stores actually offer as plugins."""
 
 import logging
 import threading
-import time
+from functools import partial
 
 import httpx
 import orjson
 from cascade.low.func import assert_never
 from fiab_core.fable import PluginCompositeId, PluginId
+from packaging.version import Version
+from pydantic import Field
 from pyrsistent import pmap
 from pyrsistent.typing import PMap
 from typing_extensions import Self
 
-from forecastbox.domain.plugin.manager import submit_update_single
-from forecastbox.utility.concurrent import timed_acquire
-from forecastbox.utility.config import PluginSettings, PluginStoreConfig, PluginStoreId, PluginStoresConfig, config, config_edit_lock
+from forecastbox.domain.plugin.compatibility import get_compatible_versions
+from forecastbox.domain.plugin.settings import PluginSettings
+from forecastbox.domain.plugin.submit import submit_update_single
+from forecastbox.utility.concurrency.manager import TaskName, execution_manager
+from forecastbox.utility.concurrency.synchronization import timed_acquire
+from forecastbox.utility.config import ConcurrentPools, PluginStoreConfig, PluginStoreId, PluginStoresConfig, config
+from forecastbox.utility.http_pools import HttpProfile, get_sync
 from forecastbox.utility.httpx import fetch_content
+from forecastbox.utility.packages import get_package_versions
 from forecastbox.utility.pydantic import FiabBaseModel
 
 logger = logging.getLogger(__name__)
@@ -52,22 +62,19 @@ class PluginRemoteInfo(FiabBaseModel):
 
 
 def get_latest_version(package_name: str, client: httpx.Client) -> str:
-    url = f"https://pypi.org/pypi/{package_name}/json"
-    response = client.get(url)
-    if response.status_code == 200:
-        try:
-            return response.json()["info"]["version"]
-        except Exception:
-            logger.exception(f"getting version of {package_name=} => failure {response=}")
-    else:
-        logger.warning(f"getting version of {package_name=} => failure {response=}")
-    return "unknown"
+    try:
+        available = get_package_versions(package_name, client)
+        compatible = get_compatible_versions(package_name, available)
+        return max(compatible, key=lambda v: Version(v))
+    except Exception as e:
+        logger.error(f"getting version of {package_name=} => failure {e!r}")
+        return "unknown"
 
 
 class PluginStore(FiabBaseModel):
     display_name: str
-    plugins: dict[PluginId, PluginStoreEntry] = {}
-    remote: dict[PluginId, PluginRemoteInfo] = {}
+    plugins: dict[PluginId, PluginStoreEntry] = Field(default_factory=dict)
+    remote: dict[PluginId, PluginRemoteInfo] = Field(default_factory=dict)
 
 
 def fetch_store(client: httpx.Client, plugin_store_config: PluginStoreConfig) -> PluginStore:
@@ -104,18 +111,28 @@ def populate_store(store: PluginStore, client: httpx.Client) -> None:
 
 
 class StoresManager:
-    stores: PMap[PluginStoreId, PluginStore] = pmap()
+    stores: PMap[PluginStoreId, PluginStore] | None = None
+    """None until `initialize_stores` has completed at least once. Distinguishes 'not initialized
+    yet' from 'initialized, but happens to have no stores configured' (an empty PMap)."""
     stores_lock: threading.Lock = threading.Lock()
-    stores_updater: threading.Thread | None = None
+
+
+def stores_ready() -> bool:
+    """Whether the stores have finished their (asynchronous, submitted-at-startup) initialization.
+
+    Callers such as `resolve_plugin_from_store` rely on `StoresManager.stores` being populated;
+    right after process startup this may not be the case yet, so this helper lets HTTP callers
+    (see `forecastbox.routes.status`) report readiness instead of failing with a 500."""
+    return StoresManager.stores is not None
 
 
 def initialize_stores(plugin_stores_config: PluginStoresConfig) -> None:
-    # assumed to be submitted from a thread
-    with httpx.Client() as client:
-        # a thread pool / async could work here but we dont expect many stores here
-        stores = {key: fetch_store(client, value) for key, value in plugin_stores_config.items()}
-        for store in stores.values():
-            populate_store(store, client)
+    # assumed to be submitted through ConcurrentPools.Io
+    client = get_sync(HttpProfile.Default)
+    # a thread pool / async could work here but we dont expect many stores here
+    stores = {key: fetch_store(client, value) for key, value in plugin_stores_config.items()}
+    for store in stores.values():
+        populate_store(store, client)
     with timed_acquire(StoresManager.stores_lock, 600) as result:
         if not result:
             raise ValueError("failed to acquire lock")
@@ -129,23 +146,37 @@ def get_plugins_detail() -> dict[PluginCompositeId, tuple[PluginStoreEntry, Plug
             store.plugins[pluginId],
             store.remote[pluginId],
         )
-        for storeId, store in StoresManager.stores.items()
+        for storeId, store in (StoresManager.stores or pmap()).items()
         for pluginId in store.plugins.keys()
     }
 
 
 def submit_initialize_stores() -> None:
-    with timed_acquire(StoresManager.stores_lock, 10) as result:
-        if not result:
-            logger.error("failed to initialize stores")
-            return
-        StoresManager.stores_updater = threading.Thread(target=initialize_stores, args=(config.product.plugin_stores,))
-        StoresManager.stores_updater.start()
+    """Submit store initialization as a monitored task on the shared ``Io`` pool.
+
+    Fire-and-forget: an unexpected exception is recorded by the execution manager's
+    monitored-failure history. Callers continue to see an empty store map (via
+    ``get_plugins_detail``/``StoresManager.stores``) until a successful publication
+    replaces it -- a partial store map is never published.
+    """
+
+    # NOTE No need to protect from concurrent runs -- http fetches are safe, and
+    # the last operation which mutates the global state is lock protected, and we
+    # are ok with last one winning.
+    execution_manager.submit_monitored(
+        ConcurrentPools.Io,
+        TaskName("plugin.stores.initialize"),
+        partial(initialize_stores, config.external.plugin_stores),
+    )
 
 
-def submit_install_plugin(plugin_composite_key: PluginCompositeId) -> None:
+def resolve_plugin_from_store(plugin_composite_key: PluginCompositeId) -> PluginSettings:
+    """Retrieves the plugin information from the store and returns the settings to install it
+    with. Synchronous and self-contained -- performs no pip operation and no persistence,
+    that is the caller's job (see ``domain.plugin.loading.update_single``, which persists the
+    returned settings into the plugin_state database table upon a successful install)."""
     # No lock needed for reads with pyrsistent immutable structures
-    if not StoresManager.stores:
+    if StoresManager is None:
         raise ValueError("stores not initialized")
     storeId, pluginId = plugin_composite_key.store, plugin_composite_key.local
     store = StoresManager.stores.get(storeId, None)
@@ -155,29 +186,15 @@ def submit_install_plugin(plugin_composite_key: PluginCompositeId) -> None:
     if pluginStoreEntry is None:
         raise ValueError(f"plugin with id {pluginId} not known to store {storeId}")
 
-    if plugin_composite_key not in config.product.plugins:
-        with timed_acquire(config_edit_lock, 5) as result:
-            if not result:
-                raise ValueError("failed to acquire the shared lock")
-            config.product.plugins[plugin_composite_key] = PluginSettings(
-                pip_source=pluginStoreEntry.pip_source,
-                module_name=pluginStoreEntry.module_name,
-                update_strategy="manual",
-            )
-            config.save_to_file()
-
-    submit_update_single(plugin_composite_key, isUpdate=True)
+    return PluginSettings(
+        pip_source=pluginStoreEntry.pip_source,
+        module_name=pluginStoreEntry.module_name,
+        update_strategy="manual",
+    )
 
 
-def join_stores_thread(timeout_sec: int) -> None:
-    # TODO candidate for ecpyutil, duplicated in plugin.manager
-    barrier = (time.perf_counter_ns() / 1e9) + timeout_sec
-    with timed_acquire(StoresManager.stores_lock, timeout_sec) as result:
-        if not result:
-            logger.error("failed to lock for joining updater thread")
-        else:
-            if StoresManager.stores_updater is not None:
-                budget = barrier - (time.perf_counter_ns() / 1e9)
-                StoresManager.stores_updater.join(budget)
-                if StoresManager.stores_updater.is_alive():
-                    logger.error("failed to join StoresManager updater thread")
+async def submit_install_single(plugin_composite_key: PluginCompositeId) -> str:
+    """Retrieves the information from the store, then submits the actual pip operation via
+    `plugins.submit`"""
+    settings = resolve_plugin_from_store(plugin_composite_key)
+    return await submit_update_single(plugin_composite_key, install=True, version=None, settings=settings)

@@ -20,6 +20,7 @@ import { userEvent } from 'vitest/browser'
 import { describe, expect, it } from 'vitest'
 import { renderWithProviders } from '@tests/utils/render'
 import type { GlyphInfo } from '@/features/fable-builder/hooks/useAllGlyphs'
+import type { SharedOutputPath } from '@/features/fable-builder/utils/run-folder-nudge'
 import { GlyphFieldWrapper } from '@/components/base/fields/fields/GlyphFieldWrapper'
 import { InputGroupInput } from '@/components/ui/input-group'
 import {
@@ -30,8 +31,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { GlyphContext } from '@/features/fable-builder/context/GlyphContext'
-import { ResolvedConfigContext } from '@/features/fable-builder/context/ResolvedConfigContext'
-import { FieldErrorsContext } from '@/features/fable-builder/context/FieldErrorsContext'
+import { BlockValidationProvider } from '@/features/fable-builder/context/BlockValidationContext'
 
 // ---------------------------------------------------------------------------
 // Test data
@@ -67,19 +67,26 @@ function WithGlyphs({
   glyphs = TEST_GLYPHS,
   resolvedConfig = null,
   fieldErrors = null,
+  sharedOutputPaths = null,
+  missingFileNames = null,
 }: {
   children: React.ReactNode
   glyphs?: Array<GlyphInfo>
   resolvedConfig?: Record<string, string> | null
   fieldErrors?: Record<string, Array<string>> | null
+  sharedOutputPaths?: Record<string, SharedOutputPath> | null
+  missingFileNames?: Record<string, string> | null
 }) {
   return (
     <GlyphContext.Provider value={glyphs}>
-      <ResolvedConfigContext.Provider value={resolvedConfig}>
-        <FieldErrorsContext.Provider value={fieldErrors}>
-          {children}
-        </FieldErrorsContext.Provider>
-      </ResolvedConfigContext.Provider>
+      <BlockValidationProvider
+        resolvedConfig={resolvedConfig}
+        fieldErrors={fieldErrors}
+        sharedOutputPaths={sharedOutputPaths}
+        missingFileNames={missingFileNames}
+      >
+        {children}
+      </BlockValidationProvider>
     </GlyphContext.Provider>
   )
 }
@@ -88,12 +95,16 @@ function ControlledStringField(props: {
   initialValue?: string
   resolvedConfig?: Record<string, string> | null
   fieldErrors?: Record<string, Array<string>> | null
+  sharedOutputPaths?: Record<string, SharedOutputPath> | null
+  missingFileNames?: Record<string, string> | null
 }) {
   const [value, setValue] = useState(props.initialValue ?? '')
   return (
     <WithGlyphs
       resolvedConfig={props.resolvedConfig ?? null}
       fieldErrors={props.fieldErrors ?? null}
+      sharedOutputPaths={props.sharedOutputPaths ?? null}
+      missingFileNames={props.missingFileNames ?? null}
     >
       <GlyphFieldWrapper
         id="test-field"
@@ -413,7 +424,7 @@ describe('GlyphFieldWrapper Integration', () => {
   })
 
   describe('Field-level validation errors', () => {
-    it('renders inline error message for the field when FieldErrorsContext has entries', async () => {
+    it('renders inline error message for the field when field errors are present', async () => {
       const screen = await renderWithProviders(
         <ControlledStringField
           initialValue="${runtd}"
@@ -425,7 +436,7 @@ describe('GlyphFieldWrapper Integration', () => {
         .toBeVisible()
     })
 
-    it('does not render an error when FieldErrorsContext is null', async () => {
+    it('does not render an error when there are no field errors', async () => {
       const screen = await renderWithProviders(
         <ControlledStringField initialValue="${runtd}" />,
       )
@@ -460,6 +471,89 @@ describe('GlyphFieldWrapper Integration', () => {
         .toBeVisible()
       // Combobox still rendered (no glyph toggle)
       await expect.element(screen.getByRole('combobox')).toBeVisible()
+    })
+  })
+
+  describe('Run folder nudge', () => {
+    it('warns about a shared folder and applies the run folder fix', async () => {
+      const fix = '/tmp/out/${runId}__${attemptCount}/[shortName].grib'
+      const screen = await renderWithProviders(
+        <ControlledStringField
+          initialValue="/tmp/out/[shortName].grib"
+          sharedOutputPaths={{ value: { scope: 'folder', fix } }}
+        />,
+      )
+      await expect
+        .element(screen.getByText('Not a per-run folder'))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText(/^This folder has no run ID/))
+        .toBeVisible()
+      await screen.getByRole('button', { name: 'Use run folder' }).click()
+      await expect
+        .element(screen.getByTestId('current-value'))
+        .toHaveTextContent(fix)
+    })
+
+    it('warns without a fix button when no fix applies', async () => {
+      const screen = await renderWithProviders(
+        <ControlledStringField
+          initialValue="${outputRoot}"
+          sharedOutputPaths={{ value: { scope: 'path', fix: null } }}
+        />,
+      )
+      await expect.element(screen.getByTestId('run-folder-nudge')).toBeVisible()
+      await expect
+        .element(screen.getByRole('button', { name: 'Use run folder' }))
+        .not.toBeInTheDocument()
+      // A Zarr store is the path itself: no folder note.
+      await expect
+        .element(screen.getByText(/^This folder has no run ID/))
+        .not.toBeInTheDocument()
+    })
+
+    it('stays hidden for other fields', async () => {
+      const screen = await renderWithProviders(
+        <ControlledStringField
+          initialValue="/tmp/out/[shortName].grib"
+          sharedOutputPaths={{ other_key: { scope: 'folder', fix: null } }}
+        />,
+      )
+      await expect
+        .element(screen.getByTestId('run-folder-nudge'))
+        .not.toBeInTheDocument()
+    })
+  })
+
+  describe('File name nudge', () => {
+    it('warns about a GRIB path without a file name and appends one', async () => {
+      const value = '${outDir}/${runId}__${attemptCount}/'
+      const fix = `${value}[shortName].grib`
+      const screen = await renderWithProviders(
+        <ControlledStringField
+          initialValue={value}
+          missingFileNames={{ value: fix }}
+        />,
+      )
+      await expect.element(screen.getByText(/^No file name/)).toBeVisible()
+      await screen.getByRole('button', { name: 'Add file name' }).click()
+      await expect
+        .element(screen.getByTestId('current-value'))
+        .toHaveTextContent(fix)
+    })
+
+    it('gives way to a field error', async () => {
+      const screen = await renderWithProviders(
+        <ControlledStringField
+          initialValue="/tmp/out/"
+          fieldErrors={{ value: ['Invalid filepath'] }}
+          missingFileNames={{ value: '/tmp/out/[shortName].grib' }}
+        />,
+      )
+      await expect.element(screen.getByText('Invalid filepath')).toBeVisible()
+      await expect
+        .element(screen.getByTestId('file-name-nudge'))
+        .not.toBeInTheDocument()
     })
   })
 })

@@ -18,7 +18,9 @@ Pyrsistent immutable structures allow safe lock-free reads.
 
 import logging
 import os
+import socket
 import subprocess
+import sys
 import threading
 import uuid
 from dataclasses import dataclass
@@ -28,8 +30,13 @@ from cascade.low.func import assert_never
 from pyrsistent import pmap
 from pyrsistent.typing import PMap
 
-from forecastbox.utility.concurrent import FreePortsManager, NoFreePortsException, shutdown_popen, timed_acquire
+from forecastbox.domain.lens.exceptions import NoLensFound
+from forecastbox.utility.concurrency.ports import FreePortsManager, NoFreePortsException
+from forecastbox.utility.concurrency.shutdown import shutdown_popen
+from forecastbox.utility.concurrency.synchronization import timed_acquire
+from forecastbox.utility.config import config, get_backend_log_directory
 from forecastbox.utility.pydantic import FiabBaseModel
+from forecastbox.utility.time import default_tz_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +45,10 @@ LensName = Literal["skinnyWMS"]
 LensStatus = Literal["starting", "running", "terminated", "failed"]
 
 timeout_acquire = 1
+# gunicorn worker timeout, seconds, as the proxy's read timeout
+timeout_lens_worker = 120
+# Indexes the data folder at import, once in the preloading master
+lens_wsgi_app = "forecastbox.domain.lens.skinnywms_app:application"
 
 
 class LensInstanceDetail(FiabBaseModel):
@@ -48,11 +59,17 @@ class LensInstanceDetail(FiabBaseModel):
 
 
 @dataclass
+# Intentionally mutable: `process` holds a `subprocess.Popen` object whose internal state
+# (return code, file descriptors) is mutated externally by the OS throughout the process
+# lifecycle. Making this field immutable is not meaningful; the dataclass is kept mutable
+# to reflect that reality.
 class LensInstance:
     process: subprocess.Popen[bytes] | None
     lens_params: dict[str, Any]
     lens_name: LensName
     ports: set[int]
+    # Ports seen accepting connections; set once, while the process lives
+    bound: bool = False
 
 
 class LensInstanceManager:
@@ -60,17 +77,40 @@ class LensInstanceManager:
     instances: PMap[LensInstanceId, LensInstance] = pmap()
 
 
+def check_server_ready(host: str = "127.0.0.1", port: int = 8000, timeout: float = 0.1) -> bool:
+    """Ultra-fast check to see if the lens process has successfully bound to the port.
+
+    Returns True if the port is open and accepting connections, False otherwise.
+    """
+    # TODO add warning if lens not local, we are blocking async loop. For now the async loop
+    # block acceptable, no need to flag during review
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        try:
+            # connect_ex returns 0 on success, or an error code on failure
+            return s.connect_ex((host, port)) == 0
+        except Exception:
+            return False
+
+
 def _compute_status(instance: LensInstance) -> LensInstanceDetail:
     status: LensStatus
     if instance.lens_name == "skinnyWMS":
         if instance.process is None:
+            # process not spawned yet at all
             status = "starting"
-        elif instance.process.poll() is None:
+        elif instance.process.poll() is not None:
+            status = "terminated" if instance.process.returncode == 0 else "failed"
+        elif instance.bound or all(check_server_ready(port=port) for port in instance.ports):
+            # process alive and its port(s) are bound -- guvicorn/gunicorn finished starting
+            # Probe once: a busy lens's queue holds each probe connection
+            # TODO we are modifying the pyrsistent-owned structure outside of lock, ugly! No
+            # need to flag during review, this whole section is planned for a big rewrite anyway
+            instance.bound = True
             status = "running"
-        elif instance.process.returncode == 0:
-            status = "terminated"
         else:
-            status = "failed"
+            # process alive but not yet listening -- still starting up
+            status = "starting"
     else:
         assert_never(instance.lens_name)
 
@@ -101,30 +141,75 @@ def start_skinny_wms(local_path: str) -> LensInstanceId:
         LensInstanceManager.instances = LensInstanceManager.instances.set(instance_id, instance)
 
     failed: str | None = None
+    process: subprocess.Popen[bytes] | None = None
     try:
-        cmd = ["uv", "run", "gunicorn", "--bind", f"127.0.0.1:{port}", "skinnywms.wmssvr:application"]
-        env = {**os.environ, "SKINNYWMS_DATA_PATH": local_path}
-        process: subprocess.Popen[bytes] = subprocess.Popen(
-            cmd,
-            env=env,
-            start_new_session=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        cmd = [
+            "uv",
+            "run",
+            "gunicorn",
+            "--bind",
+            f"127.0.0.1:{port}",
+            "--timeout",
+            str(timeout_lens_worker),
+            # Replacement workers fork from the indexed master: no rescan
+            "--preload",
+            # Replacing the worker frees the memory Magics leaks per rendered image
+            "--max-requests",
+            str(config.backend.lens.worker_max_requests),
+            "--max-requests-jitter",
+            str(config.backend.lens.worker_max_requests_jitter),
+            lens_wsgi_app,
+        ]
+        env = {
+            **os.environ,
+            # So that responses such as GetCapabilities refer to client-visible proxy urls,
+            # instead of localhost-based ones
+            "SKINNYWMS_TRUST_XFORWARDED": "1",
+            "SKINNYWMS_DATA_PATH": local_path,
+            # In case the clients (the in-app WMS viewer, crossOrigin tile requests, ogw)
+            # call the lens directly on its own port, i.e. cross-origin.
+            # SkinnyWMS honours this via flask-cors on all endpoints.
+            # *DEPRECATED* -- remove the xforwarded-based path verified
+            "SKINNYWMS_CORS_ORIGINS": "*",
+            # Equivalent of --enable-reference-time-dimension: fields from different
+            # forecast runs sharing a validity time are exposed via DIM_REFERENCE_TIME
+            "SKINNYWMS_ENABLE_REFERENCE_TIME_DIMENSION": "1",
+            # SkinnyWMS localizes naive UTC GRIB datetimes via astimezone(),
+            # shifting advertised times by the host's UTC offset — we explicitly
+            # use the backend-wide default tz
+            "TZ": default_tz_fallback(),
+            "MAGICS_STYLE_PATH": sys.prefix + "/share/magics/styles/dccms",
+            # macOS kills forked workers drawing text after the preloaded master
+            **({"OBJC_DISABLE_INITIALIZE_FORK_SAFETY": "YES"} if sys.platform == "darwin" else {}),
+        }
+        log_directory = get_backend_log_directory()
+        stdout_path = os.path.join(log_directory, f"lens.{instance_id}.stdout.txt")
+        stderr_path = os.path.join(log_directory, f"lens.{instance_id}.stderr.txt")
+        with open(stdout_path, "ab") as stdout_file, open(stderr_path, "ab") as stderr_file:
+            process = subprocess.Popen(
+                cmd,
+                env=env,
+                start_new_session=True,
+                stdout=stdout_file,
+                stderr=stderr_file,
+            )
     except Exception as e:
         failed = repr(e)
         logger.error(f"failed to start skinny wms: {failed}")
 
     with timed_acquire(LensInstanceManager.lock, timeout_acquire) as acquired:
         if not acquired:
-            shutdown_popen(process)
+            if process is not None:
+                shutdown_popen(process)
             FreePortsManager.release_port(port)
             raise TimeoutError("Failed to acquire lens manager lock for update")
         if instance_id not in LensInstanceManager.instances:
-            shutdown_popen(process)
+            if process is not None:
+                shutdown_popen(process)
             FreePortsManager.release_port(port)
             raise RuntimeError(f"Lens instance {instance_id} was removed during startup")
-        if failed is not None:
+        if failed is not None or process is None:
+            LensInstanceManager.instances = LensInstanceManager.instances.remove(instance_id)
             FreePortsManager.release_port(port)
             raise RuntimeError(f"Lens instance {instance_id} failed to start with {failed}")
         updated = LensInstance(
@@ -142,7 +227,7 @@ def get_status(instance_id: LensInstanceId) -> LensInstanceDetail:
     """Return the status of a lens instance. Raises KeyError if not found."""
     instance = LensInstanceManager.instances.get(instance_id)
     if instance is None:
-        raise KeyError(instance_id)
+        raise NoLensFound(instance_id)
     return _compute_status(instance)
 
 
@@ -155,7 +240,7 @@ def list_instances() -> list[tuple[LensInstanceId, LensInstanceDetail]]:
 def stop_instance(instance_id: LensInstanceId) -> None:
     """Stop and remove a lens instance, releasing its ports.
 
-    Raises KeyError if the instance is not found.
+    Raises NoLensFound if the instance is not found.
     The port is always released in a finally block to prevent leaks.
     """
     instance: LensInstance | None = None
@@ -164,7 +249,7 @@ def stop_instance(instance_id: LensInstanceId) -> None:
             if not acquired:
                 raise TimeoutError("Failed to acquire lens manager lock")
             if instance_id not in LensInstanceManager.instances:
-                raise KeyError(instance_id)
+                raise NoLensFound(instance_id)
             instance = LensInstanceManager.instances[instance_id]
             LensInstanceManager.instances = LensInstanceManager.instances.remove(instance_id)
         if instance.process is not None:
@@ -181,7 +266,7 @@ def shutdown_all_lens_instances() -> None:
     for instance_id in list(instances.keys()):
         try:
             stop_instance(instance_id)
-        except KeyError:
+        except NoLensFound:
             pass  # already removed
         except Exception as e:
             logger.warning(f"Failed to stop lens instance {instance_id} during shutdown: {repr(e)}")

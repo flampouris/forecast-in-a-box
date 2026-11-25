@@ -15,14 +15,20 @@
  * StringField, NumberField, DateTimeField, EnumField, ListField
  */
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { userEvent } from 'vitest/browser'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+import { HttpResponse, http } from 'msw'
 import { renderWithProviders } from '@tests/utils/render'
+import { worker } from '@tests/../mocks/browser'
+import { failNextDownloadPoll } from '../../../../mocks/handlers/artifacts.handlers'
+import { API_ENDPOINTS } from '@/api/endpoints'
 import {
-  FieldRenderer,
-  InlineFieldRenderer,
-} from '@/components/base/fields/FieldRenderer'
+  resetDownloadState,
+  useDownloadActions,
+} from '@/api/hooks/useArtifacts'
+import { FieldRenderer } from '@/components/base/fields/FieldRenderer'
+import { BlockConfigProvider } from '@/features/fable-builder/context/BlockConfigContext'
 
 /**
  * Controlled wrapper to capture onChange values
@@ -99,6 +105,21 @@ describe('FieldRenderer Integration', () => {
       await expect
         .element(screen.getByText('A helpful description'))
         .toBeVisible()
+    })
+
+    it('renders "- " description lines as a bullet list', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer
+          valueType="str"
+          description={'Pick one.\n- first: a\n- second: b\nAfter.'}
+        />,
+      )
+      await expect.element(screen.getByText('Pick one.')).toBeVisible()
+      const items = screen.getByRole('listitem')
+      await expect.element(items.nth(0)).toHaveTextContent('first: a')
+      await expect.element(items.nth(1)).toHaveTextContent('second: b')
+      expect(items.all()).toHaveLength(2)
+      await expect.element(screen.getByText('After.')).toBeVisible()
     })
   })
 
@@ -187,7 +208,7 @@ describe('FieldRenderer Integration', () => {
       await expect.element(timeInput).toHaveValue('00:00')
     })
 
-    it('combines date + time into a datetime-local string on date pick', async () => {
+    it('combines date + time into an ISO 8601 string with seconds on date pick', async () => {
       const screen = await renderWithProviders(
         <ControlledFieldRenderer valueType="datetime" label="DateValue" />,
       )
@@ -195,7 +216,7 @@ describe('FieldRenderer Integration', () => {
       await dateInput.fill('2026-07-15')
       await expect
         .element(screen.getByTestId('current-value'))
-        .toHaveTextContent('2026-07-15T00:00')
+        .toHaveTextContent('2026-07-15T00:00:00')
     })
 
     it('renders date input for "date-iso8601"', async () => {
@@ -211,7 +232,7 @@ describe('FieldRenderer Integration', () => {
   describe('Enum field', () => {
     it('renders a select trigger for enum type', async () => {
       const screen = await renderWithProviders(
-        <ControlledFieldRenderer valueType="enum['opt1','opt2','opt3']" />,
+        <ControlledFieldRenderer valueType="enum[str]('opt1','opt2','opt3')" />,
       )
       // SelectTrigger renders a button with role="combobox"
       const trigger = screen.getByRole('combobox')
@@ -220,7 +241,7 @@ describe('FieldRenderer Integration', () => {
 
     it('shows placeholder text', async () => {
       const screen = await renderWithProviders(
-        <ControlledFieldRenderer valueType="enum['opt1','opt2','opt3']" />,
+        <ControlledFieldRenderer valueType="enum[str]('opt1','opt2','opt3')" />,
       )
       await expect
         .element(screen.getByText('Select an option...'))
@@ -324,23 +345,6 @@ describe('FieldRenderer Integration', () => {
     })
   })
 
-  describe('InlineFieldRenderer', () => {
-    it('renders field without label wrapper', async () => {
-      const screen = await renderWithProviders(
-        <InlineFieldRenderer
-          id="inline-test"
-          configKey="inline-test"
-          valueType="str"
-          value="hello"
-          onChange={() => {}}
-        />,
-      )
-      const input = screen.getByRole('textbox')
-      await expect.element(input).toBeVisible()
-      await expect.element(input).toHaveValue('hello')
-    })
-  })
-
   describe('Unknown type fallback', () => {
     it('falls back to string input for unknown value type', async () => {
       const screen = await renderWithProviders(
@@ -348,6 +352,363 @@ describe('FieldRenderer Integration', () => {
       )
       const input = screen.getByRole('textbox')
       await expect.element(input).toBeVisible()
+    })
+  })
+
+  describe('GeoDomain field', () => {
+    it('renders a trigger summarizing the current value', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType="geodomain" initialValue="global" />,
+      )
+      // The trigger shows the selected name as a badge (also echoed in current-value span).
+      await expect.element(screen.getByText('global').first()).toBeVisible()
+    })
+
+    it('shows the placeholder when empty', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType="geodomain" />,
+      )
+      await expect.element(screen.getByText('Select an area…')).toBeVisible()
+    })
+  })
+
+  // The grid option of ecmwf#667.
+  describe('Grid field', () => {
+    const gridType = 'enumOpen[grid](auto,0.25,0.5,1,O96,O320,N320)'
+
+    it('summarises the grid with its spacing', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType={gridType} initialValue="0.25" />,
+      )
+      await expect.element(screen.getByText('0.25° lat/lon')).toBeVisible()
+      await expect.element(screen.getByText('~28 km')).toBeVisible()
+    })
+
+    it('lists the suggestions by family and picks one', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType={gridType} initialValue="auto" />,
+      )
+      await screen.getByText('Keep input grid').click()
+      await expect.element(screen.getByText('Regular lat/lon')).toBeVisible()
+      await expect
+        .element(screen.getByText('Octahedral Gaussian'))
+        .toBeVisible()
+      await expect.element(screen.getByText('Reduced Gaussian')).toBeVisible()
+
+      await screen.getByRole('option', { name: /O96/ }).click()
+      await expect
+        .element(screen.getByTestId('current-value'))
+        .toHaveTextContent('O96')
+    })
+
+    it('accepts a typed grid in canonical form', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType={gridType} initialValue="auto" />,
+      )
+      await screen.getByText('Keep input grid').click()
+      await screen.getByPlaceholder(/type a grid/).fill('n640')
+      await expect.element(screen.getByText('Your entry')).toBeVisible()
+      await userEvent.keyboard('{Enter}')
+      await expect
+        .element(screen.getByTestId('current-value'))
+        .toHaveTextContent('N640')
+    })
+
+    it('notes that the counts are global when the block cuts out a domain', async () => {
+      const screen = await renderWithProviders(
+        <BlockConfigProvider
+          values={{ domain: 'Central Europe' }}
+          valueTypes={{ domain: 'geodomain', 'test-field': gridType }}
+        >
+          <ControlledFieldRenderer valueType={gridType} initialValue="auto" />
+        </BlockConfigProvider>,
+      )
+      await screen.getByText('Keep input grid').click()
+      const row = screen.getByRole('option', { name: /0\.25°/ })
+      await expect.element(row.getByText('1M points')).toBeVisible()
+      await expect
+        .element(screen.getByText(/whole globe, before the domain cut-out/))
+        .toBeVisible()
+    })
+
+    it.each(['auto', 'Global'])(
+      'has no note when the domain is %s',
+      async (domain) => {
+        const screen = await renderWithProviders(
+          <BlockConfigProvider
+            values={{ domain }}
+            valueTypes={{ domain: 'geodomain', 'test-field': gridType }}
+          >
+            <ControlledFieldRenderer valueType={gridType} initialValue="auto" />
+          </BlockConfigProvider>,
+        )
+        await screen.getByText('Keep input grid').click()
+        const row = screen.getByRole('option', { name: /0\.25°/ })
+        await expect.element(row.getByText('1M points')).toBeVisible()
+        await expect
+          .element(screen.getByText(/whole globe, before the domain cut-out/))
+          .not.toBeInTheDocument()
+      },
+    )
+
+    it('explains why a typed grid is invalid', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType={gridType} initialValue="auto" />,
+      )
+      await screen.getByText('Keep input grid').click()
+      await screen.getByPlaceholder(/type a grid/).fill('O100')
+      await expect
+        .element(
+          screen.getByText(
+            /Gaussian grid number must be one of 32, .*, 8000\./,
+          ),
+        )
+        .toBeVisible()
+    })
+  })
+
+  // Labels come from the MSW resolveDisplay handler (mockParamDisplays).
+  describe('Parameter fields', () => {
+    const PARAM_LIST = "list[enumClosed[param]('151','165','167','999')]"
+
+    it('labels chips with shortnames and stores ids', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer
+          valueType={PARAM_LIST}
+          initialValue="167,151"
+        />,
+      )
+      const chip = screen.getByText('2t', { exact: true })
+      await expect.element(chip).toBeVisible()
+      await expect
+        .element(screen.getByText('msl', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByTestId('current-value'))
+        .toHaveTextContent('167,151')
+
+      await chip.hover()
+      await expect
+        .element(
+          screen.getByText('2 metre temperature [K] (2t)', { exact: true }),
+        )
+        .toBeVisible()
+    })
+
+    it('finds a parameter by name or id and stores its id', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType={PARAM_LIST} />,
+      )
+      const input = screen.getByPlaceholder('Add item...')
+      await input.fill('temperature')
+      await expect
+        .element(screen.getByRole('option', { name: /2 metre temperature/ }))
+        .toBeVisible()
+      expect(screen.getByRole('option').elements()).toHaveLength(1)
+
+      await input.fill('165')
+      const wind = screen.getByRole('option', { name: /10 metre U wind/ })
+      await expect.element(wind).toBeVisible()
+      await wind.click()
+      await expect
+        .element(screen.getByTestId('current-value'))
+        .toHaveTextContent('165')
+    })
+
+    it('lists ids the backend cannot resolve as they are', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType={PARAM_LIST} />,
+      )
+      await screen.getByPlaceholder('Add item...').fill('999')
+      await expect
+        .element(screen.getByRole('option', { name: '999' }))
+        .toBeVisible()
+    })
+
+    it('keeps a value the options no longer offer visible', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer
+          valueType={PARAM_LIST}
+          initialValue="2t-167,151"
+        />,
+      )
+      const stale = screen.getByText('2t-167', { exact: true })
+      await expect.element(stale).toBeVisible()
+      await expect
+        .element(screen.getByText('msl', { exact: true }))
+        .toBeVisible()
+
+      await stale.hover()
+      await expect
+        .element(
+          screen.getByText(
+            '2t-167 is no longer offered by the input. Remove it.',
+          ),
+        )
+        .toBeVisible()
+    })
+
+    it('labels list[param] tags', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType="list[param]" initialValue="167" />,
+      )
+      const tag = screen.getByText('2t', { exact: true })
+      await expect.element(tag).toBeVisible()
+      await tag.hover()
+      await expect
+        .element(
+          screen.getByText('2 metre temperature [K] (2t)', { exact: true }),
+        )
+        .toBeVisible()
+    })
+
+    it('shows the full label in a single-parameter select', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer
+          valueType="enumClosed[param]('167','151')"
+          initialValue="167"
+        />,
+      )
+      await expect
+        .element(
+          screen
+            .getByRole('combobox')
+            .getByText('2 metre temperature [K] (2t)'),
+        )
+        .toBeVisible()
+    })
+  })
+
+  // Names come from the MSW artifact catalogue (list_models).
+  describe('Artifact field', () => {
+    const CHECKPOINTS =
+      "enumClosed[artifact]('ecmwf:aifs-ens-crps-1.0_w_sdpa','ecmwf:not-in-catalogue')"
+
+    it('shows the catalogue name instead of the wire id', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer
+          valueType={CHECKPOINTS}
+          initialValue="ecmwf:aifs-ens-crps-1.0_w_sdpa"
+        />,
+      )
+      const trigger = screen.getByRole('combobox')
+      await expect.element(trigger.getByText('AIFS ENS CRPS 1.0')).toBeVisible()
+
+      await trigger.click()
+      const option = screen.getByRole('option', { name: /AIFS ENS CRPS 1\.0/ })
+      await expect.element(option).toBeVisible()
+      // Maturity, not size or download state.
+      await expect
+        .element(option.getByText('maturity: operational'))
+        .toBeVisible()
+      expect(option.element().textContent).not.toMatch(/Downloaded|\d\s?[KMG]B/)
+      // Unknown ids stay selectable under their wire id.
+      await expect
+        .element(screen.getByRole('option', { name: 'ecmwf:not-in-catalogue' }))
+        .toBeVisible()
+    })
+
+    it('keeps the column sizers out of option names', async () => {
+      const screen = await renderWithProviders(
+        <ControlledFieldRenderer valueType="artifact" initialValue="" />,
+      )
+      await screen.getByRole('combobox').click()
+      const demo = screen.getByRole('option', { name: /aifs-single-v0\.2\.1/ })
+      await expect.element(demo).toHaveAccessibleName(/maturity: demo$/)
+      await expect.element(demo).not.toHaveAccessibleName(/operational/)
+    })
+
+    describe('after a failed download', () => {
+      afterEach(() => resetDownloadState())
+
+      it('marks the checkpoint, with the reason on hover', async () => {
+        const id = {
+          artifact_store_id: 'ecmwf',
+          artifact_local_id: 'aifs-single-mse-1.1_w_sdpa',
+        }
+        failNextDownloadPoll(id, 'HTTPError(503)')
+        function StartDownload() {
+          const { mutate } = useDownloadActions()
+          useEffect(() => mutate(id), [mutate])
+          return null
+        }
+        const screen = await renderWithProviders(
+          <>
+            <ControlledFieldRenderer
+              valueType="enumClosed[artifact]('ecmwf:aifs-single-mse-1.1_w_sdpa')"
+              initialValue=""
+            />
+            <StartDownload />
+          </>,
+        )
+
+        await screen.getByRole('combobox').click()
+        const badge = screen.getByRole('option').getByText('Download failed')
+        await expect.element(badge).toBeVisible()
+        await badge.hover()
+        await expect.element(screen.getByText('HTTPError(503)')).toBeVisible()
+      })
+    })
+
+    describe('with two models sharing a display name', () => {
+      const model = (localId: string) => ({
+        composite_id: {
+          artifact_store_id: 'ecmwf',
+          artifact_local_id: localId,
+        },
+        display_name: 'AIFS ENS CRPS 1.0',
+        display_author: 'ECMWF',
+        disk_size_bytes: 1,
+        supported_platforms: [],
+        tags: {},
+        is_available: false,
+        is_locally_compatible: true,
+        local_compatibility_detail: null,
+      })
+      const useTwins = () =>
+        worker.use(
+          http.get(`*${API_ENDPOINTS.artifacts.listModels}`, () =>
+            HttpResponse.json([model('crps_sdpa'), model('crps_flash')]),
+          ),
+        )
+
+      it('keeps the bare name when only one of them is offered', async () => {
+        useTwins()
+        const screen = await renderWithProviders(
+          <ControlledFieldRenderer
+            valueType="enumClosed[artifact]('ecmwf:crps_sdpa')"
+            initialValue="ecmwf:crps_sdpa"
+          />,
+        )
+        await expect
+          .element(
+            screen
+              .getByRole('combobox')
+              .getByText('AIFS ENS CRPS 1.0', { exact: true }),
+          )
+          .toBeVisible()
+      })
+
+      it('tells them apart by id when both are offered', async () => {
+        useTwins()
+        const screen = await renderWithProviders(
+          <ControlledFieldRenderer valueType="artifact" initialValue="" />,
+        )
+        await screen.getByRole('combobox').click()
+        const flash = screen.getByRole('option', { name: /crps_flash/ })
+        await expect
+          .element(flash.getByText('crps_flash', { exact: true }))
+          .toBeVisible()
+        // The one-line trigger carries the id in its label instead.
+        await flash.click()
+        await expect
+          .element(
+            screen
+              .getByRole('combobox')
+              .getByText('AIFS ENS CRPS 1.0 · crps_flash'),
+          )
+          .toBeVisible()
+      })
     })
   })
 })

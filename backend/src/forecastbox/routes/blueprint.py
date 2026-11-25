@@ -19,43 +19,78 @@ Contains three categories of routes:
  - building helper routes, which the clients call in sequence before creating a blueprint.
 
 Glyph routes:
- - GET  glyphs/list      — list intrinsic or global glyphs
+ - GET  glyphs/list      — list glyphs with optional type/key filters; returns combined intrinsic+global
  - GET  glyphs/functions — list all custom interpolation functions (filters and globals)
- - POST glyphs/global/post  — create or update a global glyph
- - GET  glyphs/global/get   — retrieve a global glyph by id
+ - POST glyphs/global/post    — create or update a global glyph
+ - POST glyphs/global/delete  — delete a global glyph by id
+
+Also contains:
+ - POST options/resolveDisplay — resolve cryptic configuration option values (artifact ids,
+   parameter ids) into display strings
 """
 
-from typing import Annotated, Literal, cast
+import datetime as dt
+import logging
+from functools import partial
+from typing import Annotated, Any, Literal, cast
 
 from cascade.low.func import assert_never
 from fastapi import APIRouter, Depends, status
 from fastapi.exceptions import HTTPException
-from fiab_core.fable import BlockFactoryCatalogue, BlockInstanceId, PluginBlockFactoryId, PluginCompositeId
+from fiab_core.fable import (
+    BlockFactoryCatalogue,
+    BlockInstanceId,
+    ConfigurationOptionId,
+    PluginCompositeId,
+)
 
 from forecastbox.domain.auth.users import get_auth_context
 from forecastbox.domain.blueprint import db, service
+from forecastbox.domain.blueprint.display import ResolvableValue, configOption2display
 from forecastbox.domain.blueprint.exceptions import (
     BlueprintAccessDenied,
     BlueprintNotFound,
     BlueprintVersionConflict,
 )
-from forecastbox.domain.blueprint.service import BlueprintBuilder, BlueprintSaveCommand, BlueprintValidationExpansion
+from forecastbox.domain.blueprint.service import (
+    CORE_VERSION_MISMATCH_TAG_KEY,
+    BlueprintBuilder,
+    BlueprintSaveCommand,
+    BlueprintValidationExpansion,
+    PluginBlockFactoryId,
+    SerializedBlockExpansion,
+    Tag,
+    tag_name_errors,
+)
 from forecastbox.domain.blueprint.types import BlueprintId
 from forecastbox.domain.glyphs import global_db
 from forecastbox.domain.glyphs.intrinsic import AvailableIntrinsicGlyphs, get_values_and_examples
 from forecastbox.domain.glyphs.jinja_interpolation import get_custom_functions
 from forecastbox.domain.glyphs.types import GlobalGlyphId
-from forecastbox.domain.plugin.manager import catalogue_view, plugins_ready
+from forecastbox.domain.glyphs.validation import validate_glyph
+from forecastbox.domain.plugin.compatibility import get_fiabcore_version
+from forecastbox.domain.plugin.status import catalogue_view, plugins_ready
+from forecastbox.schemata.blueprint import BlueprintSource
 from forecastbox.utility.auth import AuthContext
+from forecastbox.utility.concurrency.manager import execution_manager
+from forecastbox.utility.config import ROUTE_PREFIX
 from forecastbox.utility.pagination import PaginationSpec
 from forecastbox.utility.pydantic import FiabBaseModel
+from forecastbox.utility.time import value_dt2str
 
-PREFIX = "/api/v1/blueprint"
+logger = logging.getLogger(__name__)
+PREFIX = f"{ROUTE_PREFIX}/blueprint"
 
 router = APIRouter(
     tags=["blueprint"],
     responses={404: {"description": "Not found"}},
 )
+
+
+def _maybe_append_coreversion_mismatch(tags: list[Tag], entity_coreversion: int, current_coreversion: int) -> None:
+    """Append a ``CoreVersionMismatch`` tag when the stored and current fiab-core major versions differ."""
+    if entity_coreversion != current_coreversion:
+        tags.append(Tag(key=CORE_VERSION_MISMATCH_TAG_KEY, value=f"!{entity_coreversion} != {current_coreversion}"))
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +113,7 @@ class BlueprintCreateRequest(FiabBaseModel):
     builder: BlueprintBuilder
     display_name: str | None = None
     display_description: str | None = None
-    tags: list[str] = []
+    tags: list[Tag] = []
     parent_id: str | None = None
 
 
@@ -87,28 +122,35 @@ class BlueprintCreateResponse(FiabBaseModel):
     version: int
 
 
-class BlueprintGetResponse(FiabBaseModel):
+class BlueprintDetail(FiabBaseModel):
+    """A Blueprint, as returned by both the get and list endpoints.
+
+    ``builder`` is only populated by the get endpoint -- the list endpoint
+    leaves it unset to keep the response size small.
+    """
+
     blueprint_id: BlueprintId
     version: int
-    builder: BlueprintBuilder
+    builder: BlueprintBuilder | None = None
     display_name: str | None = None
     display_description: str | None = None
-    tags: list[str] = []
+    tags: list[Tag] = []
     parent_id: str | None = None
+    source: BlueprintSource | None = None
+    created_at: str
+    updated_at: str
+    user: str
 
 
-class BlueprintListItem(FiabBaseModel):
-    blueprint_id: BlueprintId
-    version: int
-    display_name: str | None = None
-    display_description: str | None = None
-    tags: list[str] | None = None
-    source: str | None = None
+class BlueprintListFilters(FiabBaseModel):
+    """Optional query-parameter filters for the blueprint list endpoint."""
+
     created_by: str | None = None
+    source: BlueprintSource | None = None
 
 
 class BlueprintListResponse(FiabBaseModel):
-    blueprints: list[BlueprintListItem]
+    blueprints: list[BlueprintDetail]
     total: int
     page: int
     page_size: int
@@ -120,7 +162,7 @@ class BlueprintUpdateRequest(FiabBaseModel):
     builder: BlueprintBuilder
     display_name: str | None = None
     display_description: str | None = None
-    tags: list[str] = []
+    tags: list[Tag] = []
     parent_id: str | None = None
 
 
@@ -140,24 +182,24 @@ class BlueprintValidationExpansionResponse(FiabBaseModel):
     global_errors: list[str]
     block_errors: dict[BlockInstanceId, list[str]]
     possible_sources: list[PluginBlockFactoryId]
-    possible_expansions: dict[BlockInstanceId, list[PluginBlockFactoryId]]
-    resolved_configuration_options: dict[BlockInstanceId, dict[str, str]]
+    possible_expansions: dict[BlockInstanceId, list[SerializedBlockExpansion]]
+    configuration_restrictions: dict[BlockInstanceId, dict[ConfigurationOptionId, str]] = {}
+    resolved_configuration_options: dict[BlockInstanceId, dict[ConfigurationOptionId, str | None]]
+    missing_glyphs: dict[BlockInstanceId, dict[ConfigurationOptionId, list[str]]] = {}
+    block_output_qubes: dict[BlockInstanceId, dict[str, Any]] = {}
 
 
-class GlyphDetail(FiabBaseModel):
+GlyphType = Literal["intrinsic", "global"]
+
+
+class IntrinsicGlyphResponse(FiabBaseModel):
+    """Detail of a single intrinsic (system-provided) glyph."""
+
+    glyph_type: GlyphType = "intrinsic"
     name: str
     display_name: str
     valueExample: str
     created_by: str
-
-
-class GlyphListResponse(FiabBaseModel):
-    """Paginated list of glyphs, for both intrinsic and global types."""
-
-    glyphs: list[GlyphDetail]
-    total: int
-    page: int
-    page_size: int
 
 
 class GlobalGlyphPostRequest(FiabBaseModel):
@@ -174,8 +216,9 @@ class GlobalGlyphPostRequest(FiabBaseModel):
 
 
 class GlobalGlyphResponse(FiabBaseModel):
-    """Detail of a single global glyph, returned by get and post endpoints."""
+    """Detail of a single global glyph, returned by post and list endpoints."""
 
+    glyph_type: GlyphType = "global"
     global_glyph_id: GlobalGlyphId
     key: str
     value: str
@@ -184,6 +227,15 @@ class GlobalGlyphResponse(FiabBaseModel):
     created_by: str
     created_at: str
     updated_at: str
+
+
+class GlyphListResponse(FiabBaseModel):
+    """Paginated list of glyphs, combining intrinsic and global types."""
+
+    glyphs: list[GlobalGlyphResponse | IntrinsicGlyphResponse]
+    total: int
+    page: int
+    page_size: int
 
 
 class GlobalGlyphLookup(FiabBaseModel):
@@ -215,12 +267,15 @@ async def create_blueprint(
 
     Returns 422 if the builder fails validation (unknown plugins, undefined
     glyphs, config errors, intrinsic glyph key collisions, etc.).
+    Returns 422 if any of the supplied tags has a reserved key.
     """
+    tag_errors = tag_name_errors(request.tags)
     validation = await service.validate_expand(request.builder, auth_context, validate_only=True)
-    if validation.global_errors or validation.block_errors:
+    global_errors = tag_errors + validation.global_errors
+    if global_errors or validation.block_errors:
         raise HTTPException(
             status_code=422,
-            detail={"global_errors": validation.global_errors, "block_errors": validation.block_errors},
+            detail={"global_errors": global_errors, "block_errors": validation.block_errors},
         )
     payload = BlueprintSaveCommand(
         builder=request.builder,
@@ -241,47 +296,90 @@ async def create_blueprint(
 @router.get("/get")
 async def get_blueprint(
     spec: Annotated[BlueprintLookup, Depends()],
-) -> BlueprintGetResponse:
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> BlueprintDetail:
     """Retrieve a saved blueprint by id and optional version.
 
-    Returns the latest non-deleted version when version is omitted.
+    Returns the latest non-deleted version when version is omitted. Applies the
+    same ownership scoping as ``/list`` -- a caller may only retrieve a blueprint
+    they own, a plugin template, or (if admin) any blueprint.
     """
     try:
-        retrieved = await service.load_builder(spec.blueprint_id, spec.version)
+        retrieved = await service.load_builder(spec.blueprint_id, spec.version, auth_context)
     except BlueprintNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return BlueprintGetResponse(
+    tags = list(retrieved.tags)
+    _maybe_append_coreversion_mismatch(tags, retrieved.fiabcore_major, get_fiabcore_version().major)
+    return BlueprintDetail(
         blueprint_id=retrieved.blueprint_id,
         version=retrieved.blueprint_version,
         builder=retrieved.builder,
         display_name=retrieved.display_name,
         display_description=retrieved.display_description,
-        tags=retrieved.tags,
+        tags=tags,
         parent_id=retrieved.parent_id,
+        source=cast(BlueprintSource, retrieved.source),
+        created_at=retrieved.created_at,
+        updated_at=retrieved.updated_at,
+        user=retrieved.user,
     )
 
 
 @router.get("/list")
 async def list_blueprints(
     pagination: Annotated[PaginationSpec, Depends()],
+    filters: Annotated[BlueprintListFilters, Depends()],
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> BlueprintListResponse:
-    """List the latest non-deleted version of every blueprint visible to the caller."""
-    total = await db.count_blueprints(auth_context=auth_context)
+    """List the latest non-deleted version of every blueprint visible to the caller.
+
+    Optional query parameters:
+    - ``created_by``: restrict to blueprints owned by this user or plugin.
+    - ``source``: restrict to blueprints with this source (``plugin_template``,
+      ``user_defined``, or ``oneoff_execution``).  Returns 422 for unknown values.
+    """
+    total = cast(
+        int,
+        await execution_manager.await_jobs_db(
+            "blueprint.count", partial(db.count_blueprints, auth_context=auth_context, created_by=filters.created_by, source=filters.source)
+        ),
+    )
     start = pagination.start()
-    page_defs = list(await db.list_blueprints(auth_context=auth_context, offset=start, limit=pagination.page_size))
-    items = [
-        BlueprintListItem(
-            blueprint_id=BlueprintId(str(defn.blueprint_id)),  # ty:ignore[invalid-argument-type]
-            version=cast(int, defn.version),
-            display_name=cast(str | None, defn.display_name),
-            display_description=cast(str | None, defn.display_description),
-            tags=cast(list[str] | None, defn.tags),
-            source=cast(str | None, defn.source),
-            created_by=cast(str | None, defn.created_by),
+    page_defs = cast(
+        list[db.BlueprintLatest],
+        await execution_manager.await_jobs_db(
+            "blueprint.list",
+            partial(
+                db.list_blueprints,
+                auth_context=auth_context,
+                offset=start,
+                limit=pagination.page_size,
+                created_by=filters.created_by,
+                source=filters.source,
+            ),
+        ),
+    )
+    current_fiabcore_major = get_fiabcore_version().major
+    items = []
+    for row in page_defs:
+        defn = row.blueprint
+        raw_tags: list[dict] = cast(list[dict], defn.tags) or []
+        tags = [Tag.model_validate(t) for t in raw_tags]
+        _maybe_append_coreversion_mismatch(tags, defn.fiabcore_major, current_fiabcore_major)
+        items.append(
+            BlueprintDetail(
+                blueprint_id=BlueprintId(str(defn.blueprint_id)),  # ty:ignore[invalid-argument-type]
+                version=defn.version,
+                display_name=defn.display_name,
+                display_description=defn.display_description,
+                tags=tags,
+                parent_id=defn.parent_id,
+                source=cast(BlueprintSource | None, defn.source),
+                created_at=value_dt2str(row.created_at),
+                updated_at=value_dt2str(defn.created_at),
+                user=defn.created_by,
+            )
         )
-        for defn in page_defs
-    ]
     return BlueprintListResponse(blueprints=items, total=total, page=pagination.page, page_size=pagination.page_size)
 
 
@@ -295,13 +393,16 @@ async def update_blueprint(
     ``version`` must match the current latest version; returns 409 if it does not.
     Returns 422 if the builder fails validation (unknown plugins, undefined
     glyphs, config errors, intrinsic glyph key collisions, etc.).
+    Returns 422 if any of the supplied tags has a reserved key.
     Returns the new version number on success.
     """
+    tag_errors = tag_name_errors(request.tags)
     validation = await service.validate_expand(request.builder, auth_context, validate_only=True)
-    if validation.global_errors or validation.block_errors:
+    global_errors = tag_errors + validation.global_errors
+    if global_errors or validation.block_errors:
         raise HTTPException(
             status_code=422,
-            detail={"global_errors": validation.global_errors, "block_errors": validation.block_errors},
+            detail={"global_errors": global_errors, "block_errors": validation.block_errors},
         )
     payload = BlueprintSaveCommand(
         builder=request.builder,
@@ -336,10 +437,9 @@ async def delete_blueprint(
     ``version`` must match the current latest version; returns 409 if it does not.
     """
     try:
-        await db.soft_delete_blueprint(
-            request.blueprint_id,
-            expected_version=request.version,
-            auth_context=auth_context,
+        await execution_manager.await_jobs_db(
+            "blueprint.delete",
+            partial(db.soft_delete_blueprint, request.blueprint_id, expected_version=request.version, auth_context=auth_context),
         )
     except BlueprintVersionConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -355,33 +455,38 @@ async def delete_blueprint(
 
 
 @router.get("/catalogue")
-def get_catalogue() -> dict[PluginCompositeId, BlockFactoryCatalogue]:
+async def get_catalogue() -> dict[PluginCompositeId, BlockFactoryCatalogue]:
     """All blocks this backend is capable of evaluating within a blueprint."""
     if not plugins_ready():
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Plugins not ready")
-    catalogue = catalogue_view()
-    if isinstance(catalogue, bool):
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Plugins not ready")
-    return catalogue
+    return catalogue_view()
 
 
 @router.put("/expand")
 async def expand_blueprint(
     blueprint: BlueprintBuilder,
     auth_context: AuthContext = Depends(get_auth_context),
+    validate_only: bool = False,
 ) -> BlueprintValidationExpansionResponse:
     """Validate a partially-constructed BlueprintBuilder and return completion options.
 
     Returns 200 regardless of whether validation errors are present; callers must
     inspect the returned error fields.
+
+    ``validate_only`` skips the (more expensive) expansion computation when the caller
+    only cares about resolved configuration options and validation errors -- e.g. when
+    re-rendering a previously executed Run for display purposes.
     """
-    result = await service.validate_expand(blueprint, auth_context, validate_only=False)
+    result = await service.validate_expand(blueprint, auth_context, validate_only=validate_only)
     return BlueprintValidationExpansionResponse(
         global_errors=result.global_errors,
         block_errors=result.block_errors,
         possible_sources=result.possible_sources,
         possible_expansions=result.possible_expansions,
+        configuration_restrictions=result.configuration_restrictions,
         resolved_configuration_options=result.resolved_configuration_options,
+        missing_glyphs=result.missing_glyphs,
+        block_output_qubes=result.block_output_qubes,
     )
 
 
@@ -390,52 +495,92 @@ async def expand_blueprint(
 # ---------------------------------------------------------------------------
 
 
+def _build_intrinsic_glyphs(glyph_key: str | None) -> list[IntrinsicGlyphResponse]:
+    """Return all intrinsic glyphs, optionally filtered by exact key match."""
+    result: list[IntrinsicGlyphResponse] = []
+    for glyph_name, example in get_values_and_examples().items():
+        if glyph_key is not None and glyph_name != glyph_key:
+            continue
+        glyph: AvailableIntrinsicGlyphs = glyph_name
+        if glyph == "runId":
+            display_name = "Run ID"
+        elif glyph == "submitDatetime":
+            display_name = "Submit Datetime (fixed at first submission, preserved on restart)"
+        elif glyph == "startDatetime":
+            display_name = "Start Datetime (updated on every restart)"
+        elif glyph == "attemptCount":
+            display_name = "Attempt Count (incremented on every restart)"
+        else:
+            assert_never(glyph)
+        result.append(IntrinsicGlyphResponse(name=glyph_name, display_name=display_name, valueExample=example, created_by="intrinsic"))
+    return result
+
+
+def _row_to_global_response(row: global_db.GlobalGlyphRecord) -> GlobalGlyphResponse:
+    return GlobalGlyphResponse(
+        global_glyph_id=GlobalGlyphId(str(row.global_glyph_id)),  # ty:ignore[invalid-argument-type]
+        key=str(row.key),
+        value=str(row.value),
+        public=bool(row.public),
+        overriddable=bool(row.overriddable) if row.overriddable is not None else None,
+        created_by=str(row.created_by),
+        created_at=str(row.created_at),
+        updated_at=str(row.updated_at),
+    )
+
+
 @router.get("/glyphs/list")
 async def list_available_glyphs(
-    glyph_type: Literal["intrinsic", "global"] = "intrinsic",
+    glyph_type: GlyphType | None = None,
+    glyph_key: str | None = None,
     pagination: Annotated[PaginationSpec, Depends()] = PaginationSpec(),
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> GlyphListResponse:
-    """List available glyphs.
+    """List available glyphs with optional filtering.
 
-    When ``glyph_type`` is ``intrinsic``, returns the fixed set of system-provided
-    glyphs; pagination params are ignored.  When ``glyph_type`` is ``global``,
-    returns user-defined glyphs visible to the caller with paging applied.
+    ``glyph_type`` may be ``intrinsic``, ``global``, or omitted (returns both).
+    ``glyph_key`` filters to glyphs whose key exactly matches the given value.
+
+    Results are ordered: all matching intrinsic glyphs first (ordered by key),
+    then matching global glyphs (ordered by key).  Pagination is applied across
+    the combined result set.
     """
-    if glyph_type == "intrinsic":
-        glyphs: list[GlyphDetail] = []
-        for glyph_name, example in get_values_and_examples().items():
-            glyph: AvailableIntrinsicGlyphs = glyph_name
-            if glyph == "runId":
-                display_name = "Run ID"
-            elif glyph == "submitDatetime":
-                display_name = "Submit Datetime (fixed at first submission, preserved on restart)"
-            elif glyph == "startDatetime":
-                display_name = "Start Datetime (updated on every restart)"
-            elif glyph == "attemptCount":
-                display_name = "Attempt Count (incremented on every restart)"
-            else:
-                assert_never(glyph)
-            glyphs.append(GlyphDetail(name=glyph_name, display_name=display_name, valueExample=example, created_by="intrinsic"))
-        return GlyphListResponse(glyphs=glyphs, total=len(glyphs), page=1, page_size=len(glyphs))
-    else:
-        total = await global_db.count_global_glyphs(auth_context)
-        start = pagination.start()
-        rows = list(await global_db.list_global_glyphs(auth_context, offset=start, limit=pagination.page_size))
-        glyphs_global = [
-            GlyphDetail(
-                name=str(row.key),
-                display_name=str(row.key),
-                valueExample=str(row.value),
-                created_by=str(row.created_by),
+    want_intrinsic = glyph_type is None or glyph_type == "intrinsic"
+    want_global = glyph_type is None or glyph_type == "global"
+
+    # Always compute all matching intrinsic glyphs (there are always few).
+    intrinsic_all = _build_intrinsic_glyphs(glyph_key) if want_intrinsic else []
+    intrinsic_page, remainder = pagination.extract_and_shift(intrinsic_all)
+
+    global_items: list[GlobalGlyphResponse] = []
+    global_total = 0
+    if want_global:
+        global_total = cast(
+            int, await execution_manager.await_jobs_db("glyph.count", partial(global_db.count_global_glyphs, auth_context, key=glyph_key))
+        )
+        if remainder.current_page_remaining > 0:
+            rows = cast(
+                list[global_db.GlobalGlyphRecord],
+                await execution_manager.await_jobs_db(
+                    "glyph.list",
+                    partial(
+                        global_db.list_global_glyphs,
+                        auth_context,
+                        offset=remainder.offset_shifted,
+                        limit=remainder.current_page_remaining,
+                        key=glyph_key,
+                    ),
+                ),
             )
-            for row in rows
-        ]
-        return GlyphListResponse(glyphs=glyphs_global, total=total, page=pagination.page, page_size=pagination.page_size)
+            global_items = [_row_to_global_response(row) for row in rows]
+
+    combined: list[GlobalGlyphResponse | IntrinsicGlyphResponse] = [*intrinsic_page, *global_items]
+    total = len(intrinsic_all) + global_total
+    return GlyphListResponse(glyphs=combined, total=total, page=pagination.page, page_size=pagination.page_size)
 
 
 @router.get("/glyphs/functions")
-def list_glyph_functions() -> GlyphFunctionsResponse:
+async def list_glyph_functions() -> GlyphFunctionsResponse:
     """Return all custom functions available in glyph interpolation expressions.
 
     Includes both filters (pipe syntax, e.g. ``${dt | add_days(1)}``) and globals
@@ -458,11 +603,11 @@ async def post_global_glyph(
     must be absent when public=False).
     Returns 403 if a non-admin tries to create a public glyph.
     """
-    intrinsic_names = set(get_values_and_examples().keys())
-    if request.key in intrinsic_names:
+    glyph_validation = validate_glyph(request.key)
+    if glyph_validation.e is not None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Key {request.key!r} is reserved as an intrinsic glyph and cannot be overridden.",
+            detail=f"Key {request.key!r} {glyph_validation.e}.",
         )
     if request.public and request.overriddable is None:
         raise HTTPException(
@@ -479,35 +624,71 @@ async def post_global_glyph(
             status_code=403,
             detail="Only admins may create or update public global glyphs.",
         )
-    row = await global_db.upsert_global_glyph(request.key, request.value, request.public, request.overriddable, auth_context)
-    return GlobalGlyphResponse(
-        global_glyph_id=GlobalGlyphId(str(row.global_glyph_id)),  # ty:ignore[invalid-argument-type]
-        key=str(row.key),
-        value=str(row.value),
-        public=bool(row.public),
-        overriddable=bool(row.overriddable) if row.overriddable is not None else None,
-        created_by=str(row.created_by),
-        created_at=str(row.created_at),
-        updated_at=str(row.updated_at),
+    row = cast(
+        global_db.GlobalGlyphRecord,
+        await execution_manager.await_jobs_db(
+            "glyph.upsert",
+            partial(global_db.upsert_global_glyph, request.key, request.value, request.public, request.overriddable, auth_context),
+        ),
     )
+    return _row_to_global_response(row)
 
 
-@router.get("/glyphs/global/get")
-async def get_global_glyph(
-    spec: Annotated[GlobalGlyphLookup, Depends()],
+@router.post("/glyphs/global/delete")
+async def delete_global_glyph(
+    request: GlobalGlyphLookup,
     auth_context: AuthContext = Depends(get_auth_context),
-) -> GlobalGlyphResponse:
-    """Retrieve a global glyph visible to the caller by its stable id."""
-    row = await global_db.get_global_glyph(spec.global_glyph_id, auth_context)
+) -> None:
+    """Delete a global glyph by its stable id.
+
+    Returns 404 if the glyph does not exist or is not visible to the caller.
+    Returns 403 if the caller is not the owner and is not an admin.
+    """
+    row = cast(
+        global_db.GlobalGlyphRecord | None,
+        await execution_manager.await_jobs_db(
+            "glyph.delete", partial(global_db.delete_global_glyph, request.global_glyph_id, auth_context)
+        ),
+    )
     if row is None:
-        raise HTTPException(status_code=404, detail=f"GlobalGlyph {spec.global_glyph_id!r} not found.")
-    return GlobalGlyphResponse(
-        global_glyph_id=GlobalGlyphId(str(row.global_glyph_id)),  # ty:ignore[invalid-argument-type]
-        key=str(row.key),
-        value=str(row.value),
-        public=bool(row.public),
-        overriddable=bool(row.overriddable) if row.overriddable is not None else None,
-        created_by=str(row.created_by),
-        created_at=str(row.created_at),
-        updated_at=str(row.updated_at),
+        raise HTTPException(status_code=404, detail=f"GlobalGlyph {request.global_glyph_id!r} not found or not accessible.")
+
+
+# ---------------------------------------------------------------------------
+# Configuration option display resolution
+# ---------------------------------------------------------------------------
+
+
+class ResolveDisplayRequest(FiabBaseModel):
+    elements: list[ResolvableValue]
+
+
+class ResolvedValue(FiabBaseModel):
+    typeName: str
+    value: str
+    display: str | None
+
+
+class ResolveDisplayResponse(FiabBaseModel):
+    elements: list[ResolvedValue]
+
+
+@router.post("/options/resolveDisplay")
+async def resolve_display(request: ResolveDisplayRequest) -> ResolveDisplayResponse:
+    """Resolve configuration option values into display strings.
+
+    Each element's ``typeName`` is parsed as a Fable type expression. Artifact ids are looked
+    up in the artifact catalog and resolved to their display name; parameter ids are resolved
+    via the Metkit param database. Any other valid type resolves to a None display. Returns
+    404 if any element's ``typeName`` is not a valid Fable type expression.
+    """
+    try:
+        displays = configOption2display(request.elements)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return ResolveDisplayResponse(
+        elements=[
+            ResolvedValue(typeName=element.typeName, value=element.value, display=display)
+            for element, display in zip(request.elements, displays)
+        ]
     )

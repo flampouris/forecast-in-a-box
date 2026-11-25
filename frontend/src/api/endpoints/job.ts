@@ -13,6 +13,7 @@
  */
 
 import type {
+  CompilationDetailResponse,
   JobExecuteRequest,
   JobExecuteResponse,
   JobExecutionDetail,
@@ -20,14 +21,14 @@ import type {
   JobStatus,
 } from '@/api/types/job.types'
 import {
+  CompilationDetailResponseSchema,
   JobExecuteResponseSchema,
   JobExecutionDetailSchema,
   JobExecutionListSchema,
 } from '@/api/types/job.types'
-import { ApiClientError, apiClient } from '@/api/client'
+import { apiClient, apiErrorFromResponse, buildUrl } from '@/api/client'
 import { API_ENDPOINTS } from '@/api/endpoints'
-import { getBackendBaseUrl } from '@/utils/env'
-import { STORAGE_KEYS } from '@/lib/storage-keys'
+import { readAnonymousId } from '@/lib/anonymous-id'
 
 export async function executeJob(
   request: JobExecuteRequest,
@@ -52,42 +53,49 @@ export async function getJobsStatus(
   })
 }
 
-function buildFullUrl(path: string, params?: Record<string, string>): string {
-  const baseUrl = getBackendBaseUrl()
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`
-  const fullPath = baseUrl
-    ? `${baseUrl.replace(/\/$/, '')}${normalizedPath}`
-    : normalizedPath
-
-  if (!params || Object.keys(params).length === 0) {
-    return fullPath
-  }
-
-  const searchParams = new URLSearchParams(params)
-  return `${fullPath}?${searchParams.toString()}`
-}
-
 function buildHeaders(): HeadersInit {
   const headers: HeadersInit = {}
-  const anonymousId = localStorage.getItem(STORAGE_KEYS.auth.anonymousId)
+  // Same validated read as apiClient.
+  const anonymousId = readAnonymousId()
   if (anonymousId) {
     headers['X-Anonymous-ID'] = anonymousId
   }
   return headers
 }
 
-export async function getJobStatus(runId: string): Promise<JobExecutionDetail> {
+export async function getJobStatus(
+  runId: string,
+  attemptCount?: number,
+): Promise<JobExecutionDetail> {
+  const params: Record<string, string | number> = { run_id: runId }
+  if (attemptCount != null) {
+    params.attempt_count = attemptCount
+  }
   return apiClient.get(API_ENDPOINTS.job.get, {
-    params: { run_id: runId },
+    params,
     schema: JobExecutionDetailSchema,
+  })
+}
+
+export async function getCompilationDetail(
+  runId: string,
+  blockId?: string,
+): Promise<CompilationDetailResponse> {
+  const params: Record<string, string> = { run_id: runId }
+  if (blockId != null) {
+    params.block_id = blockId
+  }
+  return apiClient.get(API_ENDPOINTS.job.compilationDetail, {
+    params,
+    schema: CompilationDetailResponseSchema,
   })
 }
 
 export async function getJobResult(
   runId: string,
   datasetId: string,
-): Promise<{ blob: Blob; contentType: string }> {
-  const url = buildFullUrl(API_ENDPOINTS.job.outputContent, {
+): Promise<{ blob: Blob }> {
+  const url = buildUrl(API_ENDPOINTS.job.outputContent, {
     run_id: runId,
     dataset_id: datasetId,
   })
@@ -98,71 +106,78 @@ export async function getJobResult(
   })
 
   if (!response.ok) {
-    throw new ApiClientError(
+    throw await apiErrorFromResponse(
+      response,
       `Failed to fetch result: ${response.statusText}`,
-      response.status,
     )
   }
 
   const blob = await response.blob()
-  const contentType =
-    response.headers.get('content-type') ?? 'application/octet-stream'
-  return { blob, contentType }
+  return { blob }
 }
 
 /**
- * Probe the output's MIME type without downloading the full body.
+ * Fetch only the leading `byteCount` bytes of an output — enough for magic-byte
+ * MIME sniffing without pulling a multi-gigabyte GRIB/NetCDF payload.
  *
- * We issue a GET and abort as soon as the response headers arrive. A HEAD
- * request would be cheaper on paper, but Vite's dev proxy doesn't forward
- * HEAD to /api routes — the SPA fallback intercepts and serves index.html
- * (text/html). GET + abort works uniformly in dev and prod, still avoids
- * downloading multi-gigabyte GRIB/NetCDF payloads.
+ * Sends a `Range` header; a server that honours it replies `206` with just the
+ * slice. A server (or dev proxy) that ignores Range replies `200` with the full
+ * body — still correct, since the caller only ever reads the first bytes.
  */
-export async function headJobResultContentType(
+export async function getJobResultHead(
   runId: string,
   datasetId: string,
-): Promise<string | null> {
-  const url = buildFullUrl(API_ENDPOINTS.job.outputContent, {
+  byteCount: number,
+): Promise<Uint8Array> {
+  const url = buildUrl(API_ENDPOINTS.job.outputContent, {
     run_id: runId,
     dataset_id: datasetId,
   })
-  const controller = new AbortController()
-  try {
-    const response = await fetch(url, {
-      method: 'GET',
-      credentials: 'include',
-      headers: buildHeaders(),
-      signal: controller.signal,
-    })
-    // Headers have arrived — abort to cancel body streaming.
-    controller.abort()
-    if (!response.ok) return null
-    return response.headers.get('content-type')
-  } catch (err) {
-    // AbortError can fire if the abort races the fetch resolution; treat
-    // as "unknown mime type" rather than propagating.
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      return null
-    }
-    throw err
+
+  const response = await fetch(url, {
+    credentials: 'include',
+    headers: { ...buildHeaders(), Range: `bytes=0-${byteCount - 1}` },
+  })
+
+  if (!response.ok) {
+    throw await apiErrorFromResponse(
+      response,
+      `Failed to fetch result head: ${response.statusText}`,
+    )
   }
+
+  const buf = await response.arrayBuffer()
+  // A Range-ignoring server returns the whole body; slice to the head we need.
+  return new Uint8Array(buf, 0, Math.min(buf.byteLength, byteCount))
 }
 
-export async function downloadJobLogs(runId: string): Promise<Blob> {
-  const url = buildFullUrl(API_ENDPOINTS.job.logs, {
+/** Absolute zip URL of a fetchable output. */
+export function buildOutputZipUrl(runId: string, datasetId: string): string {
+  const url = buildUrl(API_ENDPOINTS.job.outputZipped, {
+    run_id: runId,
+    dataset_id: datasetId,
+  })
+  return new URL(url, window.location.href).href
+}
+
+export async function downloadJobLogs(
+  runId: string,
+  { signal }: { signal?: AbortSignal } = {},
+): Promise<Blob> {
+  const url = buildUrl(API_ENDPOINTS.job.logs, {
     run_id: runId,
   })
 
   const response = await fetch(url, {
     credentials: 'include',
     headers: buildHeaders(),
+    signal,
   })
 
   if (!response.ok) {
-    throw new ApiClientError(
+    throw await apiErrorFromResponse(
+      response,
       `Failed to download logs: ${response.statusText}`,
-      response.status,
     )
   }
 
@@ -187,6 +202,17 @@ export async function deleteJob(
   attemptCount: number,
 ): Promise<void> {
   return apiClient.post(API_ENDPOINTS.job.delete, {
+    run_id: runId,
+    attempt_count: attemptCount,
+  })
+}
+
+/** Ask the backend to stop an active run; it turns `stopping`, then `stopped`. */
+export async function stopJob(
+  runId: string,
+  attemptCount: number,
+): Promise<void> {
+  return apiClient.post(API_ENDPOINTS.job.stop, {
     run_id: runId,
     attempt_count: attemptCount,
   })

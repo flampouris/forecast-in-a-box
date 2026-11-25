@@ -8,29 +8,39 @@
  * does it submit to any jurisdiction.
  */
 
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   ArrowLeft,
+  BrushCleaning,
+  CalendarClock,
   Check,
+  ChevronDown,
   Download,
   FileText,
-  LayoutGrid,
+  HelpCircle,
   MoreVertical,
+  Play,
+  Redo2,
   Save,
-  Share2,
+  Undo2,
   Upload,
 } from 'lucide-react'
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
+import { useTranslation } from 'react-i18next'
 import { ValidationStatusBadge } from './shared/ValidationStatus'
 import { DraftStatus } from './DraftStatus'
 import { GraphOptionsDropdown } from './graph-mode/GraphOptionsDropdown'
 import { SaveConfigPopover } from './SaveConfigPopover'
-import type {
-  BlockFactoryCatalogue,
-  FableBuilderV1,
-} from '@/api/types/fable.types'
+import { ConfigureHelpDialog } from './ConfigureHelpDialog'
+import type { BlockFactoryCatalogue } from '@/api/types/fable.types'
 import { getBlocksByKind } from '@/api/types/fable.types'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
+import { useFableRetrieve } from '@/api/hooks/useFable'
+import { stripSystemTags } from '@/lib/system-tags'
+import { Badge } from '@/components/ui/badge'
+import { downloadFableJson } from '@/features/fable-builder/utils/export-config'
+import { useLoadWorkflowFile } from '@/features/fable-builder/hooks/useLoadWorkflowFile'
+import { useUndoRedoShortcuts } from '@/features/fable-builder/hooks/useUndoRedoShortcuts'
 import { Button } from '@/components/ui/button'
 import { ButtonGroup } from '@/components/ui/button-group'
 import {
@@ -40,8 +50,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { H1 } from '@/components/base/typography'
-import { cn, copyToClipboard } from '@/lib/utils'
 import { showToast } from '@/lib/toast'
+import { TOUR, tourAttr } from '@/features/tutorials/anchors'
 import {
   Tooltip,
   TooltipContent,
@@ -51,62 +61,80 @@ import {
 interface FableBuilderHeaderProps {
   fableId?: string
   catalogue: BlockFactoryCatalogue
+  /** Fired after a config file was parsed and applied to the store */
+  onConfigLoaded?: () => void
+  /** Why the last validation request failed; null when it didn't. */
+  validationFailure?: string | null
 }
+
+/** Tags shown in the header before folding the rest into a +N. */
+const VISIBLE_TAG_COUNT = 3
 
 export function FableBuilderHeader({
   fableId,
   catalogue,
+  onConfigLoaded,
+  validationFailure = null,
 }: FableBuilderHeaderProps) {
-  const [shareButtonText, setShareButtonText] = useState('Share')
+  const { t } = useTranslation('configure')
   const [savePopoverOpen, setSavePopoverOpen] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const shareTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
-  useEffect(() => () => clearTimeout(shareTimeoutRef.current), [])
-
-  const mode = useFableBuilderStore((s) => s.mode)
   const step = useFableBuilderStore((s) => s.step)
   const fableName = useFableBuilderStore((s) => s.fableName)
+  // Fall back to a translated placeholder when the config is still unnamed.
+  const displayName = fableName || t('page.untitledConfiguration')
   const fable = useFableBuilderStore((s) => s.fable)
   const validationState = useFableBuilderStore((s) => s.validationState)
   const storeFableId = useFableBuilderStore((s) => s.fableId)
 
-  const setMode = useFableBuilderStore((s) => s.setMode)
   const setStep = useFableBuilderStore((s) => s.setStep)
-  const setFable = useFableBuilderStore((s) => s.setFable)
+  const loadWorkflowFile = useLoadWorkflowFile()
   const setSubmitDialogOpen = useFableBuilderStore((s) => s.setSubmitDialogOpen)
+  const undo = useFableBuilderStore((s) => s.undo)
+  const redo = useFableBuilderStore((s) => s.redo)
+  const canUndo = useFableBuilderStore((s) => s.past.length > 0)
+  const canRedo = useFableBuilderStore((s) => s.future.length > 0)
 
-  const blockCount = Object.keys(fable.blocks).length
+  // Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z (Ctrl+Y on Windows) only while editing —
+  // the review step is read-only, undo there would be misleading.
+  useUndoRedoShortcuts(step === 'edit')
+
   const isValid = validationState?.isValid ?? false
-  const hasBlocks = blockCount > 0
+  const hasBlocks = Object.keys(fable.blocks).length > 0
   const isExistingConfig = !!(fableId || storeFableId)
+  const { data: blueprint } = useFableRetrieve(fableId ?? storeFableId)
+  const tags = stripSystemTags(blueprint?.tags)
+  const hiddenTagCount = Math.max(0, tags.length - VISIBLE_TAG_COUNT)
   const hasSinkBlock = getBlocksByKind(fable, catalogue, 'sink').length > 0
   const canReview = isValid && hasSinkBlock
 
   const reviewTooltip = !hasBlocks
-    ? 'Add blocks to your configuration'
+    ? t('header.reviewTooltipNoBlocks')
     : !hasSinkBlock
-      ? 'Add at least one output block'
+      ? t('header.reviewTooltipNoSink')
       : !isValid
-        ? 'Fix validation errors before submitting'
+        ? t('header.reviewTooltipInvalid')
         : undefined
 
-  async function handleShare(): Promise<void> {
-    const ok = await copyToClipboard(window.location.href)
-    if (!ok) {
-      showToast.error('Could not copy link to clipboard')
-      return
-    }
-    setShareButtonText('Copied!')
-    clearTimeout(shareTimeoutRef.current)
-    shareTimeoutRef.current = setTimeout(
-      () => setShareButtonText('Share'),
-      2000,
-    )
+  const navigate = useNavigate()
+  // Routes through the fresh intent — dirty bench work parks on the shelf.
+  function handleNewConfiguration(): void {
+    void navigate({ to: '/configure', search: { fresh: true } })
   }
 
   function handleReview(): void {
     setStep('review')
+  }
+
+  function handleRunOnce(): void {
+    // Skip the review page — submit straight from the canvas.
+    setSubmitDialogOpen(true, 'run')
+  }
+
+  function handleSchedule(): void {
+    setSubmitDialogOpen(true, 'schedule')
   }
 
   function handleBackToEdit(): void {
@@ -115,20 +143,10 @@ export function FableBuilderHeader({
 
   function handleExportConfig(): void {
     try {
-      const json = JSON.stringify(fable, null, 2)
-      const blob = new Blob([json], { type: 'application/json' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      const date = new Date().toISOString().slice(0, 19).replace(/:/g, '-')
-      a.download = `${fableName.replace(/\s+/g, '_').toLowerCase()}_${date}_config.json`
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
+      downloadFableJson(fable, displayName)
     } catch (error) {
       showToast.error(
-        'Failed to export config',
+        t('header.exportFailed'),
         error instanceof Error ? error.message : String(error),
       )
     }
@@ -141,50 +159,9 @@ export function FableBuilderHeader({
   function handleFileChange(event: React.ChangeEvent<HTMLInputElement>): void {
     const file = event.target.files?.[0]
     if (!file) return
-
-    // Prevent client-side DoS from oversized files (1 MB limit)
-    const MAX_CONFIG_SIZE = 1 * 1024 * 1024
-    if (file.size > MAX_CONFIG_SIZE) {
-      showToast.error(
-        'File too large',
-        'Configuration files must be smaller than 1 MB.',
-      )
-      return
-    }
-
-    const reader = new FileReader()
-    reader.onload = (e) => {
-      try {
-        const content = e.target?.result as string
-        const parsed = JSON.parse(content) as unknown
-        if (
-          parsed &&
-          typeof parsed === 'object' &&
-          'blocks' in parsed &&
-          typeof (parsed as { blocks: unknown }).blocks === 'object'
-        ) {
-          setFable(parsed as FableBuilderV1, null)
-          showToast.success('Configuration loaded')
-        } else {
-          showToast.error(
-            'Invalid config file',
-            'File must contain a valid configuration with a "blocks" property.',
-          )
-        }
-      } catch (error) {
-        showToast.error(
-          'Failed to parse config file',
-          error instanceof Error ? error.message : String(error),
-        )
-      }
-    }
-    reader.onerror = () => {
-      showToast.error(
-        'Failed to read file',
-        reader.error?.message ?? 'Unknown read error',
-      )
-    }
-    reader.readAsText(file)
+    void loadWorkflowFile(file).then((loaded) => {
+      if (loaded) onConfigLoaded?.()
+    })
 
     // Reset input so same file can be loaded again
     event.target.value = ''
@@ -202,10 +179,10 @@ export function FableBuilderHeader({
       />
 
       <header className="w-full overflow-hidden border-b border-border bg-card px-4 py-3">
-        <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 sm:gap-4">
+        <div className="grid grid-cols-[1fr_auto] items-center gap-2 sm:gap-4">
           {/* Left: Back button + title */}
           <div className="flex min-w-0 items-center gap-2 sm:gap-3">
-            <Link to="/dashboard">
+            <Link to="/overview">
               <Button variant="ghost" size="icon" className="shrink-0">
                 <ArrowLeft className="h-4 w-4" />
               </Button>
@@ -214,60 +191,41 @@ export function FableBuilderHeader({
             <div className="min-w-0 overflow-hidden">
               <div className="flex min-w-0 items-center gap-2 overflow-hidden">
                 <H1 className="min-w-0 truncate text-lg font-semibold">
-                  {fableName}
+                  {displayName}
                 </H1>
               </div>
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <span>
-                  {blockCount} {blockCount === 1 ? 'block' : 'blocks'}
-                </span>
-                {hasBlocks && <ValidationStatusBadge />}
+              {/* Badge height keeps the header steady. */}
+              <div className="flex min-h-5 items-center gap-2 text-sm text-muted-foreground">
+                {hasBlocks && (
+                  <ValidationStatusBadge
+                    catalogue={catalogue}
+                    failure={validationFailure}
+                  />
+                )}
                 <DraftStatus className="hidden sm:inline-flex" />
+                {tags.length > 0 && (
+                  <span className="hidden min-w-0 items-center gap-1 sm:flex">
+                    {tags.slice(0, VISIBLE_TAG_COUNT).map((tag) => (
+                      <Badge
+                        key={tag}
+                        variant="outline"
+                        className="max-w-32 truncate font-normal text-muted-foreground"
+                      >
+                        {tag}
+                      </Badge>
+                    ))}
+                    {hiddenTagCount > 0 && (
+                      <span
+                        className="text-xs"
+                        title={tags.slice(VISIBLE_TAG_COUNT).join(', ')}
+                      >
+                        {t('header.moreTags', { count: hiddenTagCount })}
+                      </span>
+                    )}
+                  </span>
+                )}
               </div>
             </div>
-          </div>
-
-          {/* Center: Mode toggle (Graph/Form) */}
-          <div className="flex justify-center">
-            {step === 'edit' && (
-              <div className="flex shrink-0 items-center gap-1 rounded-lg bg-muted p-1">
-                {mode === 'graph' ? (
-                  <ButtonGroup>
-                    <Button
-                      variant="default"
-                      size="sm"
-                      className="gap-1.5 shadow-sm sm:gap-2"
-                    >
-                      <LayoutGrid className="h-4 w-4" />
-                      <span className="hidden sm:inline">Graph</span>
-                    </Button>
-                    <GraphOptionsDropdown />
-                  </ButtonGroup>
-                ) : (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => setMode('graph')}
-                    className="gap-1.5 sm:gap-2"
-                  >
-                    <LayoutGrid className="h-4 w-4" />
-                    <span className="hidden sm:inline">Graph</span>
-                  </Button>
-                )}
-                <Button
-                  variant={mode === 'form' ? 'default' : 'ghost'}
-                  size="sm"
-                  onClick={() => setMode('form')}
-                  className={cn(
-                    'gap-1.5 sm:gap-2',
-                    mode === 'form' && 'shadow-sm',
-                  )}
-                >
-                  <FileText className="h-4 w-4" />
-                  <span className="hidden sm:inline">Form</span>
-                </Button>
-              </div>
-            )}
           </div>
 
           {/* Right: Action buttons */}
@@ -276,63 +234,148 @@ export function FableBuilderHeader({
               <>
                 {/* Desktop: Show main buttons */}
                 <div className="hidden items-center gap-2 sm:flex">
-                  {/* Save Config with dropdown for more actions */}
-                  <ButtonGroup>
-                    <SaveConfigPopover
-                      fableId={fableId}
-                      catalogue={catalogue}
-                      disabled={!hasBlocks}
-                    />
-                    <DropdownMenu>
-                      <DropdownMenuTrigger
-                        render={
-                          <Button
-                            variant="outline"
-                            size="icon"
-                            className="h-8 w-8 border-l-0"
-                          />
-                        }
-                      >
-                        <MoreVertical className="h-4 w-4" />
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="min-w-37.5">
-                        <DropdownMenuItem
-                          onClick={handleShare}
-                          disabled={!hasBlocks}
+                  {/* Graph options + undo/redo. Shortcuts in useUndoRedoShortcuts. */}
+                  <div className="flex items-center gap-1">
+                    <GraphOptionsDropdown />
+                    <Tooltip>
+                      <TooltipTrigger render={<span className="inline-flex" />}>
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={undo}
+                          disabled={!canUndo}
+                          aria-label={t('header.undo')}
                         >
-                          <Share2 className="mr-2 h-4 w-4 shrink-0" />
-                          <span className="whitespace-nowrap">
-                            {shareButtonText}
-                          </span>
-                        </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={handleExportConfig}
-                          disabled={!hasBlocks}
+                          <Undo2 className="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{t('header.undo')}</TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger render={<span className="inline-flex" />}>
+                        <Button
+                          variant="outline"
+                          size="icon"
+                          className="h-8 w-8"
+                          onClick={redo}
+                          disabled={!canRedo}
+                          aria-label={t('header.redo')}
                         >
-                          <Download className="mr-2 h-4 w-4 shrink-0" />
-                          <span className="whitespace-nowrap">
-                            Export Config
-                          </span>
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={handleLoadConfig}>
-                          <Upload className="mr-2 h-4 w-4 shrink-0" />
-                          <span className="whitespace-nowrap">Load Config</span>
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </ButtonGroup>
+                          <Redo2 className="h-4 w-4" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>{t('header.redo')}</TooltipContent>
+                    </Tooltip>
+                  </div>
 
                   <Tooltip>
                     <TooltipTrigger render={<span className="inline-flex" />}>
                       <Button
-                        size="sm"
-                        onClick={handleReview}
-                        disabled={!canReview}
-                        className="gap-2"
+                        variant="outline"
+                        size="icon"
+                        className="h-8 w-8"
+                        onClick={handleNewConfiguration}
+                        aria-label={t('header.newConfiguration')}
+                        {...tourAttr(TOUR.configure.newConfig)}
                       >
-                        <Check className="h-4 w-4" />
-                        Review & Submit
+                        <BrushCleaning className="h-4 w-4" />
                       </Button>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {t('header.newConfiguration')}
+                    </TooltipContent>
+                  </Tooltip>
+
+                  {/* File: share, export, load. */}
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      render={
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-8 gap-1.5"
+                        />
+                      }
+                    >
+                      <FileText className="h-4 w-4" />
+                      {t('header.file')}
+                      <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="end"
+                      className="w-auto min-w-37.5"
+                    >
+                      <DropdownMenuItem
+                        onClick={handleExportConfig}
+                        disabled={!hasBlocks}
+                      >
+                        <Download className="mr-2 h-4 w-4 shrink-0" />
+                        <span className="whitespace-nowrap">
+                          {t('header.exportConfig')}
+                        </span>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={handleLoadConfig}>
+                        <Upload className="mr-2 h-4 w-4 shrink-0" />
+                        <span className="whitespace-nowrap">
+                          {t('header.loadConfig')}
+                        </span>
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+
+                  <SaveConfigPopover
+                    fableId={fableId}
+                    catalogue={catalogue}
+                    disabled={!hasBlocks}
+                  />
+
+                  {/* Primary runs once (skipping review); caret holds the
+                      review/schedule paths. Tooltip wraps the whole group, not
+                      the button: disabled buttons swallow hover, and a
+                      per-button trigger would break ButtonGroup's join. */}
+                  <Tooltip>
+                    <TooltipTrigger render={<span className="inline-flex" />}>
+                      <ButtonGroup>
+                        <Button
+                          size="sm"
+                          onClick={handleRunOnce}
+                          disabled={!canReview}
+                          className="gap-2"
+                          {...tourAttr(TOUR.configure.runOnce)}
+                        >
+                          <Play className="h-4 w-4" />
+                          {t('header.runOnce')}
+                        </Button>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger
+                            render={
+                              <Button
+                                size="sm"
+                                disabled={!canReview}
+                                aria-label={t('header.submitOptions')}
+                                className="px-1.5"
+                              />
+                            }
+                          >
+                            <ChevronDown className="h-4 w-4" />
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="min-w-44">
+                            <DropdownMenuItem onClick={handleReview}>
+                              <Check className="mr-2 h-4 w-4 shrink-0" />
+                              <span className="whitespace-nowrap">
+                                {t('header.reviewSubmit')}
+                              </span>
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={handleSchedule}>
+                              <CalendarClock className="mr-2 h-4 w-4 shrink-0" />
+                              <span className="whitespace-nowrap">
+                                {t('header.runOnSchedule')}
+                              </span>
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </ButtonGroup>
                     </TooltipTrigger>
                     {reviewTooltip && (
                       <TooltipContent>{reviewTooltip}</TooltipContent>
@@ -353,14 +396,17 @@ export function FableBuilderHeader({
                   >
                     <MoreVertical className="h-4 w-4" />
                   </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="min-w-40">
-                    <DropdownMenuItem
-                      onClick={handleShare}
-                      disabled={!hasBlocks}
-                    >
-                      <Share2 className="mr-2 h-4 w-4 shrink-0" />
+                  <DropdownMenuContent align="end" className="w-auto min-w-40">
+                    <DropdownMenuItem onClick={undo} disabled={!canUndo}>
+                      <Undo2 className="mr-2 h-4 w-4 shrink-0" />
                       <span className="whitespace-nowrap">
-                        {shareButtonText}
+                        {t('header.undo')}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={redo} disabled={!canRedo}>
+                      <Redo2 className="mr-2 h-4 w-4 shrink-0" />
+                      <span className="whitespace-nowrap">
+                        {t('header.redo')}
                       </span>
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -368,11 +414,21 @@ export function FableBuilderHeader({
                       disabled={!hasBlocks}
                     >
                       <Download className="mr-2 h-4 w-4 shrink-0" />
-                      <span className="whitespace-nowrap">Export Config</span>
+                      <span className="whitespace-nowrap">
+                        {t('header.exportConfig')}
+                      </span>
                     </DropdownMenuItem>
                     <DropdownMenuItem onClick={handleLoadConfig}>
                       <Upload className="mr-2 h-4 w-4 shrink-0" />
-                      <span className="whitespace-nowrap">Load Config</span>
+                      <span className="whitespace-nowrap">
+                        {t('header.loadConfig')}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={handleNewConfiguration}>
+                      <BrushCleaning className="mr-2 h-4 w-4 shrink-0" />
+                      <span className="whitespace-nowrap">
+                        {t('header.newConfiguration')}
+                      </span>
                     </DropdownMenuItem>
                     <DropdownMenuItem
                       onClick={() => setSavePopoverOpen(true)}
@@ -380,7 +436,18 @@ export function FableBuilderHeader({
                     >
                       <Save className="mr-2 h-4 w-4 shrink-0" />
                       <span className="whitespace-nowrap">
-                        {isExistingConfig ? 'Update Config' : 'Save Config'}
+                        {isExistingConfig
+                          ? t('save.triggerUpdate')
+                          : t('save.triggerSave')}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={handleRunOnce}
+                      disabled={!canReview}
+                    >
+                      <Play className="mr-2 h-4 w-4 shrink-0" />
+                      <span className="whitespace-nowrap">
+                        {t('header.runOnce')}
                       </span>
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -388,7 +455,18 @@ export function FableBuilderHeader({
                       disabled={!canReview}
                     >
                       <Check className="mr-2 h-4 w-4 shrink-0" />
-                      <span className="whitespace-nowrap">Review & Submit</span>
+                      <span className="whitespace-nowrap">
+                        {t('header.reviewSubmit')}
+                      </span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={handleSchedule}
+                      disabled={!canReview}
+                    >
+                      <CalendarClock className="mr-2 h-4 w-4 shrink-0" />
+                      <span className="whitespace-nowrap">
+                        {t('header.runOnSchedule')}
+                      </span>
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -401,6 +479,18 @@ export function FableBuilderHeader({
                   open={savePopoverOpen}
                   onOpenChange={setSavePopoverOpen}
                 />
+
+                {/* Help lives in the header so the tour entry never hides. */}
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-8 w-8"
+                  onClick={() => setHelpOpen(true)}
+                  title={t('help.open')}
+                  aria-label={t('help.open')}
+                >
+                  <HelpCircle className="h-3.5 w-3.5" />
+                </Button>
               </>
             ) : (
               <>
@@ -411,7 +501,9 @@ export function FableBuilderHeader({
                   className="gap-2"
                 >
                   <ArrowLeft className="h-4 w-4" />
-                  <span className="hidden sm:inline">Back to Edit</span>
+                  <span className="hidden sm:inline">
+                    {t('header.backToEdit')}
+                  </span>
                 </Button>
 
                 <Button
@@ -421,13 +513,16 @@ export function FableBuilderHeader({
                   className="gap-2"
                 >
                   <Check className="h-4 w-4" />
-                  <span className="hidden sm:inline">Submit Job</span>
+                  <span className="hidden sm:inline">
+                    {t('header.submitJob')}
+                  </span>
                 </Button>
               </>
             )}
           </div>
         </div>
       </header>
+      <ConfigureHelpDialog open={helpOpen} onOpenChange={setHelpOpen} />
     </>
   )
 }

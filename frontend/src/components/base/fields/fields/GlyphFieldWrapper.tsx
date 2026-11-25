@@ -23,11 +23,12 @@
  * available in context.
  */
 
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { AlertCircle, Braces } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { GlyphTextInput } from './GlyphTextInput'
 import { Button } from '@/components/ui/button'
+import { Reveal } from '@/components/common/Reveal'
 import {
   InputGroup,
   InputGroupAddon,
@@ -36,11 +37,18 @@ import {
 import {
   Tooltip,
   TooltipContent,
+  TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { DefineVariableButton } from '@/features/fable-builder/components/shared/DefineVariableButton'
 import { useGlyphContext } from '@/features/fable-builder/context/GlyphContext'
-import { useResolvedConfig } from '@/features/fable-builder/context/ResolvedConfigContext'
-import { useFieldErrors } from '@/features/fable-builder/context/FieldErrorsContext'
+import {
+  useFieldErrors,
+  useMissingFileNames,
+  useMissingGlyphs,
+  useResolvedConfig,
+  useSharedOutputPaths,
+} from '@/features/fable-builder/context/BlockValidationContext'
 import { containsGlyphs } from '@/features/fable-builder/utils/glyph-display'
 import {
   applyFloorDay,
@@ -65,6 +73,8 @@ export interface GlyphFieldWrapperProps {
    * whose values are constrained to a backend-declared set).
    */
   allowGlyphMode?: boolean
+  /** True when the child draws its own border, e.g. a Select. */
+  selfContainedChild?: boolean
   /**
    * When true, the backend expects a calendar-date-only value
    * (`YYYY-MM-DD`). If a glyph expression resolves to a datetime with a
@@ -78,6 +88,83 @@ export interface GlyphFieldWrapperProps {
 
 type FieldMode = 'concrete' | 'glyph'
 
+const NUDGE_CLASS =
+  'mt-1 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400'
+const NUDGE_ACTION_CLASS =
+  'h-6 border-amber-500/60 px-2 text-xs text-amber-700 hover:bg-amber-500/10 dark:text-amber-400'
+
+/** Italic "resolves to …" line with the full value in a tooltip. */
+export function ResolvedPreview({ preview }: { preview: string }) {
+  const { t } = useTranslation('glyphs')
+  return (
+    // fast delay — the tooltip is the only way to read a truncated value
+    <TooltipProvider delay={120}>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <div className="mt-1 truncate text-sm text-muted-foreground italic" />
+          }
+        >
+          {t('panel.resolvesTo')} <span className="font-mono">{preview}</span>
+        </TooltipTrigger>
+        <TooltipContent side="bottom" className="max-w-96 font-mono break-all">
+          {preview}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
+/** Nudge button that writes `fix` into the field; the tooltip shows the path. */
+function PathFixButton({
+  label,
+  tooltip,
+  fix,
+  onApply,
+}: {
+  label: string
+  tooltip: string
+  fix: string
+  onApply: (fix: string) => void
+}) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className={NUDGE_ACTION_CLASS}
+            onClick={() => onApply(fix)}
+          />
+        }
+      >
+        {label}
+      </TooltipTrigger>
+      <TooltipContent
+        side="left"
+        className="max-w-80 flex-col items-start gap-1"
+      >
+        {tooltip}
+        {/* Wraps only after a slash. */}
+        <span className="font-mono">
+          {fix.split('/').map((part, i) => (
+            <Fragment key={i}>
+              {i > 0 && (
+                <>
+                  /<wbr />
+                </>
+              )}
+              {part}
+            </Fragment>
+          ))}
+        </span>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 export function GlyphFieldWrapper({
   id,
   configKey,
@@ -87,6 +174,7 @@ export function GlyphFieldWrapper({
   disabled,
   className,
   allowGlyphMode = true,
+  selfContainedChild = false,
   isDateOnly = false,
   children,
 }: GlyphFieldWrapperProps) {
@@ -118,21 +206,47 @@ export function GlyphFieldWrapper({
       : fieldErrors[0]
     : null
 
-  // No glyphs / glyph mode disabled → render children directly, only adding
-  // an error ring + absolute-positioned error text when the field is invalid.
+  const missingGlyphNames = useMissingGlyphs()?.[configKey] ?? null
+  const sharedOutputPaths = useSharedOutputPaths()
+  const missingFileNames = useMissingFileNames()
+  const valueHasGlyphs = containsGlyphs(value)
+
+  // No glyphs / glyph mode disabled → children, error text and preview only.
   if (!hasGlyphs || !allowGlyphMode) {
-    if (!hasFieldError) return <>{children}</>
+    // InputGroupInput has no border of its own, so it still needs the group.
+    const plain = selfContainedChild ? (
+      <>{children}</>
+    ) : (
+      <InputGroup className={cn(hasFieldError && 'border-destructive')}>
+        {children}
+      </InputGroup>
+    )
+    const injectedPreview =
+      valueHasGlyphs && !hasFieldError
+        ? (resolvedConfig?.[configKey] ?? null)
+        : null
+    const showInjectedPreview =
+      injectedPreview !== null && injectedPreview !== value
+    if (!hasFieldError && !showInjectedPreview && !missingGlyphNames?.length) {
+      return plain
+    }
     return (
-      <div className="relative">
-        <div className="rounded-md ring-1 ring-destructive">{children}</div>
-        <p className="pointer-events-none absolute top-full left-0 mt-0.5 truncate text-xs text-destructive">
-          {errorMessage}
-        </p>
+      <div>
+        {hasFieldError && selfContainedChild ? (
+          <div className="rounded-md ring-1 ring-destructive">{children}</div>
+        ) : (
+          plain
+        )}
+        <Reveal open={errorMessage !== null}>
+          <p className="truncate pt-1 text-xs text-danger">{errorMessage}</p>
+        </Reveal>
+        {missingGlyphNames?.map((name) => (
+          <DefineVariableButton key={name} name={name} />
+        ))}
+        {showInjectedPreview && <ResolvedPreview preview={injectedPreview} />}
       </div>
     )
   }
-
-  const valueHasGlyphs = containsGlyphs(value)
   const canSwitchToConcrete = mode === 'glyph' && !valueHasGlyphs
 
   function handleToggle() {
@@ -171,6 +285,21 @@ export function GlyphFieldWrapper({
     previewHasTimeComponent(resolvedPreview)
   const dateNudgeFixAvailable = dateNudgeVisible && canApplyFloorDay(value)
 
+  // Nudge when a GRIB path names a folder, not a file.
+  const fileNameFix = hasFieldError
+    ? null
+    : (missingFileNames?.[configKey] ?? null)
+
+  // Nudge when a sink's output path is shared across runs.
+  const runFolderNudgeVisible =
+    !hasFieldError &&
+    sharedOutputPaths !== null &&
+    configKey in sharedOutputPaths
+  const runFolder = runFolderNudgeVisible ? sharedOutputPaths[configKey] : null
+  const runFolderFix = runFolder?.fix ?? null
+  // GRIB output is the file's folder, not the file.
+  const runFolderIsGrib = runFolder?.scope === 'folder'
+
   function handleApplyFloorDay() {
     const next = applyFloorDay(value)
     if (next !== value) onChange(next)
@@ -183,6 +312,9 @@ export function GlyphFieldWrapper({
         className={cn(
           mode === 'glyph' && 'border-primary/30',
           hasFieldError && 'border-destructive',
+          // Strip the child's own border so the group reads as one control.
+          selfContainedChild &&
+            '[&_[data-slot=select-trigger]]:border-0 [&_[data-slot=select-trigger]]:bg-transparent [&_[data-slot=select-trigger]]:shadow-none',
         )}
       >
         {mode === 'glyph' ? (
@@ -230,36 +362,21 @@ export function GlyphFieldWrapper({
         </InputGroupAddon>
       </InputGroup>
 
-      {errorMessage && (
-        <p className="pointer-events-none absolute top-full left-0 mt-0.5 truncate text-xs text-destructive">
-          {errorMessage}
-        </p>
-      )}
+      <Reveal open={errorMessage !== null}>
+        <p className="truncate pt-1 text-xs text-danger">{errorMessage}</p>
+      </Reveal>
+
+      {missingGlyphNames?.map((name) => (
+        <DefineVariableButton key={name} name={name} />
+      ))}
 
       {/* In-flow so visual order reads Input → Preview → Nudge. Validation
           is debounced 300 ms, so these appear/disappear at pause boundaries,
           not per keystroke — an honest layout reaction, not flicker. */}
-      {showPreview && (
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <div className="mt-1 truncate text-sm text-muted-foreground italic" />
-            }
-          >
-            {t('panel.resolvesTo')}{' '}
-            <span className="font-mono">{resolvedPreview}</span>
-          </TooltipTrigger>
-          <TooltipContent
-            side="bottom"
-            className="max-w-96 font-mono break-all"
-          >
-            {resolvedPreview}
-          </TooltipContent>
-        </Tooltip>
-      )}
+      {showPreview && <ResolvedPreview preview={resolvedPreview} />}
 
       {dateNudgeVisible && (
-        <div className="mt-1 flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+        <div className={NUDGE_CLASS}>
           <AlertCircle className="h-3.5 w-3.5 shrink-0" />
           <span className="min-w-0 flex-1 truncate">
             {t('field.datePreview.hasTime')}
@@ -272,7 +389,7 @@ export function GlyphFieldWrapper({
                     type="button"
                     size="sm"
                     variant="outline"
-                    className="h-6 border-amber-500/60 px-2 text-xs text-amber-700 hover:bg-amber-500/10 dark:text-amber-400"
+                    className={NUDGE_ACTION_CLASS}
                     onClick={handleApplyFloorDay}
                   />
                 }
@@ -283,6 +400,61 @@ export function GlyphFieldWrapper({
                 {t('field.datePreview.floorDayTooltip')}
               </TooltipContent>
             </Tooltip>
+          )}
+        </div>
+      )}
+
+      {fileNameFix !== null && (
+        <div className={NUDGE_CLASS} data-testid="file-name-nudge">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <Tooltip>
+            <TooltipTrigger
+              render={<span className="min-w-0 flex-1 truncate" />}
+            >
+              {t('field.fileName.missing')}
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-72">
+              {t('field.fileName.details')}
+            </TooltipContent>
+          </Tooltip>
+          <PathFixButton
+            label={t('field.fileName.action')}
+            tooltip={t('field.fileName.actionTooltip')}
+            fix={fileNameFix}
+            onApply={onChange}
+          />
+        </div>
+      )}
+
+      {runFolderNudgeVisible && (
+        <div
+          className={cn(NUDGE_CLASS, 'flex-wrap gap-y-0.5')}
+          data-testid="run-folder-nudge"
+        >
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <Tooltip>
+            <TooltipTrigger
+              render={<span className="min-w-0 flex-1 truncate" />}
+            >
+              {t('field.runFolder.shared')}
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="max-w-72">
+              {t('field.runFolder.details')}
+            </TooltipContent>
+          </Tooltip>
+          {runFolderFix !== null && (
+            <PathFixButton
+              label={t('field.runFolder.action')}
+              tooltip={t('field.runFolder.actionTooltip')}
+              fix={runFolderFix}
+              onApply={onChange}
+            />
+          )}
+          {/* Own row, aligned with the label. */}
+          {runFolderIsGrib && (
+            <p className="basis-full pl-5.5">
+              {t('field.runFolder.gribFolder')}
+            </p>
           )}
         </div>
       )}

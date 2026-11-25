@@ -10,10 +10,13 @@
 """Jinja2-based string interpolation engine for ${...} glyph expressions.
 
 Uses ``${`` / ``}`` as variable delimiters instead of the Jinja2 default ``{{`` / ``}}``.
-Variables whose values match the canonical datetime format (``YYYY-MM-DD HH:MM:SS``) are
-auto-coerced to :class:`datetime` objects so that date filters and arithmetic work directly.
+Variables whose values match the canonical datetime format (``YYYY-MM-DD HH:MM:SS`` and tz-aware
+variants) are auto-coerced to :class:`datetime` objects so that date filters and arithmetic
+work directly. The auto-coercion is bound to fiab-core.types.DatetimeType, as they are
+inherently coupled.
 """
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -21,19 +24,20 @@ from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from cascade.low.func import Either
-from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
-from jinja2 import nodes as jnodes
+from fiab_core.types import DatetimeType, WrongType
+from jinja2 import Environment, StrictUndefined, TemplateSyntaxError, nodes
 from jinja2.sandbox import SandboxedEnvironment
 
-# Only the canonical backend datetime format is auto-coerced; other date-like strings
-# (e.g. "2024-01-15") are intentionally kept as strings to avoid silent format changes.
-_CANONICAL_DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
+from forecastbox.utility.time import value_dt2str
+
+logger = logging.getLogger(__name__)
+_dt_instance = DatetimeType()
 
 
 def _try_parse_datetime(value: str) -> datetime | str:
     try:
-        return datetime.strptime(value, _CANONICAL_DATETIME_FMT)
-    except ValueError:
+        return _dt_instance.validate_convert(value)
+    except WrongType:
         return value
 
 
@@ -67,11 +71,11 @@ def _split(value: str, sep: str | None = None) -> list[str]:
 
 def _stringify_result(value: object) -> str:
     if isinstance(value, datetime):
-        return value.strftime(_CANONICAL_DATETIME_FMT)
+        return value_dt2str(value)
     return str(value)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=True, slots=True)
 class CustomFunction:
     """A named function registered in the Jinja2 interpolation environment.
 
@@ -162,12 +166,20 @@ def _make_env() -> SandboxedEnvironment:
 _ENV = _make_env()
 
 # Names that are part of the jinja2 environment (filters + globals) rather than user variables.
-_FILTER_NAMES: frozenset[str] = frozenset(_ENV.filters) | frozenset(_ENV.globals)
+_GLOBALS = frozenset(_ENV.globals)
+_FILTER_NAMES: frozenset[str] = frozenset(_ENV.filters) | _GLOBALS
 
 
 def get_custom_functions() -> list[CustomFunction]:
     """Return all custom functions registered in the interpolation environment."""
     return list(CUSTOM_FUNCTIONS)
+
+
+def is_jinja_reserved_name(s: str) -> bool:
+    """Return True if `s` collides with a jinja2 filter or global name registered in
+    the interpolation environment (e.g. ``floor_day``, ``timedelta``), and would
+    therefore shadow a built-in function rather than resolve as a glyph."""
+    return s in _FILTER_NAMES
 
 
 def render_expression(raw: str, variables: dict[str, str]) -> str:
@@ -184,8 +196,8 @@ def render_expression(raw: str, variables: dict[str, str]) -> str:
     return template.render(ctx)
 
 
-def _collect_glyph_names(node: jnodes.Node, glyphs: set[str]) -> None:
-    if isinstance(node, jnodes.Name) and node.ctx == "load" and node.name not in _FILTER_NAMES:
+def _collect_glyph_names(node: nodes.Node, glyphs: set[str]) -> None:
+    if isinstance(node, nodes.Name) and node.ctx == "load" and node.name not in _GLOBALS:
         glyphs.add(node.name)
     for child in node.iter_child_nodes():
         _collect_glyph_names(child, glyphs)
@@ -208,4 +220,8 @@ def extract_glyph_names(raw: str) -> Either[set[str], str]:  # type: ignore[inva
 
     glyphs: set[str] = set()
     _collect_glyph_names(ast, glyphs)
-    return Either.ok(glyphs - _FILTER_NAMES)
+    # NOTE we used to subtract _FILTER_NAMES here, but thats actually not necessary:
+    # an expression like ${myGlyph | aFilter(var1, var2)} will not return aFilter
+    # as a node anyway due to jinja ast typing. And in case user malforms by providing
+    # ${aFilter}, which oddly is valid in jinja, we *do* want to return it
+    return Either.ok(glyphs)

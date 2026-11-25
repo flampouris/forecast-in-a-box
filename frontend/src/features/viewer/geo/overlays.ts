@@ -1,0 +1,279 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * User-uploaded GeoJSON context overlays (boundaries, tracks, points of
+ * interest) drawn above the data layers on every compare panel. Features
+ * are kept in WGS84; each map mounts its own VectorLayer over a copy
+ * reprojected into that map's view projection.
+ */
+
+import { useEffect, useState } from 'react'
+import GeoJSON from 'ol/format/GeoJSON'
+import GeometryCollection from 'ol/geom/GeometryCollection'
+import SimpleGeometry from 'ol/geom/SimpleGeometry'
+import VectorLayer from 'ol/layer/Vector'
+import VectorSource from 'ol/source/Vector'
+import { Fill, Stroke, Style, Text } from 'ol/style'
+import CircleStyle from 'ol/style/Circle'
+import {
+  LABEL_OFFSET_Y,
+  OVERLAY_COLORS,
+  OVERLAY_LABEL,
+  OVERLAY_POINT_RADIUS,
+  OVERLAY_POINT_STROKE_WIDTH,
+  OVERLAY_STROKE_WIDTH,
+} from '../vector-styles'
+import type { RefObject } from 'react'
+import type Feature from 'ol/Feature'
+import type Geometry from 'ol/geom/Geometry'
+import type OlMap from 'ol/Map'
+import type { FeatureLike } from 'ol/Feature'
+
+/** Above data stacks (100/200 bands), below the reference overlay (1000). */
+const OVERLAY_Z = 900
+
+let overlayCounter = 0
+
+export interface ContextOverlay {
+  id: string
+  name: string
+  visible: boolean
+  /** WGS84 features — each map reprojects its own copy. */
+  features: ReadonlyArray<Feature>
+  featureCount: number
+  /** Property keys found in the file (label choices), frequency-ordered. */
+  propertyKeys: Array<string>
+  /** Property rendered as a permanent canvas label; null = none. */
+  labelProperty: string | null
+}
+
+const OVERLAY_STYLE = new Style({
+  stroke: new Stroke({
+    color: OVERLAY_COLORS.stroke,
+    width: OVERLAY_STROKE_WIDTH,
+  }),
+  fill: new Fill({ color: OVERLAY_COLORS.fill }),
+  image: new CircleStyle({
+    radius: OVERLAY_POINT_RADIUS,
+    fill: new Fill({ color: OVERLAY_COLORS.point }),
+    stroke: new Stroke({ color: 'white', width: OVERLAY_POINT_STROKE_WIDTH }),
+    // none: markers always draw and never block labels (incl. their own); labels declutter vs each other.
+    declutterMode: 'none',
+  }),
+})
+
+/** Imported 1e999/string coords parse to Infinity/NaN — anywhere in a
+ *  geometry they poison camera and extent math. Empty counts as bad. */
+function geometryIsFinite(geometry: Geometry): boolean {
+  if (geometry instanceof GeometryCollection) {
+    const parts = geometry.getGeometries()
+    return parts.length > 0 && parts.every(geometryIsFinite)
+  }
+  if (geometry instanceof SimpleGeometry) {
+    const flat = geometry.getFlatCoordinates()
+    return flat.length > 0 && flat.every(Number.isFinite)
+  }
+  return false
+}
+
+const finiteFeature = (feature: Feature): boolean => {
+  const geometry = feature.getGeometry()
+  return geometry !== undefined && geometryIsFinite(geometry)
+}
+
+/**
+ * Parse GeoJSON text into an overlay (features kept in WGS84).
+ * Non-finite geometries are dropped; throws on unparsable input or zero
+ * usable features.
+ */
+export function parseGeojsonOverlay(
+  name: string,
+  text: string,
+): ContextOverlay {
+  const features = new GeoJSON()
+    .readFeatures(JSON.parse(text), { featureProjection: 'EPSG:4326' })
+    .filter(finiteFeature)
+  if (features.length === 0) {
+    throw new Error('GeoJSON contains no features')
+  }
+  overlayCounter += 1
+  return {
+    id: `overlay-${overlayCounter}`,
+    name,
+    visible: true,
+    features,
+    featureCount: features.length,
+    propertyKeys: collectPropertyKeys(features),
+    labelProperty: null,
+  }
+}
+
+/** A map-projection copy; features that hit a singularity are dropped. */
+function reprojectedSource(
+  features: ReadonlyArray<Feature>,
+  projection: string,
+): VectorSource {
+  return new VectorSource({
+    features: features
+      .map((feature) => {
+        const copy = feature.clone()
+        copy.getGeometry()?.transform('EPSG:4326', projection)
+        return copy
+      })
+      .filter(finiteFeature),
+  })
+}
+
+/** A feature's label from the chosen property; null = none. */
+export function overlayLabelText(
+  feature: FeatureLike,
+  labelProperty: string | null,
+): string | null {
+  const raw: unknown = labelProperty ? feature.get(labelProperty) : undefined
+  return raw === undefined || raw === null || raw === '' ? null : String(raw)
+}
+
+/** Base style + a canvas Text label from the chosen property — part of
+ *  the map pixels, so exports include it. */
+function overlayStylesWithLabel(
+  feature: FeatureLike,
+  labelProperty: string | null,
+): Array<Style> {
+  const text = overlayLabelText(feature, labelProperty)
+  if (!text) return [OVERLAY_STYLE]
+  return [
+    OVERLAY_STYLE,
+    new Style({
+      text: new Text({
+        text,
+        font: OVERLAY_LABEL.font,
+        offsetY: LABEL_OFFSET_Y,
+        overflow: true,
+        fill: new Fill({ color: OVERLAY_LABEL.color }),
+        backgroundFill: new Fill({ color: OVERLAY_LABEL.background }),
+        padding: [...OVERLAY_LABEL.padding],
+      }),
+    }),
+  ]
+}
+
+/** Feature properties (sans geometry) under the cursor, for the hover
+ *  inspection card. */
+export interface OverlayHover {
+  x: number
+  y: number
+  rows: Array<[string, string]>
+  more: number
+}
+
+const HOVER_MAX_ROWS = 8
+
+/** The hover card for `feature` with the cursor at (`x`, `y`). */
+export function overlayHoverAt(
+  feature: FeatureLike,
+  x: number,
+  y: number,
+): OverlayHover {
+  const entries = Object.entries(feature.getProperties()).filter(
+    ([key]) => key !== 'geometry',
+  )
+  return {
+    x,
+    y,
+    rows: entries
+      .slice(0, HOVER_MAX_ROWS)
+      .map(([k, v]) => [k, v === null ? '—' : String(v)]),
+    more: Math.max(0, entries.length - HOVER_MAX_ROWS),
+  }
+}
+
+export function useOverlayHover(
+  mapRef: RefObject<OlMap | null>,
+  overlays: ReadonlyArray<ContextOverlay>,
+  /** useOlMapBase recreation counter — re-attach after a map rebuild. */
+  mapVersion: number,
+): OverlayHover | null {
+  const [hover, setHover] = useState<OverlayHover | null>(null)
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || overlays.length === 0) {
+      setHover(null)
+      return
+    }
+    const onMove = (evt: { pixel: Array<number> }) => {
+      const feature = map.forEachFeatureAtPixel(evt.pixel, (f) => f, {
+        hitTolerance: 5,
+        layerFilter: (layer) => layer.get('contextOverlay') === true,
+      })
+      if (!feature) {
+        setHover((prev) => (prev === null ? prev : null))
+        return
+      }
+      setHover(overlayHoverAt(feature, evt.pixel[0], evt.pixel[1]))
+    }
+    map.on('pointermove', onMove)
+    return () => {
+      map.un('pointermove', onMove)
+      setHover(null)
+    }
+  }, [mapRef, overlays, mapVersion])
+  return hover
+}
+
+/** Mount one VectorLayer per overlay on this map. */
+export function useContextOverlays(
+  mapRef: RefObject<OlMap | null>,
+  overlays: ReadonlyArray<ContextOverlay>,
+  /** useOlMapBase recreation counter — re-attach after a map rebuild. */
+  mapVersion: number,
+): void {
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || overlays.length === 0) return
+    const projection = map.getView().getProjection().getCode()
+    const layers = overlays.map((overlay) => {
+      const layer = new VectorLayer({
+        source: reprojectedSource(overlay.features, projection),
+        style: overlay.labelProperty
+          ? (feature) => overlayStylesWithLabel(feature, overlay.labelProperty)
+          : OVERLAY_STYLE,
+        zIndex: OVERLAY_Z,
+        visible: overlay.visible,
+        // Hide colliding labels; shares the basemap's declutter group (true), overlay wins ties.
+        declutter: true,
+      })
+      // Marks the layer for the hover-inspection hit test.
+      layer.set('contextOverlay', true)
+      return layer
+    })
+    for (const layer of layers) map.addLayer(layer)
+    return () => {
+      for (const layer of layers) map.removeLayer(layer)
+    }
+  }, [mapRef, overlays, mapVersion])
+}
+
+/** Property keys present in the overlay, most frequent first — offered
+ *  as permanent-label choices. */
+export function collectPropertyKeys(
+  features: ReadonlyArray<Feature>,
+): Array<string> {
+  const counts = new Map<string, number>()
+  for (const feature of features) {
+    for (const key of Object.keys(feature.getProperties())) {
+      if (key === 'geometry') continue
+      counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+  }
+  return [...counts.entries()]
+    .sort((x, y) => y[1] - x[1] || x[0].localeCompare(y[0]))
+    .map(([key]) => key)
+}

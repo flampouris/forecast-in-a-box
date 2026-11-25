@@ -18,10 +18,13 @@
  */
 
 import { Outlet, createFileRoute, redirect } from '@tanstack/react-router'
-import { useTranslation } from 'react-i18next'
 import { DashboardLayout } from '@/components/layout/DashboardLayout'
+import { OnboardingController } from '@/features/onboarding/OnboardingController'
+import { TutorialsController } from '@/features/tutorials/TutorialsController'
 import { useConfigStore } from '@/stores/configStore'
 import { checkSession } from '@/api/endpoints/auth'
+import { useNotificationSocket } from '@/api/hooks/useNotificationSocket'
+import { readAnonymousId } from '@/lib/anonymous-id'
 import { createLogger } from '@/lib/logger'
 import { isValidInternalRedirect } from '@/lib/utils'
 import { STORAGE_KEYS } from '@/lib/storage-keys'
@@ -41,22 +44,21 @@ function isLoggedOut(): boolean {
  * Check if user is authenticated in anonymous mode
  */
 function isAnonymousUser(): boolean {
-  return !!localStorage.getItem(STORAGE_KEYS.auth.anonymousId)
+  return readAnonymousId() !== null
 }
 
 /**
  * Authenticated layout component
  */
 function AuthenticatedLayout() {
-  const { t } = useTranslation('dashboard')
+  // Server-push notifications live as long as any authenticated page does.
+  useNotificationSocket()
 
   return (
-    <DashboardLayout
-      notificationMessage={t('notification.newModels')}
-      notificationLinkText={t('notification.registryLink')}
-      notificationLinkHref="#"
-    >
+    <DashboardLayout>
       <Outlet />
+      <OnboardingController />
+      <TutorialsController />
     </DashboardLayout>
   )
 }

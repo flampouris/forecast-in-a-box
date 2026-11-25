@@ -11,23 +11,28 @@
 
 import subprocess
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 from pyrsistent import pmap
 
+from forecastbox.domain.lens.exceptions import NoLensFound
 from forecastbox.domain.lens.manager import (
     LensInstance,
     LensInstanceDetail,
     LensInstanceId,
     LensInstanceManager,
     _compute_status,
+    check_server_ready,
     get_status,
     list_instances,
     shutdown_all_lens_instances,
+    start_skinny_wms,
     stop_instance,
 )
-from forecastbox.utility.concurrent import FreePortsManager, NoFreePortsException
+from forecastbox.utility.concurrency.ports import FreePortsManager, NoFreePortsException
+from forecastbox.utility.config import BACKEND_LOG_DIRECTORY_ENV, LensSettings, config
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +43,17 @@ def reset_lens_manager() -> Iterator[None]:
     yield
     LensInstanceManager.instances = original_instances
     FreePortsManager.free_ports = original_ports
+
+
+@pytest.fixture(autouse=True)
+def assume_ports_bound() -> Iterator[None]:
+    """By default, pretend every lens port is bound (server finished starting).
+
+    Individual tests exercising the "process alive but port not bound yet" path
+    override this via `patch("forecastbox.domain.lens.manager.check_server_ready", ...)`.
+    """
+    with patch("forecastbox.domain.lens.manager.check_server_ready", return_value=True):
+        yield
 
 
 def _make_instance(process: subprocess.Popen | None = None, returncode: int | None = None) -> LensInstance:
@@ -68,6 +84,32 @@ class TestComputeStatus:
         instance = _make_instance(process=mock_proc)
         assert _compute_status(instance).status == "running"
 
+    def test_running_process_with_unbound_port_is_starting(self) -> None:
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.poll.return_value = None  # still alive
+        instance = _make_instance(process=mock_proc)
+        with patch("forecastbox.domain.lens.manager.check_server_ready", return_value=False):
+            assert _compute_status(instance).status == "starting"
+
+    def test_bound_lens_is_probed_once(self) -> None:
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.poll.return_value = None  # still alive
+        instance = _make_instance(process=mock_proc)
+        with patch("forecastbox.domain.lens.manager.check_server_ready", return_value=True) as probe:
+            assert _compute_status(instance).status == "running"
+            assert _compute_status(instance).status == "running"
+        # Each probe connection would wait in a busy lens's accept queue
+        probe.assert_called_once()
+
+    def test_bound_lens_that_exits_is_failed(self) -> None:
+        mock_proc = MagicMock(spec=subprocess.Popen)
+        mock_proc.poll.return_value = None
+        instance = _make_instance(process=mock_proc)
+        assert _compute_status(instance).status == "running"
+        mock_proc.poll.return_value = -9
+        mock_proc.returncode = -9
+        assert _compute_status(instance).status == "failed"
+
     def test_process_exited_zero_is_terminated(self) -> None:
         instance = _make_instance(returncode=0)
         assert _compute_status(instance).status == "terminated"
@@ -82,8 +124,8 @@ class TestComputeStatus:
 
 
 class TestGetStatus:
-    def test_raises_key_error_for_unknown_id(self) -> None:
-        with pytest.raises(KeyError):
+    def test_raises_no_lens_found_for_unknown_id(self) -> None:
+        with pytest.raises(NoLensFound):
             get_status(LensInstanceId("no-such-id"))
 
     def test_returns_status_for_known_id(self) -> None:
@@ -119,9 +161,9 @@ class TestListInstances:
 
 
 class TestStopInstance:
-    def test_raises_key_error_for_unknown_id(self) -> None:
+    def test_raises_no_lens_found_for_unknown_id(self) -> None:
         LensInstanceManager.instances = pmap()
-        with pytest.raises(KeyError):
+        with pytest.raises(NoLensFound):
             stop_instance(LensInstanceId("ghost"))
 
     def test_removes_instance_from_manager(self) -> None:
@@ -210,6 +252,57 @@ class TestShutdownAllInstances:
 
         with patch("forecastbox.domain.lens.manager.stop_instance", side_effect=flaky_stop):
             shutdown_all_lens_instances()  # should not raise
+
+
+class TestStartSkinnyWms:
+    def test_preloads_the_indexed_app_and_recycles_the_worker(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BACKEND_LOG_DIRECTORY_ENV, str(tmp_path))
+        with patch("forecastbox.domain.lens.manager.subprocess.Popen") as mock_popen:
+            start_skinny_wms("/data/run")
+        cmd = mock_popen.call_args.args[0]
+        # The master indexes the data folder once; workers fork from it
+        assert "--preload" in cmd
+        assert cmd[-1] == "forecastbox.domain.lens.skinnywms_app:application"
+        # Magics leaks every rendered image: by default the worker must not live forever
+        assert 0 < int(cmd[cmd.index("--max-requests") + 1]) <= 50
+        assert int(cmd[cmd.index("--max-requests-jitter") + 1]) > 0
+
+    def test_recycles_the_worker_as_configured(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BACKEND_LOG_DIRECTORY_ENV, str(tmp_path))
+        monkeypatch.setattr(config.backend, "lens", LensSettings(worker_max_requests=0, worker_max_requests_jitter=0))
+        with patch("forecastbox.domain.lens.manager.subprocess.Popen") as mock_popen:
+            start_skinny_wms("/data/run")
+        cmd = mock_popen.call_args.args[0]
+        assert cmd[cmd.index("--max-requests") + 1] == "0"
+        assert cmd[cmd.index("--max-requests-jitter") + 1] == "0"
+
+    @pytest.mark.parametrize(("platform", "expected"), [("darwin", "YES"), ("linux", None)])
+    def test_lifts_the_macos_fork_check_for_preloaded_workers(
+        self, platform: str, expected: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(BACKEND_LOG_DIRECTORY_ENV, str(tmp_path))
+        monkeypatch.delenv("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", raising=False)
+        monkeypatch.setattr("forecastbox.domain.lens.manager.sys.platform", platform)
+        with patch("forecastbox.domain.lens.manager.subprocess.Popen") as mock_popen:
+            start_skinny_wms("/data/run")
+        # Workers drawing text crash on macOS otherwise; Linux has no such check
+        assert mock_popen.call_args.kwargs["env"].get("OBJC_DISABLE_INITIALIZE_FORK_SAFETY") == expected
+
+    def test_failing_popen_raises_runtime_error_and_cleans_up(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(BACKEND_LOG_DIRECTORY_ENV, str(tmp_path))
+        ports_before = FreePortsManager.free_ports.copy()
+        LensInstanceManager.instances = pmap()
+        with patch("forecastbox.domain.lens.manager.subprocess.Popen", side_effect=OSError("boom")):
+            with pytest.raises(RuntimeError):
+                start_skinny_wms("/data/run")
+        assert len(LensInstanceManager.instances) == 0
+        assert FreePortsManager.free_ports == ports_before
+
+
+class TestCheckServerReady:
+    def test_returns_false_when_nothing_listening(self) -> None:
+        # port 1 is a privileged, virtually-never-bound port; connecting should fail fast.
+        assert check_server_ready(port=1, timeout=0.05) is False
 
 
 class TestFreePortsManager:

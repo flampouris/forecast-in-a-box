@@ -1,0 +1,205 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * Annotation state for the compare viewer: the pin list, editor draft,
+ * tool arming, sidebar highlight/locate, GeoJSON import, and the
+ * route-leave guard. Rendering stays with the caller.
+ */
+
+import { useCallback, useRef, useState } from 'react'
+import { useBlocker } from '@tanstack/react-router'
+import { fromLonLat } from 'ol/proj'
+import { formatLatLon } from '../format'
+import {
+  defaultAnnotationColor,
+  nextAnnotationId,
+  nextAnnotationLabel,
+} from './annotations'
+import type { RefObject } from 'react'
+import type View from 'ol/View'
+import type { MapAnnotation } from './annotations'
+import type { AnnotationDraft, AnnotationPatch } from './AnnotationEditorDialog'
+import type { SourceSlot } from './layer-pairing'
+
+export function useViewerAnnotations({
+  viewRef,
+  centerGlobe,
+  onToggle,
+}: {
+  /** Shared camera — locate() pans it to a pin. */
+  viewRef: RefObject<View | null>
+  /** Turns the globe to a pin; false while the flat map is shown. */
+  centerGlobe: (lon: number, lat: number) => boolean
+  /** Fires on every arm/disarm toggle — the caller disarms rival tools. */
+  onToggle: () => void
+}) {
+  const [annotations, setAnnotations] = useState<Array<MapAnnotation>>([])
+  // Annotations are ephemeral — block route-leave and browser unload
+  // while any exist; the dialog offers a GeoJSON export first.
+  // Search-only navigations (slot/mode changes) keep the viewer mounted
+  // and must pass freely.
+  const leaveBlocker = useBlocker({
+    shouldBlockFn: ({ current, next }) =>
+      annotations.length > 0 && current.pathname !== next.pathname,
+    enableBeforeUnload: () => annotations.length > 0,
+    withResolver: true,
+  })
+  const [annotateArmed, setAnnotateArmed] = useState(false)
+  const [annotationDraft, setAnnotationDraft] =
+    useState<AnnotationDraft | null>(null)
+  // Where a new annotation will land, captured at map-click time.
+  const pendingRef = useRef<{
+    lonLat: [number, number]
+    sourceId: string | null
+  } | null>(null)
+
+  const onAnnotationCreate = useCallback(
+    (
+      lonLat: [number, number],
+      // The binding is the source id; the slot only picks the color default.
+      sourceId: string | null,
+      slot: SourceSlot | null,
+    ) => {
+      pendingRef.current = { lonLat, sourceId }
+      setAnnotationDraft({
+        id: null,
+        text: '',
+        label: nextAnnotationLabel(annotations),
+        color: defaultAnnotationColor(slot),
+      })
+    },
+    [annotations],
+  )
+  const onAnnotationEdit = useCallback(
+    (id: string) => {
+      const annotation = annotations.find((ann) => ann.id === id)
+      if (!annotation) return
+      setAnnotationDraft({
+        id,
+        text: annotation.text,
+        label: annotation.label,
+        color: annotation.color,
+      })
+    },
+    [annotations],
+  )
+  const saveAnnotation = (patch: AnnotationPatch) => {
+    if (annotationDraft?.id) {
+      setAnnotations((prev) =>
+        prev.map((ann) =>
+          ann.id === annotationDraft.id ? { ...ann, ...patch } : ann,
+        ),
+      )
+    } else if (pendingRef.current) {
+      const { lonLat, sourceId } = pendingRef.current
+      setAnnotations((prev) => [
+        ...prev,
+        { id: nextAnnotationId(), lonLat, sourceId, ...patch },
+      ])
+      pendingRef.current = null
+    }
+    setAnnotationDraft(null)
+  }
+  const deleteAnnotation = () => {
+    if (annotationDraft?.id) {
+      setAnnotations((prev) =>
+        prev.filter((ann) => ann.id !== annotationDraft.id),
+      )
+    }
+    setAnnotationDraft(null)
+  }
+  const closeAnnotationEditor = useCallback(() => {
+    pendingRef.current = null
+    setAnnotationDraft(null)
+  }, [])
+  const removeAnnotationById = useCallback(
+    (id: string) =>
+      setAnnotations((prev) => prev.filter((ann) => ann.id !== id)),
+    [],
+  )
+  const moveAnnotation = useCallback(
+    (id: string, lonLat: [number, number]) =>
+      setAnnotations((prev) =>
+        prev.map((ann) => (ann.id === id ? { ...ann, lonLat } : ann)),
+      ),
+    [],
+  )
+  const importAnnotations = useCallback(
+    (items: ReadonlyArray<Omit<MapAnnotation, 'id'>>) =>
+      setAnnotations((prev) => {
+        // Label-less pins (v1 files) get the next free numbers here.
+        const next = [...prev]
+        for (const item of items) {
+          next.push({
+            ...item,
+            label: item.label || nextAnnotationLabel(next),
+            id: nextAnnotationId(),
+          })
+        }
+        return next
+      }),
+    [],
+  )
+  // Sidebar-row hover echoes onto the map; row click pans to the pin.
+  const [annotationHighlightId, setAnnotationHighlightId] = useState<
+    string | null
+  >(null)
+  const locateAnnotation = useCallback(
+    (id: string) => {
+      const annotation = annotations.find((ann) => ann.id === id)
+      const view = viewRef.current
+      if (!annotation || centerGlobe(...annotation.lonLat) || !view) return
+      view.animate({
+        center: fromLonLat(annotation.lonLat, view.getProjection()),
+        duration: 350,
+      })
+    },
+    [annotations, viewRef, centerGlobe],
+  )
+
+  const onToggleRef = useRef(onToggle)
+  onToggleRef.current = onToggle
+  const toggleAnnotate = useCallback(() => {
+    setAnnotateArmed((armed) => !armed)
+    onToggleRef.current()
+  }, [])
+  const disarmAnnotate = useCallback(() => setAnnotateArmed(false), [])
+
+  // The editing pin's position (or the pending click) for the dialog.
+  const annotationDraftLocation = (() => {
+    const lonLat = annotationDraft?.id
+      ? annotations.find((ann) => ann.id === annotationDraft.id)?.lonLat
+      : pendingRef.current?.lonLat
+    if (!lonLat) return null
+    return formatLatLon(lonLat[1], lonLat[0])
+  })()
+
+  return {
+    annotations,
+    leaveBlocker,
+    annotateArmed,
+    toggleAnnotate,
+    disarmAnnotate,
+    annotationDraft,
+    annotationDraftLocation,
+    onAnnotationCreate,
+    onAnnotationEdit,
+    saveAnnotation,
+    deleteAnnotation,
+    closeAnnotationEditor,
+    removeAnnotationById,
+    moveAnnotation,
+    importAnnotations,
+    locateAnnotation,
+    annotationHighlightId,
+    setAnnotationHighlightId,
+  }
+}

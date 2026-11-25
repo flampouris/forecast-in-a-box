@@ -10,7 +10,10 @@
 
 import { defineConfig, mergeConfig } from 'vitest/config'
 import { playwright } from '@vitest/browser-playwright'
-import viteConfig from './vite.config'
+import viteConfig from './vite.config.ts'
+
+/** Local only (`npm run test:gpu`): real-WebGL tests, slow on CI's software GL, and CI-flaky ones. */
+export const GPU_TESTS = 'tests/**/*.gpu.test.{ts,tsx}'
 
 export default mergeConfig(
   viteConfig({ mode: 'test', command: 'serve' }),
@@ -23,21 +26,41 @@ export default mergeConfig(
         '@testing-library/react',
         'sonner',
         'lz-string',
+        'date-fns',
+        '@date-fns/tz',
+        // First-import of a not-yet-optimized subpath re-optimizes mid-run
+        // and dual-loads React ("Cannot read properties of null").
+        '@tanstack/charts',
+        '@tanstack/charts/motion',
+        '@tanstack/charts/scales/band',
+        '@tanstack/charts/scales/linear',
+        '@tanstack/charts/tooltip',
+        '@tanstack/charts/react/tooltip',
+        '@base-ui/react/checkbox',
+        '@base-ui/react/context-menu',
+        'zustand/react/shallow',
       ],
     },
     test: {
       globals: true,
+      // Chromium's benign ResizeObserver notice; keep it out of the report.
+      onConsoleLog: (log) => !log.includes('ResizeObserver loop'),
       include: [
         'src/**/*.{test,spec}.{ts,tsx}',
         'tests/**/*.{test,spec}.{ts,tsx}',
       ],
-      exclude: ['tests/e2e/**', 'node_modules/**'],
+      exclude: ['tests/e2e/**', 'node_modules/**', GPU_TESTS],
       setupFiles: ['./tests/setup.ts'],
+      // expect.poll's 1 s default flakes on loaded CI runners; only failures wait longer.
+      expect: { poll: { timeout: 5000 } },
       browser: {
         enabled: true,
         provider: playwright(),
         instances: [{ browser: 'chromium' }],
         headless: true,
+        // Desktop layout (vitest default 414 < lg auto-collapse); height
+        // ≥896 keeps unstyled dialogs above the fold; tests may override.
+        viewport: { width: 1280, height: 900 },
       },
       coverage: {
         provider: 'v8',

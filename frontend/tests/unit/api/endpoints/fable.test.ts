@@ -16,6 +16,7 @@ import {
   expandFable,
   getCatalogue,
   retrieveFable,
+  updateBlueprint,
   upsertFable,
 } from '@/api/endpoints/fable'
 import { API_ENDPOINTS } from '@/api/endpoints'
@@ -36,6 +37,21 @@ const mockFable: FableBuilderV1 = {
       input_ids: {},
     },
   },
+}
+
+/** API wire format for mockFable (new backend format with list-based blocks). */
+const mockApiFable = {
+  blocks: [
+    {
+      instance_id: 'block-1',
+      plugin: { store: 'ecmwf', local: 'core' },
+      factory: 'model',
+      instance: {
+        configuration_values: { param1: 'value1' },
+        input_ids: {},
+      },
+    },
+  ],
 }
 
 describe('getCatalogue', () => {
@@ -111,7 +127,19 @@ describe('expandFable', () => {
       global_errors: [],
       block_errors: {},
       possible_sources: [],
-      possible_expansions: {},
+      possible_expansions: {
+        'block-1': [
+          {
+            plugin: { store: 'ecmwf', local: 'core' },
+            factory: 'model',
+            restrictions: {},
+          },
+        ],
+      },
+      configuration_restrictions: {
+        'block-1': { param1: "enumClosed[str]('value1','value2')" },
+      },
+      missing_glyphs: {},
     }
 
     worker.use(
@@ -123,6 +151,9 @@ describe('expandFable', () => {
     const result = await expandFable(mockFable)
     expect(result.global_errors).toEqual([])
     expect(result.block_errors).toEqual({})
+    expect(result.configuration_restrictions).toEqual({
+      'block-1': { param1: "enumClosed[str]('value1','value2')" },
+    })
   })
 
   it('sends fable as JSON body', async () => {
@@ -135,13 +166,22 @@ describe('expandFable', () => {
           global_errors: [],
           block_errors: {},
           possible_sources: [],
-          possible_expansions: {},
+          possible_expansions: {
+            'block-1': [
+              {
+                plugin: { store: 'ecmwf', local: 'core' },
+                factory: 'model',
+                restrictions: { param1: "enumClosed[str]('value1','value2')" },
+              },
+            ],
+          },
+          missing_glyphs: {},
         })
       }),
     )
 
     await expandFable(mockFable)
-    expect(capturedBody).toEqual(mockFable)
+    expect(capturedBody).toEqual(mockApiFable)
   })
 })
 
@@ -154,10 +194,10 @@ describe('retrieveFable', () => {
     const mockResponse = {
       blueprint_id: 'fable-123',
       version: 1,
-      builder: mockFable,
+      builder: mockApiFable,
       display_name: 'My Config',
       display_description: 'Some description',
-      tags: ['tag1'],
+      tags: [{ key: 'tag1', value: '' }],
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-01T00:00:00Z',
     }
@@ -175,6 +215,53 @@ describe('retrieveFable', () => {
     expect(result.display_name).toBe('My Config')
   })
 
+  it('parses label tags whose value is null (backend Tag.value: str | None)', async () => {
+    // Regression (#494): label tags serialise as { key, value: null }; if the
+    // schema rejects the null, the whole retrieve fails and the page loses its
+    // blueprint (no graph, untitled, raw block ids).
+    worker.use(
+      http.get(API_ENDPOINTS.fable.get, () =>
+        HttpResponse.json({
+          blueprint_id: 'fable-oneoff',
+          version: 1,
+          builder: mockApiFable,
+          display_name: 'One-off run',
+          display_description: null,
+          tags: [{ key: '__fiab:oneoff__', value: null }],
+        }),
+      ),
+    )
+
+    const result = await retrieveFable('fable-oneoff')
+    expect(result.tags).toEqual(['__fiab:oneoff__'])
+    expect(result.display_name).toBe('One-off run')
+    expect(result.coreVersionMismatch).toBeNull()
+  })
+
+  it('extracts the CoreVersionMismatch tag from the tag list (backend #494)', async () => {
+    // CoreVersionMismatch is reserved: stripped from user tags (else it would
+    // render as a chip and 422 on save), its value surfaced separately.
+    worker.use(
+      http.get(API_ENDPOINTS.fable.get, () =>
+        HttpResponse.json({
+          blueprint_id: 'fable-mismatch',
+          version: 1,
+          builder: mockApiFable,
+          display_name: 'Stale config',
+          display_description: null,
+          tags: [
+            { key: 'prod', value: null },
+            { key: 'CoreVersionMismatch', value: '!3 != 4' },
+          ],
+        }),
+      ),
+    )
+
+    const result = await retrieveFable('fable-mismatch')
+    expect(result.tags).toEqual(['prod'])
+    expect(result.coreVersionMismatch).toBe('!3 != 4')
+  })
+
   it('sends blueprint_id as query parameter', async () => {
     let capturedUrl: string | null = null
 
@@ -184,7 +271,7 @@ describe('retrieveFable', () => {
         return HttpResponse.json({
           blueprint_id: 'fable-456',
           version: 1,
-          builder: mockFable,
+          builder: mockApiFable,
           display_name: 'Test',
           display_description: '',
           tags: [],
@@ -226,7 +313,7 @@ describe('upsertFable', () => {
     expect(result.blueprint_id).toBe('new-fable-id')
     expect(result.version).toBe(1)
     expect(capturedBody).toMatchObject({
-      builder: mockFable,
+      builder: mockApiFable,
       display_name: 'My Config',
       display_description: 'Some notes',
     })
@@ -253,5 +340,33 @@ describe('upsertFable', () => {
       parent_id: 'existing-id',
     })
     expect(capturedBody).toMatchObject({ parent_id: 'existing-id' })
+  })
+})
+
+describe('updateBlueprint', () => {
+  afterEach(() => {
+    worker.resetHandlers()
+  })
+
+  it('re-sends parent_id so the version bump keeps its lineage', async () => {
+    let capturedBody: unknown = null
+
+    worker.use(
+      http.post(API_ENDPOINTS.fable.update, async ({ request }) => {
+        capturedBody = await request.json()
+        return HttpResponse.json({ blueprint_id: 'bp-1', version: 3 })
+      }),
+    )
+
+    await updateBlueprint({
+      blueprint_id: 'bp-1',
+      version: 2,
+      builder: mockFable,
+      display_name: 'Renamed',
+      display_description: '',
+      tags: [],
+      parent_id: 'tpl-001',
+    })
+    expect(capturedBody).toMatchObject({ parent_id: 'tpl-001' })
   })
 })

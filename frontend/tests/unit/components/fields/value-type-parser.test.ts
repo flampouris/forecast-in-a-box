@@ -8,11 +8,13 @@
  * does it submit to any jurisdiction.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  displayKindOf,
   getDefaultValueForType,
   parseValueType,
 } from '@/components/base/fields/value-type-parser'
+import { useUiStore } from '@/stores/uiStore'
 
 describe('parseValueType', () => {
   describe('simple types', () => {
@@ -78,27 +80,109 @@ describe('parseValueType', () => {
         itemType: 'int',
       })
     })
+
+    it('parses list with closed enum item type', () => {
+      expect(parseValueType('list[enumClosed[str](2t,msl)]')).toEqual({
+        type: 'enumList',
+        options: ['2t', 'msl'],
+        closed: true,
+      })
+    })
+
+    it('parses list with open enum item type', () => {
+      expect(parseValueType("list[enum[str]('a','b')]")).toEqual({
+        type: 'enumList',
+        options: ['a', 'b'],
+        closed: false,
+      })
+    })
   })
 
   describe('enum types', () => {
     it('parses single-quoted enum options', () => {
-      expect(parseValueType("enum['a','b','c']")).toEqual({
+      expect(parseValueType("enum[str]('a','b','c')")).toEqual({
         type: 'enum',
         options: ['a', 'b', 'c'],
+        closed: false,
       })
     })
 
     it('parses double-quoted enum options', () => {
-      expect(parseValueType('enum["x","y","z"]')).toEqual({
+      expect(parseValueType('enum[str]("x","y","z")')).toEqual({
         type: 'enum',
         options: ['x', 'y', 'z'],
+        closed: false,
       })
     })
 
     it('parses enum with single option', () => {
-      expect(parseValueType("enum['only']")).toEqual({
+      expect(parseValueType("enum[str]('only')")).toEqual({
         type: 'enum',
         options: ['only'],
+        closed: false,
+      })
+    })
+
+    it('parses enumClosed options', () => {
+      expect(
+        parseValueType("enumClosed[str]('mars','ecmwf-open-data')"),
+      ).toEqual({
+        type: 'enum',
+        options: ['mars', 'ecmwf-open-data'],
+        closed: true,
+      })
+    })
+
+    it('parses unquoted enumClosed options', () => {
+      expect(parseValueType('enumClosed[str](2t,msl)')).toEqual({
+        type: 'enum',
+        options: ['2t', 'msl'],
+        closed: true,
+      })
+    })
+
+    // anemoiSource.input_source ships this (the serializer emits no
+    // spaces after commas; tolerate both).
+    it('parses enumOpen options as an open enum', () => {
+      expect(
+        parseValueType("enumOpen[str]('mars', 'opendata', 'polytope')"),
+      ).toEqual({
+        type: 'enum',
+        options: ['mars', 'opendata', 'polytope'],
+        closed: false,
+      })
+    })
+
+    it('parses int-subtype enums as selects over the wire strings', () => {
+      expect(parseValueType('enumClosed[int](1,2,3)')).toEqual({
+        type: 'enum',
+        options: ['1', '2', '3'],
+        closed: true,
+      })
+    })
+
+    it('parses float-subtype enums', () => {
+      expect(parseValueType('enumOpen[float](0.5,1.5)')).toEqual({
+        type: 'enum',
+        options: ['0.5', '1.5'],
+        closed: false,
+      })
+    })
+
+    it('parses a list of int-subtype enums as a closed multi-select', () => {
+      expect(parseValueType('list[enumClosed[int](1,2)]')).toEqual({
+        type: 'enumList',
+        options: ['1', '2'],
+        closed: true,
+      })
+    })
+
+    it('falls back to unknown for unsupported enum subtypes', () => {
+      expect(
+        parseValueType('enumClosed[datetime](2026-01-01T00:00:00)'),
+      ).toEqual({
+        type: 'unknown',
+        raw: 'enumClosed[datetime](2026-01-01T00:00:00)',
       })
     })
   })
@@ -134,6 +218,19 @@ describe('parseValueType', () => {
 
     it('returns unknown for empty string', () => {
       expect(parseValueType('')).toEqual({ type: 'string' })
+    })
+
+    // Grammar-valid since fiab-core #691/#704 but still widget-less: they
+    // must land on the text fallback, not be rejected.
+    it('returns unknown for timedelta and none-bearing unions', () => {
+      expect(parseValueType('timedelta')).toEqual({
+        type: 'unknown',
+        raw: 'timedelta',
+      })
+      expect(parseValueType('union[str,none]')).toEqual({
+        type: 'unknown',
+        raw: 'union[str,none]',
+      })
     })
   })
 
@@ -175,11 +272,23 @@ describe('parseValueType', () => {
     })
 
     it('preserves enum options when wrapped', () => {
-      expect(parseValueType("optional[enum['a','b']]")).toEqual({
+      expect(parseValueType("optional[enum[str]('a','b')]")).toEqual({
         type: 'enum',
         options: ['a', 'b'],
+        closed: false,
         optional: true,
       })
+    })
+
+    it('preserves enumClosed options when wrapped', () => {
+      expect(parseValueType("optional[enumClosed[str]('mean','std')]")).toEqual(
+        {
+          type: 'enum',
+          options: ['mean', 'std'],
+          closed: true,
+          optional: true,
+        },
+      )
     })
 
     it('marks unknown inner as optional unknown', () => {
@@ -190,11 +299,180 @@ describe('parseValueType', () => {
       })
     })
   })
+
+  describe('artifact and param types', () => {
+    it('parses "artifact" as a catalogue picker', () => {
+      expect(parseValueType('artifact')).toEqual({ type: 'artifact' })
+    })
+
+    it('parses "param" as string', () => {
+      expect(parseValueType('param')).toEqual({ type: 'string' })
+    })
+
+    it('parses optional[artifact] as a picker with optional flag', () => {
+      expect(parseValueType('optional[artifact]')).toEqual({
+        type: 'artifact',
+        optional: true,
+      })
+    })
+
+    it('parses enumClosed[artifact] as a picker restricted to its ids', () => {
+      expect(
+        parseValueType("enumClosed[artifact]('ecmwf:aifs-a','ecmwf:aifs-b')"),
+      ).toEqual({
+        type: 'artifact',
+        options: ['ecmwf:aifs-a', 'ecmwf:aifs-b'],
+      })
+    })
+
+    it('parses enumOpen[param] as a labelled enum', () => {
+      expect(parseValueType("enumOpen[param]('167','151')")).toEqual({
+        type: 'enum',
+        options: ['167', '151'],
+        closed: false,
+        lookup: 'param',
+      })
+    })
+
+    it('parses list[enumClosed[param]] as a labelled enum list', () => {
+      expect(parseValueType("list[enumClosed[param]('167','151')]")).toEqual({
+        type: 'enumList',
+        options: ['167', '151'],
+        closed: true,
+        lookup: 'param',
+      })
+    })
+
+    it('parses list[param] as a labelled tag list', () => {
+      expect(parseValueType('list[param]')).toEqual({
+        type: 'list',
+        itemType: 'string',
+        lookup: 'param',
+      })
+    })
+
+    it('keeps str enums unlabelled', () => {
+      expect(
+        parseValueType("list[enumClosed[str]('a','b')]"),
+      ).not.toHaveProperty('lookup')
+    })
+  })
+
+  describe('displayKindOf', () => {
+    it.each([
+      ['param', 'param'],
+      ['list[param]', 'param'],
+      ["enumClosed[param]('167')", 'param'],
+      ["list[enumClosed[param]('167','151')]", 'param'],
+      ['artifact', 'artifact'],
+      ["enumClosed[artifact]('ecmwf:a')", 'artifact'],
+      ['str', null],
+      ["list[enumClosed[str]('a')]", null],
+      ['int{positive}', null],
+      [undefined, null],
+      ['not a type[[', null],
+    ])('%s → %s', (valueType, kind) => {
+      expect(displayKindOf(valueType)).toBe(kind)
+    })
+  })
+
+  describe('geodomain type', () => {
+    it('parses "geodomain"', () => {
+      expect(parseValueType('geodomain')).toEqual({ type: 'geodomain' })
+    })
+
+    it('is case-insensitive', () => {
+      expect(parseValueType('GeoDomain')).toEqual({ type: 'geodomain' })
+    })
+
+    it('parses optional[geodomain] with optional flag', () => {
+      expect(parseValueType('optional[geodomain]')).toEqual({
+        type: 'geodomain',
+        optional: true,
+      })
+    })
+  })
+
+  describe('grid type', () => {
+    it('parses a bare "grid" with the built-in suggestions', () => {
+      expect(parseValueType('grid')).toEqual({
+        type: 'grid',
+        options: ['auto', '0.25', '0.5', '1', 'O96', 'O320', 'N320'],
+        closed: false,
+      })
+    })
+
+    // As fiab-plugin-ecmwf sends it (ecmwf#667).
+    it('parses the plugin suggestions as an open grid, not a select', () => {
+      expect(
+        parseValueType('enumOpen[grid](auto,0.25,0.5,1,O96,O320,N320)'),
+      ).toEqual({
+        type: 'grid',
+        options: ['auto', '0.25', '0.5', '1', 'O96', 'O320', 'N320'],
+        closed: false,
+      })
+    })
+
+    it('keeps a closed grid enum closed', () => {
+      expect(parseValueType('enumClosed[grid](auto,O96)')).toEqual({
+        type: 'grid',
+        options: ['auto', 'O96'],
+        closed: true,
+      })
+    })
+
+    it('leaves a list of grids without a widget', () => {
+      expect(parseValueType('list[grid]')).toEqual({
+        type: 'unknown',
+        raw: 'list[grid]',
+      })
+    })
+  })
+
+  describe('traits', () => {
+    // *TODO* once traits feed the UI, assert on the parsed trait info
+    // instead of just the base widget type.
+    it('ignores a trailing traits suffix on a plain type', () => {
+      expect(parseValueType('int{positive}')).toEqual({ type: 'int' })
+    })
+
+    it('ignores a traits suffix with an argument', () => {
+      expect(parseValueType('float{nonNegative,divisibleBy(3)}')).toEqual({
+        type: 'float',
+      })
+    })
+
+    it('reads float{finite} as a plain float', () => {
+      expect(parseValueType('float{finite}')).toEqual({ type: 'float' })
+    })
+
+    it('ignores a traits suffix nested inside a list', () => {
+      expect(parseValueType('list[int{positive}]')).toEqual({
+        type: 'list',
+        itemType: 'int',
+      })
+    })
+  })
 })
 
 describe('getDefaultValueForType', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+    useUiStore.getState().reset()
+  })
+
   it('returns empty string for string type', () => {
     expect(getDefaultValueForType({ type: 'string' })).toBe('')
+  })
+
+  it('returns the first suggestion for grid type', () => {
+    expect(
+      getDefaultValueForType({
+        type: 'grid',
+        options: ['auto'],
+        closed: false,
+      }),
+    ).toBe('auto')
   })
 
   it('returns "0" for int type', () => {
@@ -205,25 +483,31 @@ describe('getDefaultValueForType', () => {
     expect(getDefaultValueForType({ type: 'float' })).toBe('0.0')
   })
 
-  it('returns today at local midnight for datetime type', () => {
-    const result = getDefaultValueForType({ type: 'datetime' })
-    // datetime-local compatible: YYYY-MM-DDTHH:mm, time pinned to 00:00
-    expect(result).toMatch(/^\d{4}-\d{2}-\d{2}T00:00$/)
-    const today = new Date()
-    const y = today.getFullYear()
-    const m = String(today.getMonth() + 1).padStart(2, '0')
-    const d = String(today.getDate()).padStart(2, '0')
-    expect(result).toBe(`${y}-${m}-${d}T00:00`)
+  it('returns today at 00:00 UTC for datetime type', () => {
+    vi.useFakeTimers()
+    // 23:30 UTC — a later calendar date in many browser timezones.
+    vi.setSystemTime(new Date('2026-05-15T23:30:00Z'))
+    expect(getDefaultValueForType({ type: 'datetime' })).toBe(
+      '2026-05-15T00:00:00',
+    )
   })
 
-  it('returns local today for date type', () => {
-    const result = getDefaultValueForType({ type: 'date' })
-    expect(result).toMatch(/^\d{4}-\d{2}-\d{2}$/)
-    const today = new Date()
-    const y = today.getFullYear()
-    const m = String(today.getMonth() + 1).padStart(2, '0')
-    const d = String(today.getDate()).padStart(2, '0')
-    expect(result).toBe(`${y}-${m}-${d}`)
+  it('keeps the datetime default in UTC regardless of the app timezone', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-15T23:30:00Z'))
+    useUiStore.setState({ timeZone: 'Asia/Tokyo' })
+    expect(getDefaultValueForType({ type: 'datetime' })).toBe(
+      '2026-05-15T00:00:00',
+    )
+  })
+
+  it('returns today in the app timezone for date type', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-05-15T23:30:00Z'))
+    useUiStore.setState({ timeZone: 'UTC' })
+    expect(getDefaultValueForType({ type: 'date' })).toBe('2026-05-15')
+    useUiStore.setState({ timeZone: 'Asia/Tokyo' }) // +9h -> next calendar day
+    expect(getDefaultValueForType({ type: 'date' })).toBe('2026-05-16')
   })
 
   it('returns empty string for list type', () => {
@@ -232,17 +516,44 @@ describe('getDefaultValueForType', () => {
     )
   })
 
+  it('returns the first restricted id for an artifact picker', () => {
+    expect(
+      getDefaultValueForType({ type: 'artifact', options: ['ecmwf:a'] }),
+    ).toBe('ecmwf:a')
+    expect(getDefaultValueForType({ type: 'artifact' })).toBe('')
+  })
+
+  it('returns empty string for enum list type', () => {
+    expect(
+      getDefaultValueForType({
+        type: 'enumList',
+        options: ['2t', 'msl'],
+        closed: true,
+      }),
+    ).toBe('')
+  })
+
   it('returns first option for enum type', () => {
     expect(
-      getDefaultValueForType({ type: 'enum', options: ['alpha', 'beta'] }),
+      getDefaultValueForType({
+        type: 'enum',
+        options: ['alpha', 'beta'],
+        closed: true,
+      }),
     ).toBe('alpha')
   })
 
   it('returns empty string for enum with no options', () => {
-    expect(getDefaultValueForType({ type: 'enum', options: [] })).toBe('')
+    expect(
+      getDefaultValueForType({ type: 'enum', options: [], closed: true }),
+    ).toBe('')
   })
 
   it('returns empty string for unknown type', () => {
     expect(getDefaultValueForType({ type: 'unknown', raw: 'xyz' })).toBe('')
+  })
+
+  it('returns empty string for geodomain', () => {
+    expect(getDefaultValueForType({ type: 'geodomain' })).toBe('')
   })
 })

@@ -7,70 +7,68 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-"""Common session maker invocation, db locking, retries"""
+"""Synchronous locking, retries, and session helpers for jobs persistence.
 
-import asyncio
+The lock in this module is a synchronous ``threading.RLock`` that serializes all
+in-process access to the jobs SQLite database. The administrative users database
+has its own separate async lock and retry helper in ``domain.auth.db``.
+"""
+
 import logging
-from asyncio import Lock
+import threading
+import time
 from collections.abc import Callable
-from typing import Any, Awaitable, TypeVar
+from typing import Any, TypeVar
 
 import sqlalchemy.exc
 
 logger = logging.getLogger(__name__)
 retries = 3
-# TODO we have one lock per two sqlite files -- overkill
-lock = Lock()
+# This lock is for jobs persistence only. The users database has a separate lock.
+# TODO investigate concurrent reads. SQLite should support concurrent readers,
+# but the first implementation deliberately serializes all access so this
+# rework does not also need to solve read/write classification and consistency.
+lock = threading.RLock()
 T = TypeVar("T")
 
 # TODO integrate with sqlalchemy typing system
 
 
-async def dbRetry(func: Callable[[int], Awaitable[T]]) -> T:
+def dbRetry(func: Callable[[int], T]) -> T:
     for i in range(retries, -1, -1):
         try:
-            async with lock:
-                return await func(i)
+            with lock:
+                return func(i)
         except sqlalchemy.exc.OperationalError:
             if i == 0:
                 raise
-            await asyncio.sleep(0.1)
+            time.sleep(0.1)
     raise ValueError  # NOTE in case of retries misconfig, we dont want implicit None
 
 
-async def executeAndCommit(stmt: Any, session_maker: Any) -> None:
-    async def func(i: int) -> None:
-        async with session_maker() as session:
-            await session.execute(stmt)
-            await session.commit()
+def executeAndCommit(stmt: Any, session_maker: Any) -> None:
+    def func(i: int) -> None:
+        with session_maker() as session:
+            session.execute(stmt)
+            session.commit()
 
-    await dbRetry(func)
+    dbRetry(func)
 
 
-async def addAndCommit(entity: Any, session_maker: Any) -> None:
-    async def func(i: int) -> None:
-        async with session_maker() as session:
+def addAndCommit(entity: Any, session_maker: Any) -> None:
+    def func(i: int) -> None:
+        with session_maker() as session:
             session.add(entity)
-            await session.commit()
+            session.commit()
 
-    await dbRetry(func)
+    dbRetry(func)
 
 
-async def querySingle(query: Any, session_maker: Any) -> Any:
-    async def func(i: int) -> Any:
-        async with session_maker() as session:
-            result = await session.execute(query)
+def querySingle(query: Any, session_maker: Any) -> Any:
+    def func(i: int) -> Any:
+        with session_maker() as session:
+            result = session.execute(query)
             maybe_row = result.first()
-            rv = maybe_row if maybe_row is None else maybe_row[0]
-            return rv
+            return maybe_row if maybe_row is None else maybe_row[0]
 
-    return await dbRetry(func)
-
-
-async def queryCount(query: Any, session: Any) -> int:
-    # TODO scalar_one
-    result = (await session.execute(query)).scalar()
-    if result is None or not isinstance(result, int):
-        raise TypeError(result)
-    else:
-        return result
+    return dbRetry(func)

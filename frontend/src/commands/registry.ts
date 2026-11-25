@@ -15,12 +15,14 @@
  * Commands are organized by category and can be filtered by route context.
  */
 
+import type { HotkeySequence } from '@tanstack/react-hotkeys'
 import type { ReactNode } from 'react'
 
 /**
  * Command category for grouping in the palette
  */
-export type CommandCategory = 'Getting Started' | 'Navigation'
+export type CommandCategory =
+  'Getting Started' | 'Navigation' | 'Presets' | 'Runs' | 'Blocks'
 
 /**
  * Command definition
@@ -34,12 +36,14 @@ export interface Command {
   description?: string
   /** Optional icon */
   icon?: ReactNode
-  /** Optional keyboard shortcut display (e.g., "⌘K") */
-  shortcut?: string
+  /** Optional global keyboard shortcut, as a key sequence (e.g. ['G', 'O']) */
+  hotkey?: HotkeySequence
   /** Category for grouping */
   category: CommandCategory
   /** Search keywords/aliases */
   keywords?: Array<string>
+  /** Listed only once the user types — keeps long catalogues out of the idle list. */
+  searchOnly?: boolean
   /** Action to execute when selected */
   action: () => void
 }
@@ -66,7 +70,13 @@ export function groupCommandsByCategory(
   }
 
   // Return in preferred order
-  const order: Array<CommandCategory> = ['Getting Started', 'Navigation']
+  const order: Array<CommandCategory> = [
+    'Getting Started',
+    'Navigation',
+    'Presets',
+    'Runs',
+    'Blocks',
+  ]
 
   return order
     .filter((category) => grouped.has(category))

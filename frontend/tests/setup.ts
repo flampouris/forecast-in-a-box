@@ -23,23 +23,37 @@ import { afterAll, afterEach, beforeAll, beforeEach } from 'vitest'
 import { cleanup } from 'vitest-browser-react'
 import { worker } from '../mocks/browser'
 import { resetJobsState } from '../mocks/data/job.data'
+import { resetWmsState } from '../mocks/data/wms.data'
 import { resetArtifactsHandlerState } from '../mocks/handlers/artifacts.handlers'
 import { resetFableHandlerState } from '../mocks/handlers/fable.handlers'
 import { resetPluginsHandlerState } from '../mocks/handlers/plugins.handlers'
 import { useActivityStore } from '@/stores/activityStore'
+import { useComparisonStore } from '@/features/visualise/stores/comparisonStore'
+import { useOnboardingStore } from '@/stores/onboardingStore'
+import { useTutorialsStore } from '@/stores/tutorialsStore'
 import { useCommandStore } from '@/stores/commandStore'
 import { useConfigStore } from '@/stores/configStore'
 import { useUiStore } from '@/stores/uiStore'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
 import { useStatusStore } from '@/features/status/stores/statusStore'
+import { resetPollIntervals } from '@/api/pollIntervals'
 
 // Start MSW browser worker before all tests
 beforeAll(async () => {
   await worker.start({
-    onUnhandledRequest: 'error',
+    onUnhandledFrame: ({ frame, defaults }) => {
+      if (!isViteModuleFrame(frame)) defaults.error()
+    },
     quiet: true,
   })
 })
+
+/** Vite `/@id/` module URLs, e.g. Vitest 5.1's `vi.mock` modules. */
+function isViteModuleFrame(frame: { protocol: string; data: unknown }) {
+  if (frame.protocol !== 'http') return false
+  const { request } = frame.data as { request: Request }
+  return new URL(request.url).pathname.startsWith('/@id/')
+}
 
 /** Reset shared mock + store state. Called from both afterEach and beforeEach
  *  so any async tails from the previous test are wiped _before_ the next
@@ -47,25 +61,40 @@ beforeAll(async () => {
  *  retrieve error` from sporadically seeing a stale `fable-100`/`fable-101`
  *  from an earlier save mutation. */
 function resetSharedState(): void {
+  // Back to production cadences; file-level beforeEach overrides run later.
+  resetPollIntervals()
+
   // MSW handler-scoped mutable state
   resetFableHandlerState()
   resetPluginsHandlerState()
   resetArtifactsHandlerState()
   resetJobsState()
+  resetWmsState()
 
   // Zustand stores that tests write to
   useFableBuilderStore.getState().reset()
-  useCommandStore.getState().reset()
+  useCommandStore.setState({ isOpen: false })
   useUiStore.getState().reset()
   useStatusStore.getState().reset()
   useConfigStore.getState().resetConfig()
   useActivityStore.getState().clearAll()
+  useComparisonStore.setState({ entries: [] })
+  useOnboardingStore.getState().reset()
+  useTutorialsStore.getState().reset()
 
   // localStorage carries both the persisted UI-preferences slice and any
   // fable-builder draft written by `useDraftPersistence`. Test files that
   // previously called `localStorage.clear()` in their own beforeEach can
   // now drop that boilerplate.
   localStorage.clear()
+}
+
+/** Shelf reset stays lazy: a static import would pull storage→logger into
+ *  every file's module graph before logger.test.ts can stub console. */
+async function resetShelfState(): Promise<void> {
+  const { useWorkbenchShelfStore } =
+    await import('@/features/fable-builder/stores/workbenchShelfStore')
+  useWorkbenchShelfStore.getState().clear()
 }
 
 /**
@@ -85,16 +114,19 @@ afterEach(async () => {
   await new Promise((resolve) => setTimeout(resolve, 0))
   worker.resetHandlers()
   resetSharedState()
+  await resetShelfState()
 })
 
 // Belt-and-braces: a second reset right before each test body runs, so a
 // failed afterEach or a module-scoped write from an unrelated file can't
 // poison the next test either.
-beforeEach(() => {
+beforeEach(async () => {
   resetSharedState()
+  await resetShelfState()
 })
 
 // Stop the worker after all tests complete
 afterAll(() => {
-  worker.stop()
+  // Not awaited: stop() waits for requests timeout tests leave hanging.
+  void worker.stop()
 })

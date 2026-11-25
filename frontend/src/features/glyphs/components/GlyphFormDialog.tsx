@@ -17,10 +17,11 @@
 import { useEffect, useState } from 'react'
 import { AlertCircle, HelpCircle, Loader2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import type { GlyphDetail } from '@/api/types/fable.types'
+import type { GlobalGlyphItem } from '@/api/types/fable.types'
 import { useCreateGlobalGlyph } from '@/api/hooks/useFable'
 import { useAuth } from '@/features/auth/AuthContext'
 import { isValidGlyphKey } from '@/features/glyphs/utils/validate-key'
+import { useReservedGlyphReason } from '@/features/glyphs/utils/reserved-names'
 import { useUser } from '@/hooks/useUser'
 import { showToast } from '@/lib/toast'
 import {
@@ -47,7 +48,7 @@ import { P } from '@/components/base/typography'
 interface GlyphFormDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-  editGlyph?: GlyphDetail
+  editGlyph?: GlobalGlyphItem
 }
 
 export function GlyphFormDialog({
@@ -56,17 +57,20 @@ export function GlyphFormDialog({
   editGlyph,
 }: GlyphFormDialogProps) {
   const { t } = useTranslation('glyphs')
+  const reservedReasonFor = useReservedGlyphReason()
   const { authType } = useAuth()
   const { data: user } = useUser()
   // Passthrough mode treats every caller as admin (matches backend AuthContext).
   const isAdmin = authType === 'anonymous' || (user?.is_superuser ?? false)
   const isEditing = !!editGlyph
 
-  const [key, setKey] = useState(editGlyph?.name ?? '')
-  const [value, setValue] = useState(editGlyph?.valueExample ?? '')
-  const [isPublic, setIsPublic] = useState(false)
+  const [key, setKey] = useState(editGlyph?.key ?? '')
+  const [value, setValue] = useState(editGlyph?.value ?? '')
+  const [isPublic, setIsPublic] = useState(editGlyph?.public ?? false)
   // null when public is off; concrete boolean when public is on (backend rule).
-  const [overriddable, setOverriddable] = useState<boolean | null>(null)
+  const [overriddable, setOverriddable] = useState<boolean | null>(
+    editGlyph?.overriddable ?? null,
+  )
   const [error, setError] = useState<string | null>(null)
 
   const createGlyph = useCreateGlobalGlyph()
@@ -74,13 +78,15 @@ export function GlyphFormDialog({
   // The dialog is permanently mounted by the parent, so the useState
   // initializers above only run once. Sync local state whenever the dialog
   // is (re)opened, so editing a row populates the form with that row's
-  // current values (not a stale empty string from first mount).
+  // current values (not a stale empty string from first mount). Seeding
+  // public/overriddable from editGlyph avoids silently demoting a public
+  // glyph to private on save.
   useEffect(() => {
     if (!open) return
-    setKey(editGlyph?.name ?? '')
-    setValue(editGlyph?.valueExample ?? '')
-    setIsPublic(false)
-    setOverriddable(null)
+    setKey(editGlyph?.key ?? '')
+    setValue(editGlyph?.value ?? '')
+    setIsPublic(editGlyph?.public ?? false)
+    setOverriddable(editGlyph?.overriddable ?? null)
     setError(null)
   }, [open, editGlyph])
 
@@ -110,6 +116,16 @@ export function GlyphFormDialog({
     !isEditing &&
     trimmedKeyForValidation !== '' &&
     !isValidGlyphKey(trimmedKeyForValidation)
+  const keyReserved =
+    !isEditing && trimmedKeyForValidation !== '' && !keyFormatInvalid
+      ? reservedReasonFor(trimmedKeyForValidation)
+      : null
+  const reservedMessage =
+    keyReserved === 'intrinsic'
+      ? t('form.keyReservedIntrinsic')
+      : keyReserved === 'jinja'
+        ? t('form.keyReservedJinja')
+        : null
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -121,6 +137,15 @@ export function GlyphFormDialog({
     if (!trimmedKey || !trimmedValue) return
     if (!isEditing && !isValidGlyphKey(trimmedKey)) {
       setError(t('form.keyInvalid'))
+      return
+    }
+    const reserved = !isEditing ? reservedReasonFor(trimmedKey) : null
+    if (reserved) {
+      setError(
+        reserved === 'intrinsic'
+          ? t('form.keyReservedIntrinsic')
+          : t('form.keyReservedJinja'),
+      )
       return
     }
 
@@ -169,10 +194,14 @@ export function GlyphFormDialog({
               onChange={(e) => setKey(e.target.value)}
               placeholder={t('form.keyPlaceholder')}
               disabled={isEditing}
-              aria-invalid={keyFormatInvalid || undefined}
+              aria-invalid={
+                keyFormatInvalid || keyReserved !== null || undefined
+              }
             />
             {keyFormatInvalid ? (
-              <P className="text-sm text-destructive">{t('form.keyInvalid')}</P>
+              <P className="text-sm text-danger">{t('form.keyInvalid')}</P>
+            ) : reservedMessage ? (
+              <P className="text-sm text-danger">{reservedMessage}</P>
             ) : (
               <P className="text-sm text-muted-foreground">
                 {t('form.keyHelp')}
@@ -258,6 +287,7 @@ export function GlyphFormDialog({
                 !key.trim() ||
                 !value.trim() ||
                 keyFormatInvalid ||
+                keyReserved !== null ||
                 createGlyph.isPending
               }
             >

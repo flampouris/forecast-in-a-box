@@ -8,12 +8,34 @@
  * does it submit to any jurisdiction.
  */
 
-import { useMemo } from 'react'
-import { AlertCircle, Link2, Trash2, X } from 'lucide-react'
+import { useCallback, useMemo, useRef } from 'react'
+import {
+  Bookmark,
+  ChevronRight,
+  Link2,
+  MousePointerClick,
+  Plus,
+  Trash2,
+  X,
+} from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { Link } from '@tanstack/react-router'
 import type { BlockFactoryCatalogue } from '@/api/types/fable.types'
-import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
+import { useBlockDisplayNames } from '@/features/fable-builder/hooks/useBlockDisplayNames'
+import { definableGlyphs } from '@/features/fable-builder/utils/definable-glyphs'
+import { useFieldErrorMessages } from '@/features/fable-builder/hooks/useFieldErrorMessages'
+import {
+  useFileNameCheck,
+  useOutputPathCheck,
+} from '@/features/fable-builder/hooks/useOutputPathCheck'
+import { useReservedGlyphReason } from '@/features/glyphs/utils/reserved-names'
+import {
+  findDownstreamBlocks,
+  useFableBuilderStore,
+} from '@/features/fable-builder/stores/fableBuilderStore'
 import {
   BLOCK_KIND_METADATA,
+  getBlockConfigurationRestrictions,
   getBlockKindIcon,
   getFactory,
 } from '@/api/types/fable.types'
@@ -41,20 +63,26 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
+import { Reveal } from '@/components/common/Reveal'
 import { GlyphReferencePanel } from '@/features/fable-builder/components/shared/GlyphReferencePanel'
-import { ResolvedConfigContext } from '@/features/fable-builder/context/ResolvedConfigContext'
-import { FieldErrorsContext } from '@/features/fable-builder/context/FieldErrorsContext'
+import { BlockConfigProvider } from '@/features/fable-builder/context/BlockConfigContext'
+import { BlockValidationProvider } from '@/features/fable-builder/context/BlockValidationContext'
 import { mapBlockErrorsToFields } from '@/features/fable-builder/utils/map-block-errors-to-fields'
+import { TOUR, tourAttr } from '@/features/tutorials/anchors'
 import { cn } from '@/lib/utils'
+import { BlockName } from '@/features/fable-builder/components/shared/BlockName'
 
 interface ConfigPanelProps {
   catalogue: BlockFactoryCatalogue
 }
 
 export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
+  const { t } = useTranslation('configure')
   // Use individual selectors to avoid creating new objects on every render
   const selectedBlockId = useFableBuilderStore((state) => state.selectedBlockId)
   const fable = useFableBuilderStore((state) => state.fable)
+  const blockNames = useBlockDisplayNames(fable)
+  const blockName = selectedBlockId ? blockNames[selectedBlockId] : undefined
   const resolvedConfigForBlock = useFableBuilderStore((state) =>
     state.selectedBlockId
       ? (state.validationState?.resolvedConfigurationOptions[
@@ -68,7 +96,19 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
         null)
       : null,
   )
+  const missingGlyphs = useFableBuilderStore((state) =>
+    state.selectedBlockId
+      ? (state.validationState?.blockStates[state.selectedBlockId]
+          ?.missingGlyphs ?? null)
+      : null,
+  )
   const selectBlock = useFableBuilderStore((state) => state.selectBlock)
+  const toggleConfigPanel = useFableBuilderStore(
+    (state) => state.toggleConfigPanel,
+  )
+  const setAddSourceMenuOpen = useFableBuilderStore(
+    (state) => state.setAddSourceMenuOpen,
+  )
   const updateBlockConfig = useFableBuilderStore(
     (state) => state.updateBlockConfig,
   )
@@ -77,6 +117,12 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
   const disconnectBlock = useFableBuilderStore((state) => state.disconnectBlock)
 
   const selectedBlock = selectedBlockId ? fable.blocks[selectedBlockId] : null
+  const validationState = useFableBuilderStore((state) => state.validationState)
+  const pendingRestrictions = useFableBuilderStore((state) =>
+    selectedBlockId
+      ? state.blockConfigurationRestrictions[selectedBlockId]
+      : undefined,
+  )
   const factory = selectedBlock
     ? getFactory(catalogue, selectedBlock.factory_id)
     : null
@@ -84,20 +130,20 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
   const availableSources = useMemo(() => {
     if (!selectedBlockId) return []
 
+    // Own consumers are excluded: wiring one in would close a cycle.
+    const downstream = findDownstreamBlocks(selectedBlockId, fable.blocks)
     return Object.entries(fable.blocks)
       .filter(([id, block]) => {
-        if (id === selectedBlockId) return false
+        if (id === selectedBlockId || downstream.has(id)) return false
         const blockFactory = getFactory(catalogue, block.factory_id)
         return (
-          blockFactory?.kind === 'source' || blockFactory?.kind === 'product'
+          blockFactory?.kind === 'source' ||
+          blockFactory?.kind === 'transform' ||
+          blockFactory?.kind === 'product'
         )
       })
-      .map(([id, block]) => ({
-        id,
-        block,
-        factory: getFactory(catalogue, block.factory_id),
-      }))
-  }, [fable.blocks, selectedBlockId, catalogue])
+      .map(([id]) => ({ id, name: blockNames[id] ?? id }))
+  }, [fable.blocks, selectedBlockId, catalogue, blockNames])
 
   function handleConfigChange(key: string, value: string): void {
     if (!selectedBlockId) return
@@ -119,20 +165,97 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
     selectBlock(null)
   }
 
+  const fieldErrorMessages = useFieldErrorMessages()
+  const reservedReasonFor = useReservedGlyphReason()
+  const isJinjaReserved = useCallback(
+    (name: string) => reservedReasonFor(name) === 'jinja',
+    [reservedReasonFor],
+  )
   // Hook must be called unconditionally — guard inside rather than early-
   // returning above it.
-  const configurationValues = selectedBlock?.configuration_values
-  const mappedErrors = useMemo(
-    () => mapBlockErrorsToFields(blockErrors ?? [], configurationValues ?? {}),
-    [blockErrors, configurationValues],
+  const liveMappedErrors = useMemo(
+    () =>
+      mapBlockErrorsToFields(
+        blockErrors ?? [],
+        missingGlyphs ?? {},
+        fieldErrorMessages,
+        selectedBlock?.configuration_values ?? {},
+        isJinjaReserved,
+      ),
+    [
+      blockErrors,
+      missingGlyphs,
+      fieldErrorMessages,
+      selectedBlock,
+      isJinjaReserved,
+    ],
   )
+
+  // Cache last-known restrictions per block so the field doesn't flash to
+  // its catalogue `value_type` during the validation-flight gap (~300 ms,
+  // validationState=null between an edit and the next /blueprint/expand).
+  // Hook runs unconditionally — must precede the early-return below.
+  const lastConfigRestrictionsRef = useRef<
+    Record<string, Record<string, string>>
+  >({})
+  // Same caching for mapped errors — otherwise they blank during the gap
+  // and the form jumps up and back when the next response arrives.
+  const lastMappedErrorsRef = useRef<Record<string, typeof liveMappedErrors>>(
+    {},
+  )
+  const sharedOutputPaths = useOutputPathCheck(
+    selectedBlockId,
+    selectedBlock,
+    resolvedConfigForBlock,
+  )
+  const missingFileNames = useFileNameCheck(selectedBlock)
 
   if (!selectedBlock || !factory) {
     return (
-      <div className="flex h-full flex-col items-center justify-center p-6 text-center">
-        <div className="text-muted-foreground">
-          <AlertCircle className="mx-auto mb-3 h-10 w-10 opacity-50" />
-          <P>Select a block to configure</P>
+      <div
+        className="relative flex h-full flex-col items-center justify-center p-6 text-center"
+        {...tourAttr(TOUR.configure.configPanel)}
+      >
+        <Button
+          variant="ghost"
+          size="icon"
+          className="absolute top-3 left-3 h-6 w-6 max-lg:hidden"
+          onClick={toggleConfigPanel}
+          title={t('layout.hideConfigPanel')}
+          aria-label={t('layout.hideConfigPanel')}
+        >
+          <ChevronRight className="h-4 w-4" />
+        </Button>
+        <div className="flex flex-col items-center gap-4 text-muted-foreground">
+          <MousePointerClick className="h-10 w-10 opacity-50" />
+          <div className="space-y-1">
+            <P className="font-medium text-foreground">
+              {t('configPanel.emptyTitle')}
+            </P>
+            <P>{t('configPanel.emptyDescription')}</P>
+          </div>
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setAddSourceMenuOpen(true)}
+            >
+              <Plus />
+              {t('configPanel.addSource')}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              nativeButton={false}
+              render={<Link to="/presets" />}
+            >
+              <Bookmark />
+              {t('configPanel.startFromPreset')}
+            </Button>
+          </div>
+          <P className="-mt-2 text-xs text-muted-foreground">
+            {t('configPanel.dropHint')}
+          </P>
         </div>
       </div>
     )
@@ -140,20 +263,73 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
 
   const metadata = BLOCK_KIND_METADATA[factory.kind]
   const IconComponent = getBlockKindIcon(factory.kind)
+  // Live when validationState is present; fall back to cache during the gap.
+  const liveConfigRestrictions = validationState
+    ? getBlockConfigurationRestrictions(
+        fable,
+        validationState,
+        selectedBlockId ?? '',
+      )
+    : null
+  if (liveConfigRestrictions !== null && selectedBlockId) {
+    lastConfigRestrictionsRef.current[selectedBlockId] = liveConfigRestrictions
+  }
+  const cachedConfigRestrictions = selectedBlockId
+    ? (lastConfigRestrictionsRef.current[selectedBlockId] as
+        Record<string, string> | undefined)
+    : undefined
+  const configRestrictions = {
+    ...(pendingRestrictions ?? {}),
+    ...(liveConfigRestrictions ?? cachedConfigRestrictions ?? {}),
+  }
+  // Stale stand-in result: keep the last errors, as in the null gap.
+  const selectedBlockState = validationState?.blockStates[selectedBlockId ?? '']
+  const errorsSettled =
+    validationState !== null && selectedBlockState?.stale !== true
+  if (errorsSettled && selectedBlockId) {
+    lastMappedErrorsRef.current[selectedBlockId] = liveMappedErrors
+  }
+  const mappedErrors =
+    errorsSettled || !selectedBlockId
+      ? liveMappedErrors
+      : (lastMappedErrorsRef.current[selectedBlockId] ?? liveMappedErrors)
+  const definableMissingGlyphs = definableGlyphs(
+    missingGlyphs,
+    mappedErrors.invalidGlyphNames,
+  )
   const configOptions = Object.entries(factory.configuration_options)
+  const configValueTypes = Object.fromEntries(
+    configOptions.map(([key, option]) => [
+      key,
+      configRestrictions[key] ?? option.value_type,
+    ]),
+  )
   const inputs = factory.inputs
 
   return (
-    <div className="flex h-full flex-col">
+    <div
+      className="flex h-full flex-col"
+      {...tourAttr(TOUR.configure.configPanel)}
+    >
       <div className="border-b border-border p-4">
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 items-center gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6 shrink-0 max-lg:hidden"
+              onClick={toggleConfigPanel}
+              title={t('layout.hideConfigPanel')}
+              aria-label={t('layout.hideConfigPanel')}
+            >
+              <ChevronRight className="h-4 w-4" />
+            </Button>
             <div className={cn('shrink-0', metadata.color)}>
               <IconComponent className="h-5 w-5" />
             </div>
             <div className="min-w-0">
               <H2 className="truncate text-sm font-semibold">
-                {factory.title}
+                <BlockName name={blockName ?? factory.title} />
               </H2>
               <Badge variant="outline" className="mt-1 text-sm">
                 {metadata.label}
@@ -175,62 +351,87 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
         )}
       </div>
 
-      <div className="flex-1 space-y-6 overflow-y-auto p-4">
-        {inputs.length > 0 && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-sm font-medium">
-              <Link2 className="h-4 w-4" />
-              Input Connections
-            </div>
-            <div className="space-y-3">
-              {inputs.map((inputName) => (
-                <InputConnectionField
-                  key={inputName}
-                  inputName={inputName}
-                  currentSourceId={selectedBlock.input_ids[inputName] || ''}
-                  availableSources={availableSources}
-                  onInputChange={handleInputChange}
-                />
+      <div className="flex-1 overflow-y-auto p-4">
+        {/* Backend block errors that map to no specific field — verbatim. */}
+        <Reveal open={mappedErrors.unmapped.length > 0}>
+          <div className="pb-6">
+            <div className="space-y-1 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2">
+              {mappedErrors.unmapped.map((message) => (
+                <P key={message} className="text-sm text-danger">
+                  {message}
+                </P>
               ))}
             </div>
-            <Separator />
           </div>
-        )}
-
-        {configOptions.length > 0 && (
-          <ResolvedConfigContext.Provider value={resolvedConfigForBlock}>
-            <FieldErrorsContext.Provider value={mappedErrors.byConfigKey}>
+        </Reveal>
+        <div className="space-y-6">
+          {inputs.length > 0 && (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                <Link2 className="h-4 w-4" />
+                {t('configPanel.inputConnections')}
+              </div>
               <div className="space-y-3">
-                <div className="text-sm font-medium">Configuration</div>
-                <div className="space-y-4">
-                  {configOptions.map(([key, option]) => (
-                    <FieldRenderer
-                      key={key}
-                      id={`config-${key}`}
-                      configKey={key}
-                      valueType={option.value_type}
-                      value={selectedBlock.configuration_values[key] || ''}
-                      onChange={(value) => handleConfigChange(key, value)}
-                      label={option.title || key}
-                      description={option.description}
-                      inputClassName="h-9"
-                    />
-                  ))}
+                {inputs.map((inputName) => (
+                  <InputConnectionField
+                    key={inputName}
+                    inputName={inputName}
+                    currentSourceId={selectedBlock.input_ids[inputName] || ''}
+                    availableSources={availableSources}
+                    onInputChange={handleInputChange}
+                  />
+                ))}
+              </div>
+              <Separator />
+            </div>
+          )}
+
+          {configOptions.length > 0 && (
+            <BlockValidationProvider
+              resolvedConfig={resolvedConfigForBlock}
+              fieldErrors={mappedErrors.byConfigKey}
+              missingGlyphs={definableMissingGlyphs}
+              sharedOutputPaths={sharedOutputPaths}
+              missingFileNames={missingFileNames}
+            >
+              <div className="space-y-3">
+                <div className="text-sm font-medium">
+                  {t('configPanel.configuration')}
                 </div>
+                <BlockConfigProvider
+                  values={selectedBlock.configuration_values}
+                  valueTypes={configValueTypes}
+                >
+                  <div className="space-y-4">
+                    {configOptions.map(([key, option]) => (
+                      <FieldRenderer
+                        key={key}
+                        id={`config-${key}`}
+                        configKey={key}
+                        valueType={configValueTypes[key]}
+                        value={selectedBlock.configuration_values[key] || ''}
+                        onChange={(value) => handleConfigChange(key, value)}
+                        label={option.title || key}
+                        description={option.description}
+                        inputClassName="h-9"
+                      />
+                    ))}
+                  </div>
+                </BlockConfigProvider>
                 {/* mt-10 reserves clearance for the last field's absolute
                     preview/nudge/error stack so they don't overlap the
                     reference panel. */}
                 <GlyphReferencePanel className="mt-10" />
               </div>
-            </FieldErrorsContext.Provider>
-          </ResolvedConfigContext.Provider>
-        )}
+            </BlockValidationProvider>
+          )}
 
-        {configOptions.length === 0 && inputs.length === 0 && (
-          <div className="py-4 text-center text-sm text-muted-foreground">
-            No configuration options
-          </div>
-        )}
+          {configOptions.length === 0 && inputs.length === 0 && (
+            <div className="py-4 text-center text-sm text-muted-foreground">
+              {t('configPanel.noConfigOptions')}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="border-t border-border p-4">
@@ -245,20 +446,23 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
             }
           >
             <Trash2 className="h-4 w-4" />
-            Delete Block
+            {t('configPanel.deleteBlock')}
           </AlertDialogTrigger>
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>Delete Block</AlertDialogTitle>
+              <AlertDialogTitle>
+                {t('configPanel.deleteBlock')}
+              </AlertDialogTitle>
               <AlertDialogDescription>
-                Are you sure you want to delete "{factory.title}"? This action
-                cannot be undone.
+                {t('configPanel.deleteConfirm', {
+                  title: blockName ?? factory.title,
+                })}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
+              <AlertDialogCancel>{t('configPanel.cancel')}</AlertDialogCancel>
               <AlertDialogAction onClick={handleDelete}>
-                Delete
+                {t('configPanel.delete')}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
@@ -270,7 +474,7 @@ export function ConfigPanel({ catalogue }: ConfigPanelProps): React.ReactNode {
 
 interface AvailableSource {
   id: string
-  factory: { title?: string } | undefined
+  name: string
 }
 
 interface InputConnectionFieldProps {
@@ -286,10 +490,11 @@ function InputConnectionField({
   availableSources,
   onInputChange,
 }: InputConnectionFieldProps): React.ReactNode {
+  const { t } = useTranslation('configure')
   const displayValue = currentSourceId
-    ? availableSources.find((s) => s.id === currentSourceId)?.factory?.title ||
-      currentSourceId
-    : 'Select source...'
+    ? (availableSources.find((s) => s.id === currentSourceId)?.name ??
+      currentSourceId)
+    : t('configPanel.selectSource')
 
   return (
     <div className="space-y-1.5">
@@ -304,14 +509,14 @@ function InputConnectionField({
           <SelectValue>{displayValue}</SelectValue>
         </SelectTrigger>
         <SelectContent>
-          {availableSources.map(({ id, factory: sourceFactory }) => (
+          {availableSources.map(({ id, name }) => (
             <SelectItem key={id} value={id}>
-              {sourceFactory?.title || id}
+              {name}
             </SelectItem>
           ))}
           {availableSources.length === 0 && (
             <div className="p-2 text-sm text-muted-foreground">
-              No compatible sources
+              {t('configPanel.noCompatibleSources')}
             </div>
           )}
         </SelectContent>

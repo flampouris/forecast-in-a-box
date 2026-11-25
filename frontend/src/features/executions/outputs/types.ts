@@ -13,9 +13,10 @@
  * that decides icon, label, thumbnail, viewer, and per-output actions.
  */
 
-import type { ComponentType, LazyExoticComponent } from 'react'
+import type { ComponentType, LazyExoticComponent, ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import type { TFunction } from 'i18next'
+import type { OutputDim } from './dims'
 
 /** A typed `t` function bound to the `executions` namespace. */
 export type ExecutionsT = TFunction<'executions'>
@@ -28,9 +29,21 @@ export interface OutputItem {
   taskId: string
   /** Authoritative MIME from RunOutputMetadata. */
   mimeType: string
-  /** Source block identifier — used as the human-readable card label and group key. */
+  /** Source block id — the group key and viewer link. */
   originalBlock: string
+  /** Display name of that block, e.g. "Map Plot". */
+  blockName: string
+  /** Split coordinates, e.g. [["param", "167"], ["step", "6"]]. */
+  dims?: ReadonlyArray<OutputDim>
+  /** Differing block options, keyed `setting:<option>`. */
+  settings?: ReadonlyArray<OutputDim>
+  /** Short coordinate label, e.g. 2t and step 6. */
+  subtitle?: string
+  /** Long form of `subtitle` with full parameter names. */
+  subtitleFull?: string
   isAvailable: boolean
+  /** Reason a produced output is no longer retrievable; absent = pending. */
+  lostReason?: string
 }
 
 export interface ActionContext {
@@ -67,6 +80,13 @@ export interface ViewerProps {
    * picked. Carries the (possibly sniff-promoted) extension etc. */
   adapter: OutputAdapter
   onClose: () => void
+  /** Step prev/next in the visible list; undefined at boundaries. */
+  onPrev?: () => void
+  onNext?: () => void
+  /** 1-based position for the header indicator. */
+  navIndex?: { current: number; total: number }
+  /** Rendered below the stage, e.g. the output filmstrip. */
+  footer?: ReactNode
 }
 
 export interface OutputAdapter {
@@ -95,9 +115,8 @@ export interface OutputAdapter {
 }
 
 /**
- * Sniffer hook for the rare case where the registered MIME type is wrong
- * and we need to peek at bytes to dispatch correctly. No first-party
- * sniffer is registered today; the interface is kept for future use.
+ * Sniffer hook for the case where the registered MIME type is wrong and we
+ * need to peek at bytes to dispatch correctly. See `firstPartySniffers.ts`.
  */
 export interface Sniffer {
   /** Only run when the item's mime is in this list. */

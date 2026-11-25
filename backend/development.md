@@ -3,8 +3,10 @@
   * when adding new functionality, try to add both unit tests and integration tests
   * there are additionally `tests/largeE2E` -- you are not expected to run or modify these during regular work, those are for releases
 * project is managed by `uv` -- utilize that for running any python-related subcommands like `uv run pytest` or `uv run ty`
+  * keep the pyproject.toml in sync with uv.lock -- when you add a new dependency or update a constraint in pyproject, run the corresponding `uv lock` command
 * utilize `just` for command running -- `just val` is the "all typechecking and testing". Always run this prior to a commit, as well as utilizing pre-commit with prek
   * during development, utilize granular validation -- first, run type checking, then unit tests for the code you have created or changed, then all integration tests
+  * don't change formatting on a whim. When you notice a bug or breach of guidelines that is not related or affecting your current task, ignore it.
 * when you are creating a new package in backend/packages, initialize it with uv, add it to the backend/pyproject.toml workspace listing, and create there a basic justfile with the `val` recipe. When filling the `justfile` and the `pyproject.toml`, use the existing packages as templates
 * 
 
@@ -13,33 +15,42 @@
   * when working with a package with insufficient typing coverage like sqlalchemy, use `ty:ignore` comment
   * when `ty` is not powerful enough, use `ty:ignore `
   * use `typing.cast` when the code logic is implicitly erasing the type information
-* prioritize using pydantic BaseModel or dataclasses.dataclass object for capturing contracts and interfaces.
+  * do not use annotation-as-string unless necessary -- that is, prefer `f: TypeExpression` instead of `f: "TypeExpression"`
+* prioritize using pydantic BaseModel or dataclasses.dataclass object for capturing contracts and interfaces
+  * if an object would cross language/host boundaries go with pydantic to have json serde, otherwise dataclass. Do not use NamedTuples
   * when using pydantic, use `FiabBaseModel` from `forecastbox.utility.pydantic` (or `FiabCoreBaseModel` from `fiab_core.pydantic_utils` in fiab-core) instead of `pydantic.BaseModel` directly, unless the model requires dynamic field handling (e.g., `extra="allow"` for JSON Schema types). These base models set `extra="forbid"` to catch misconfigured constructors early. If you need the dynamic model handling, mark it clearly with a comment.
   * ideally keep them plain, stateless, frozen, without functions -- we end up serializing those objects often over to other python processes or different languages
     * having a few methods that provide convenience views, ser/de, validation, conversion does not necessarilly hurt -- its primarily about keeping the codebase generally functional and data-oriented rather than object-oriented.
   * for simple immutable data transfer objects, use `@dataclass(frozen=True, eq=True, slots=True)` directly for best type checker support -- provides immutability, hashability, and memory efficiency via slots. We set `eq=True` explicitly, despite being a default, for clarity.
   * a convenience decorator `frozendc` exists in `forecastbox.utility.structural` but direct decorator syntax is preferred for type safety
   * when using a primitive type in a semantically restricted context, utilize typing.NewType -- for example, dont do `user_id: str` but `UserId = typing.NewType("UserId", str); user_id: UserId`, because not every string is a valid UserId. This prevents a mixture of ids and gives a stronger type validity
-* use comments sparingly, for non-obvious code only. Add docstrings to functions called from other modules only. When adding docstring, use compact style -- dont separate out Args and Returns, describe everything in one or two paragraphs.
-* all imports belong to top level of the file, dont import inside function definitions unless necessiated by runtime.
-* dont alias in imports unless there is a name collision, or unless its a standard shortcut: `datetime as dt`, `multiprocessing as mp`, `numpy as np`, `xarray as xr`
+* use comments sparingly, for non-obvious code only. Add docstrings to functions called from other modules only. When adding docstring, use compact style -- dont separate out Args and Returns, describe everything in one or two paragraphs. Do not make two spaces after a dot.
+  * when making a code change, do not refer to the previous state in the docstring or the comment. In other words, do not put to docstring texts like "this function replaces the original function". This belongs to commit message, not to the code!
+* all imports belong to top level of the file, dont import inside function definitions unless necessiated by runtime (and in that case, always add explanatory comment at the site)
+* dont alias in imports unless there is a name collision, or unless its a standard shortcut: `datetime as dt`, `multiprocessing as mp`, `numpy as np`, `xarray as xr`, `earthkit.data as ekd`
 * never use python keywords and builtins as variable names -- for example, don't use `id` variable, prefer `id_<something>` or `id_`
+* prefer existing code in `utility` submodules over writing it from scratch -- for example, don't use directly `requests` or `httpx.Client`, instead use `utility.http_pools`; don't manually convert `datetime` objects to string with `strftime`, instead use `utility.time.value_dt2str`, etc.
 
 # High Level Code Organization and Placement
 When adding new code, make sure you place it in the right submodule:
 * routes: *all* backend routes are declared here. There is autodiscovery mechanism, do _not_ make submodules here; only declare routes in `routes/*.py` files.
   * when making changes to any code in the routes submodule, consult `routes/__init__.py` docstring!
-* schemata: *all* database schemata, ie, ORM classes, are declared here. There is autodiscovery mechanism, do _not_ make submodules here; only declare schemata in `routes/*.py` files.
-  * do not declare any functions in these files, only the ORM classes themselves, and the function related to discovery: `create_db_and_tables`
+* schemata: *all* database schemata, ie, ORM classes, are declared here. There is autodiscovery mechanism, do _not_ make submodules here; only declare schemata in flat `schemata/*.py` files, one file per domain (inluding subdomains if any).
+  * do not declare any functions in these files, only the ORM classes themselves
+  * the user.py represents a domain and a standalone database; the job.py is not a domain but represents a sqlite database `job.db` used by all other domains, and declares only engine/Base, no tables itself. The job.db-residing domains import the Base from jobs.py -- there must be a single Base to handle Foreign Keys correctly.
 * domain: the domain entities, related service functions, database helpers, domain dataclasses, et cetera. Most of the business logic lives here. Consult each domain's docstring in `__init__.py` to understand its role. When making *any* change to a code in a domain, consult the docstring to see if you need to make a change in the docstring itself.
   * within domain submodules there is often a `db.py` which contains helper functions to operate on top of ORMs from schemata. This module is always expected to handle automated version increments when mutating versioned entities, and to enforce authorization.
+    * no ORM object may cross the `db.py` module boundary -- convert query results into a plain dataclass (e.g. `RunRecord`) before returning. Sessions, active result objects, and lazy-loaded attributes must never be handed to callers; materialize everything the caller needs before the session closes. The ORM objects misbehave when crossing thread boundaries -- which is bound to happen to return values of functions in `db.py` given we mix sync and async code and thread pools.
+  * domains often contain an `exceptions.py` file -- we prefer domain-specific exceptions over ValueError everywhere. These exceptions should be translated into corresponding HTTP status codes in the route modules.
 * utility: code that can be utilized across domains, that is, helper functions operating primarily on standard library constructs
   * an exception is utility/config.py, which is containing a lot of domain-specific code. We chose to place it in `utility` to have all config centralized and available to the whole application.
+  * common cross-domain utility exceptions (e.g. `ExecutionManagerError` and its subclasses, `NoFreePortsException`) have a general handling in the `utility/fastapi` module, wired once in `entrypoint/app.py` -- rather than being handled ad hoc in every route that might raise them.
 * entrypoint: code related to bootstrapping the FastAPI backend itself, including self-checks, config management, logging setup, et cetera.
   * there are utility-like functions here as well -- when deciding whether to add here or to top-level utility module, consider whether its entrypoint-only or of plausible usage to domains as well
 
 Make sure you don't break importing hierarchies: utility < schemata < domain < routes < entrypoint.
 There are additional rules for hierarchy within domains -- when you change imports in a particular domain, consult its docstring to understand if that is allowed.
+In particular, the hierarchy within domains must stay acyclic. If the design seems to require a coupling between two domains, consult the "event dispatcher" in the Concurrency section below. If such situation appears, it still must be noted in the domain's top docstring as a loose/indirect domain coupling.
 
 # Backwards Compatibility
 This application is deployed at multiple machines owned by users, over which we have no control. Changes you make need to preserve compatibility:
@@ -48,9 +59,24 @@ This application is deployed at multiple machines owned by users, over which we 
 * when changing anything in the `routes` submodule, consult its docstring for mandatory guidelines
 
 # Concurrency Considerations
-There is currently async loop which serves all the requests to the FastAPI app, as well as multiple background threads created in various domains: scheduler thread, plugin thread, artifact thread. Particular care must be paid to handling things correctly
+There is currently async loop which serves all the requests to the FastAPI app, as well as managed long-lived threads (event dispatcher, scheduler, database garbage collector -- currently a read-only proof of concept in `domain/maintenance`) and named bounded thread pools (`ConcurrentPools` in `utility/config.py`). Particular care must be paid to handling things correctly -- we don't necessarily aim to maximize throughput, but we do not want to block the user-facing async loop for long as we need to keep the backend responsiveness high. Additionally, we want some sort of fairness -- one long operation should not starve other short operations.
 
-* sqlite, the current persistence layer, supports only one concurrent writer -- thats why we have async Lock in the `utility/db.py` module, and this lock governs all database access. Eventually we'll allow concurrent reads as those are allowed by sqlite. When doing database access, you *must* respect this lock, as all existing `db.py` subdomules across domains do.
-  * this is particularly interesting in the background threads which don't run in the async loop -- for now, all such threads receive a reference of the loop, and submit their database access there. When implementing a new background thread, it is critical you utilize this pattern.
+* sqlite, the jobs persistence layer, supports only one concurrent writer -- jobs-database access is synchronous and serialized by a `threading.RLock` in `utility/db.py` (`lock`, taken by `dbRetry`). Every `db.py` helper across domains is a synchronous, operation-local function that acquires this lock internally; it never submits itself to a pool. Implementing support for concurrent reads should be possible in the future, but do not attepmt to solve it now
+  * async code (routes, services) must never call a jobs `db.py` helper directly -- submit the whole helper call through `execution_manager.await_jobs_db()` (backed by the single-worker `ConcurrentPools.JobsDb` pool). Synchronous code (background threads, pool workers) calls the helper directly, on its own thread, without touching the event loop
+  * the users database (`domain/auth/db.py`) is a separate, independent concern -- it keeps its own async lock (`dbLock`)/retry helper and remains fully async via aiosqlite. Do not mix jobs-database and users-database locking. This database is physically different sqlite file with independent writes/reads, is never accessed outside of the auth web route, and may be migrated to an external auth provider later
+  * it is preferable that a read-modify-write sequence with business logic in between is split into two separate locked callables (two lock acquisitions), rather than one callable holding the lock across the business logic, to keep the lock occupancy low
 * multiple state structures are updated via the background threads, but consumed by the async loop -- to achieve synchronization, we rely on immutable data structures from the `pyrsistent` package. All concurrently accessed state is declared as pyrsistent structure, reads are lock-free, and the lock only needs to provide for atomic swap after updates. When working with shared state, make sure you utilize this pattern -- see `Manager` classes in plugin or artifact domains.
-* sometimes a request to the FastAPI app triggers a possibly long operation, which we offload to the default thread pool executor registered to asyncio -- for example, submitting a Run domain entity. It is imperative that all such operations are fully wrapped in a try-catch block, and any error manifests by updating the database state with the respective error message.
+* threads and thread pools must not be created ad hoc. Use the central `ExecutionManager` (`utility/concurrency/manager.py`'s `execution_manager` instance) for both named bounded pools (`ConcurrentPools`) and long-lived threads (`ConcurrentThreads`) -- register at startup with a stage, submit work with a `submit_*` method, and provide a non-blocking component status. Do not instantiate `ThreadPoolExecutor` or `threading.Thread` directly in domain code.
+  * stages order startup (ascending) and shutdown (descending): 0 is infrastructure (all pools, event dispatcher), 1 are producers (scheduler), 2 is maintenance (database garbage collector)
+  * `submit_monitored` transfers failure ownership to the manager (failures appear in its bounded monitored-failure history) -- use it for fire-and-forget work. `submit_unmonitored` returns a `Future` whose result the caller must retrieve; `awaitable_submit` is its async variant
+  * the execution status (pools, threads, monitored failures) is exposed under `concurrency` in the `/api/v1/status` response
+  * never hold a `threading` lock across an `await` -- move the locked section into a synchronous function and submit it to a pool instead
+  * the notification broadcaster (`domain/notification/service.py`) is the only adapter holding a reference to the event loop, to schedule websocket broadcasts from pool workers
+  * for one-to-many, loosely coupled reactions (crossing or reversing the usual dependency hierarchy), use the process-local event dispatcher (`utility/dispatcher.py`) instead of a direct call or a new thread -- producers publish an immutable `Event` and never import consumers; the entrypoint discovers and wires handlers via each domain's optional `dispatchers.py`.
+  * for a synchronous one-to-one call against the domain hierarchy, use a hook injected by the entrypoint at initialization (eg the plugin template hooks in `domain/plugin/template_hooks.py`, registered in `entrypoint/initializers.py::register_providers`), not the event bus
+  * the backend warmup (`entrypoint/warmup.py`) runs without pools, dispatcher or event loop -- if you rework some functionality relied on by application start to utilize any concurrency mechanisms, make sure warmup can still work correctly
+  * for a linear workflow where the next step just needs a different pool/lock, prefer `execution_manager.submit_after` (a non-blocking continuation) over the event bus -- the event bus is not a substitute for an ordinary same-direction function call.
+* sometimes a request to the FastAPI app triggers a possibly long operation, which we offload to a named `ExecutionManager` pool -- for example, submitting a Run domain entity. It is imperative that all such operations are fully wrapped in a try-catch block, and any error manifests by updating the database state with the respective error message.
+* HTTP clients must not be created ad hoc. Use the central registry in `utility/http_pools.py`, which holds one long-lived sync and one async `httpx` client per `HttpProfile` (eg, `Default`, `Download`, `Proxy`). The registry is started in the `http_pools` initializer step and closed at shutdown, before the execution pools are joined, so in-flight sync requests fail and are thereby cancelled.
+  * `get_sync(profile)` returns an `httpx.Client` usable from any thread, including pool workers. `get_async(profile)` returns an `httpx.AsyncClient` usable only on the event loop thread. Never block the loop with a sync client.
+  * exceptions: the bootstrap checks (`entrypoint/bootstrap/checks.py`) run outside the backend lifecycle and use short lived local clients, and `httpx_oauth` in `domain/auth/oidc.py` creates and closes its own clients internally.

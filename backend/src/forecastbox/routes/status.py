@@ -12,15 +12,18 @@
 import logging
 from dataclasses import dataclass
 
-import requests
+import httpx
 from cascade.gateway import api, client
 from fastapi import APIRouter, Request
 
-from forecastbox.domain.experiment.scheduling.background import status_scheduler
-from forecastbox.domain.plugin.manager import status_brief
-from forecastbox.utility.config import config
+from forecastbox.domain.experiment.scheduling.runtime import status_scheduler
+from forecastbox.domain.gateway.service import get_gateway_url
+from forecastbox.domain.plugin.status import status_brief
+from forecastbox.utility.concurrency.manager import ExecutionStatus, SubmissionRejected, TaskName, execution_manager
+from forecastbox.utility.config import ROUTE_PREFIX, ConcurrentPools, config
+from forecastbox.utility.http_pools import HttpProfile, get_async
 
-PREFIX = "/api/v1/status"
+PREFIX = f"{ROUTE_PREFIX}/status"
 
 logger = logging.getLogger(__name__)
 
@@ -32,22 +35,37 @@ class StatusResponse:
     api: str
     cascade: str
     ecmwf: str
+    # TODO remove, superseded by concurrency.threads.scheduler. Must be done in sync with the frontend
+    # (frontend/src/types/status.types.ts, frontend/src/components/common/StatusDetailsPopover.tsx)
+    # and backend/tests/integration/test_schedule.py; when scheduling is disabled the thread entry is
+    # absent, which clients must treat as "off".
     scheduler: str
     version: str
     plugins: str
+    concurrency: ExecutionStatus
+
+
+def _probe_cascade() -> str:
+    try:
+        client.request_response(api.JobProgressRequest(job_ids=[]), get_gateway_url(), timeout_ms=1000)
+        return "up"
+    except Exception as e:
+        logger.warning(f"Error connecting to Cascade: {repr(e)}")
+        return "down"
 
 
 @router.get("")
-def get_status(request: Request) -> StatusResponse:
+async def get_status(request: Request) -> StatusResponse:
     """Overall system status endpoint."""
 
     status: dict[str, str] = {"api": "up", "cascade": "up", "ecmwf": "up", "scheduler": "up", "version": request.app.version}
 
     try:
-        client.request_response(api.JobProgressRequest(job_ids=[]), config.cascade.cascade_url, timeout_ms=1000)
-        status["cascade"] = "up"
-    except Exception as e:
-        logger.warning(f"Error connecting to Cascade: {repr(e)}")
+        status["cascade"] = await execution_manager.awaitable_submit(
+            ConcurrentPools.General, TaskName("status.probe.cascade"), _probe_cascade
+        )
+    except SubmissionRejected as e:
+        logger.warning(f"Cascade probe rejected: {repr(e)}")
         status["cascade"] = "down"
 
     try:
@@ -63,12 +81,12 @@ def get_status(request: Request) -> StatusResponse:
         status["plugins"] = f"failure getting status"
 
     try:
-        response = requests.get(f"{config.api.model_repository}/MANIFEST", timeout=5)
+        response = await get_async(HttpProfile.Default).get(f"{config.external.model_repository}/MANIFEST", timeout=5)
         if response.status_code == 200:
             status["ecmwf"] = "up"
         else:
             status["ecmwf"] = "down"
-    except Exception:
+    except httpx.HTTPError:
         status["ecmwf"] = "down"
 
-    return StatusResponse(**status)
+    return StatusResponse(**status, concurrency=execution_manager.status())

@@ -15,13 +15,13 @@
  * After installing a plugin the backend temporarily returns 503 on the
  * catalogue endpoint while plugins reload. The UI must wait for the
  * catalogue to recover, then refresh plugin details so the installed
- * plugin moves from "Available" to "Installed".
+ * plugin's card gains its enable switch in place.
  *
  * Works with both MSW mocks (npm run test:e2e) and a real backend
  * (npm run test:e2e:stack).
  */
 
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import type { Page } from '@playwright/test'
 
 /**
@@ -31,7 +31,7 @@ import type { Page } from '@playwright/test'
  */
 async function navigateTo(page: Page, path: string) {
   await page.goto('/')
-  await page.waitForURL(/dashboard/, { timeout: 15000 })
+  await page.waitForURL(/overview/, { timeout: 15000 })
   await page.waitForLoadState('networkidle')
   await page.goto(path)
   await page.waitForLoadState('networkidle')
@@ -43,7 +43,7 @@ test.describe('Plugin Install Flow', () => {
     await navigateTo(page, '/admin/plugins')
   })
 
-  test('installing a plugin moves it from available to installed', async ({
+  test('installing a plugin turns its card into an installed one', async ({
     page,
   }) => {
     // Track catalogue 503 responses to verify retry behaviour
@@ -57,7 +57,7 @@ test.describe('Plugin Install Flow', () => {
     })
 
     // Wait for the page to fully load
-    const heading = page.getByRole('heading', { name: /plugin store/i })
+    const heading = page.getByRole('heading', { name: /^plugins$/i })
     await expect(heading).toBeVisible({ timeout: 10000 })
 
     // Switch to card view so each plugin has its own Card element
@@ -69,7 +69,6 @@ test.describe('Plugin Install Flow', () => {
     }
 
     // Find the first available plugin card that has an Install button.
-    // The available section always uses card view (individual Card per plugin).
     const availableCards = page
       .locator('[data-slot="card"]')
       .filter({ has: page.getByRole('button', { name: /^Install$/ }) })
@@ -100,13 +99,12 @@ test.describe('Plugin Install Flow', () => {
     await card.getByRole('button', { name: /^Install$/ }).click()
 
     // The mutation triggers:
-    //  1. POST /plugin/install  → 200
-    //  2. GET  /fable/catalogue → 503  (plugins reloading)
-    //  3. GET  /fable/catalogue → 200  (retry succeeds)
-    //  4. GET  /plugin/details  → 200  (updated listing)
+    //  1. POST /plugin/install      → 200
+    //  2. GET  /blueprint/catalogue → 503  (plugins reloading)
+    //  3. GET  /blueprint/catalogue → 200  (retry succeeds)
+    //  4. GET  /plugin/list         → 200  (updated listing)
 
-    // After install completes the plugin should appear in the installed
-    // section with a toggle switch. Wait for the full retry + refetch cycle.
+    // The same card gains a switch once the retry + refetch cycle is done.
     const installedCard = page
       .locator('[data-slot="card"]')
       .filter({ hasText: pluginName })

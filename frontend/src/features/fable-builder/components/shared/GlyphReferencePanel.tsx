@@ -40,6 +40,7 @@ import { useAllGlyphs } from '@/features/fable-builder/hooks/useAllGlyphs'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
 import { GlyphFormDialog } from '@/features/glyphs/components/GlyphFormDialog'
 import { isValidGlyphKey } from '@/features/glyphs/utils/validate-key'
+import { useReservedGlyphReason } from '@/features/glyphs/utils/reserved-names'
 import { showToast } from '@/lib/toast'
 import { P } from '@/components/base/typography'
 import {
@@ -130,7 +131,7 @@ export function GlyphReferencePanel({ className }: { className?: string }) {
                   type="button"
                   aria-label={t('panel.addGlobal')}
                   onClick={() => setCreateGlobalOpen(true)}
-                  className="shrink-0 rounded p-1 text-primary hover:bg-primary/10"
+                  className="shrink-0 rounded-md p-1 text-primary hover:bg-primary/10"
                 />
               }
             >
@@ -146,7 +147,7 @@ export function GlyphReferencePanel({ className }: { className?: string }) {
                 <Link
                   to="/admin/variables"
                   aria-label={t('panel.manageAll')}
-                  className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  className="shrink-0 rounded-md p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
                 />
               }
             >
@@ -175,6 +176,28 @@ export function GlyphReferencePanel({ className }: { className?: string }) {
         title={t('panel.global')}
         open={globalOpen}
         onToggle={() => setGlobalOpen(!globalOpen)}
+        action={
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <button
+                  type="button"
+                  aria-label={t('panel.addGlobal')}
+                  onClick={() => {
+                    setGlobalOpen(true)
+                    setCreateGlobalOpen(true)
+                  }}
+                  className="shrink-0 rounded-md p-1 text-primary hover:bg-primary/10"
+                />
+              }
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {t('panel.addGlobal')}
+            </TooltipContent>
+          </Tooltip>
+        }
       >
         {globalGlyphs.length > 0 ? (
           globalGlyphs.map((g) => (
@@ -187,14 +210,7 @@ export function GlyphReferencePanel({ className }: { className?: string }) {
           ))
         ) : (
           <div className="px-3 pb-2 text-sm text-muted-foreground">
-            {t('panel.noGlobal')}{' '}
-            <button
-              type="button"
-              onClick={() => setCreateGlobalOpen(true)}
-              className="text-primary hover:underline"
-            >
-              {t('panel.createOne')}
-            </button>
+            {t('panel.noGlobal')}
           </div>
         )}
       </GlyphSection>
@@ -321,18 +337,18 @@ function HelperRow({
             type="button"
             onClick={() => onCopy(fn)}
             className={cn(
-              'group flex w-full items-center gap-2 rounded px-3 py-1 text-left text-sm',
+              'group flex w-full items-center gap-2 rounded-md px-3 py-1 text-left text-sm',
               'transition-colors hover:bg-muted/80',
             )}
           />
         }
       >
-        <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+        <code className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs">
           {snippet}
         </code>
         <span
           className={cn(
-            'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+            'shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase',
             fn.kind === 'filter'
               ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400'
               : 'bg-purple-500/10 text-purple-600 dark:text-purple-400',
@@ -362,27 +378,33 @@ function GlyphSection({
   title,
   open,
   onToggle,
+  action,
   children,
 }: {
   title: string
   open: boolean
   onToggle: () => void
+  /** Right-aligned slot on the header row (typically a `+` add button). */
+  action?: React.ReactNode
   children: React.ReactNode
 }) {
   return (
     <div className="border-t border-border/50">
-      <button
-        type="button"
-        onClick={onToggle}
-        className="flex w-full items-center gap-1.5 px-3 py-2 text-sm font-medium text-muted-foreground hover:text-foreground"
-      >
-        {open ? (
-          <ChevronDown className="h-3.5 w-3.5" />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5" />
-        )}
-        {title}
-      </button>
+      <div className="flex w-full items-center gap-1.5 px-3 py-2 text-sm font-medium text-muted-foreground">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex flex-1 items-center gap-1.5 text-left hover:text-foreground"
+        >
+          {open ? (
+            <ChevronDown className="h-3.5 w-3.5" />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5" />
+          )}
+          {title}
+        </button>
+        {action}
+      </div>
       {open && <div className="space-y-0.5 pb-2">{children}</div>}
     </div>
   )
@@ -406,6 +428,7 @@ function LocalGlyphSection({
   exampleLabel: string
 }) {
   const { t } = useTranslation('glyphs')
+  const reservedReasonFor = useReservedGlyphReason()
   const setLocalGlyph = useFableBuilderStore((state) => state.setLocalGlyph)
   const removeLocalGlyph = useFableBuilderStore(
     (state) => state.removeLocalGlyph,
@@ -437,7 +460,13 @@ function LocalGlyphSection({
   const trimmedNewKey = newKey.trim()
   // Only flag the user once they've started typing — empty input shouldn't
   // light up red the moment the row appears.
-  const newKeyInvalid = trimmedNewKey !== '' && !isValidGlyphKey(trimmedNewKey)
+  const newKeyReserved =
+    trimmedNewKey !== '' && isValidGlyphKey(trimmedNewKey)
+      ? reservedReasonFor(trimmedNewKey)
+      : null
+  const newKeyInvalid =
+    (trimmedNewKey !== '' && !isValidGlyphKey(trimmedNewKey)) ||
+    newKeyReserved !== null
 
   function handleAdd() {
     const key = newKey.trim()
@@ -445,6 +474,15 @@ function LocalGlyphSection({
     if (!key || !value) return
     if (!isValidGlyphKey(key)) {
       showToast.error(t('panel.localKeyInvalid'))
+      return
+    }
+    const reserved = reservedReasonFor(key)
+    if (reserved) {
+      showToast.error(
+        reserved === 'intrinsic'
+          ? t('form.keyReservedIntrinsic')
+          : t('form.keyReservedJinja'),
+      )
       return
     }
     setLocalGlyph(key, value)
@@ -461,11 +499,11 @@ function LocalGlyphSection({
 
   return (
     <div className="border-t border-border/50">
-      <div className="flex w-full items-center gap-1.5 px-3 py-2">
+      <div className="flex w-full items-center gap-1.5 px-3 py-2 text-sm font-medium text-muted-foreground">
         <button
           type="button"
           onClick={onToggle}
-          className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground"
+          className="flex items-center gap-1.5 hover:text-foreground"
         >
           {open ? (
             <ChevronDown className="h-3.5 w-3.5" />
@@ -489,6 +527,24 @@ function LocalGlyphSection({
             {tooltip}
           </TooltipContent>
         </Tooltip>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                aria-label={t('panel.addLocal')}
+                onClick={() => {
+                  if (!open) onToggle()
+                  setIsAdding(true)
+                }}
+                className="ml-auto shrink-0 rounded-md p-1 text-primary hover:bg-primary/10"
+              />
+            }
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </TooltipTrigger>
+          <TooltipContent side="bottom">{t('panel.addLocal')}</TooltipContent>
+        </Tooltip>
       </div>
       {open && (
         <div className="space-y-0.5 pb-2">
@@ -499,7 +555,7 @@ function LocalGlyphSection({
                     key={g.name}
                     className="flex items-center gap-1.5 px-3 py-1"
                   >
-                    <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-sm">
+                    <code className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 font-mono text-sm">
                       {'${' + g.name + '}'}
                     </code>
                     <input
@@ -510,7 +566,7 @@ function LocalGlyphSection({
                         if (e.key === 'Enter') handleSaveEdit()
                         if (e.key === 'Escape') handleCancelEdit()
                       }}
-                      className="min-w-0 flex-1 rounded border border-border bg-background px-1.5 py-0.5 text-sm focus:ring-1 focus:ring-ring focus:outline-none"
+                      className="min-w-0 flex-1 rounded-md border border-border bg-background px-1.5 py-0.5 text-sm focus:ring-1 focus:ring-ring focus:outline-none"
                       autoFocus
                     />
                     <button
@@ -555,7 +611,7 @@ function LocalGlyphSection({
                   placeholder={t('panel.localKeyPlaceholder')}
                   aria-invalid={newKeyInvalid || undefined}
                   className={cn(
-                    'w-20 shrink-0 rounded border bg-background px-1.5 py-0.5 font-mono text-sm focus:ring-1 focus:outline-none',
+                    'w-20 shrink-0 rounded-md border bg-background px-1.5 py-0.5 font-mono text-sm focus:ring-1 focus:outline-none',
                     newKeyInvalid
                       ? 'border-destructive focus:ring-destructive'
                       : 'border-border focus:ring-ring',
@@ -571,7 +627,7 @@ function LocalGlyphSection({
                   value={newValue}
                   onChange={(e) => setNewValue(e.target.value)}
                   placeholder={t('panel.localValuePlaceholder')}
-                  className="min-w-0 flex-1 rounded border border-border bg-background px-1.5 py-0.5 text-sm focus:ring-1 focus:ring-ring focus:outline-none"
+                  className="min-w-0 flex-1 rounded-md border border-border bg-background px-1.5 py-0.5 text-sm focus:ring-1 focus:ring-ring focus:outline-none"
                   onKeyDown={(e) => {
                     if (e.key === 'Enter') handleAdd()
                     if (e.key === 'Escape') handleCancelAdd()
@@ -594,21 +650,12 @@ function LocalGlyphSection({
                 </button>
               </div>
               {newKeyInvalid ? (
-                <P className="mt-1 text-xs text-destructive">
+                <P className="mt-1 text-xs text-danger">
                   {t('panel.localKeyInvalid')}
                 </P>
               ) : null}
             </div>
-          ) : (
-            <button
-              type="button"
-              onClick={() => setIsAdding(true)}
-              className="flex w-full items-center gap-1.5 px-3 py-1 text-sm text-muted-foreground hover:text-foreground"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              {t('panel.addLocal')}
-            </button>
-          )}
+          ) : null}
         </div>
       )}
     </div>
@@ -634,7 +681,7 @@ function LocalGlyphRow({
         render={
           <div
             className={cn(
-              'group flex w-full items-center gap-2 rounded px-3 py-1 text-left text-sm',
+              'group flex w-full items-center gap-2 rounded-md px-3 py-1 text-left text-sm',
               'transition-colors hover:bg-muted/80',
             )}
           />
@@ -645,7 +692,7 @@ function LocalGlyphRow({
           onClick={() => onCopy(glyph.name)}
           className="flex min-w-0 flex-1 items-center gap-2"
         >
-          <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-sm">
+          <code className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 font-mono text-sm">
             {'${' + glyph.name + '}'}
           </code>
           <P className="min-w-0 truncate text-sm text-muted-foreground">
@@ -663,7 +710,7 @@ function LocalGlyphRow({
           <button
             type="button"
             onClick={onDelete}
-            className="hover:text-destructive"
+            className="hover:text-danger"
           >
             <Trash2 className="h-3 w-3" />
           </button>
@@ -705,13 +752,13 @@ function GlyphRow({
             type="button"
             onClick={() => onCopy(glyph.name)}
             className={cn(
-              'group flex w-full items-center gap-2 rounded px-3 py-1 text-left text-sm',
+              'group flex w-full items-center gap-2 rounded-md px-3 py-1 text-left text-sm',
               'transition-colors hover:bg-muted/80',
             )}
           />
         }
       >
-        <code className="shrink-0 rounded bg-muted px-1.5 py-0.5 font-mono text-sm">
+        <code className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 font-mono text-sm">
           {'${' + glyph.name + '}'}
         </code>
         <P className="min-w-0 truncate text-sm text-muted-foreground">

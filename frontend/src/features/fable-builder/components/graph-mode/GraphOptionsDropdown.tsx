@@ -8,18 +8,9 @@
  * does it submit to any jurisdiction.
  */
 
-import {
-  Lock,
-  LockOpen,
-  Map,
-  MoreHorizontal,
-  Sparkles,
-  Workflow,
-} from 'lucide-react'
-import type {
-  EdgeStyle,
-  LayoutDirection,
-} from '@/features/fable-builder/stores/fableBuilderStore'
+import { ChevronDown, Eye, Lock, LockOpen, Map, Sparkles } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import type { LayoutDirection } from '@/features/fable-builder/stores/fableBuilderStore'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
 import { Button } from '@/components/ui/button'
 import {
@@ -39,115 +30,70 @@ import {
 } from '@/components/ui/dropdown-menu'
 
 export function GraphOptionsDropdown() {
-  const edgeStyle = useFableBuilderStore((s) => s.edgeStyle)
-  const autoLayout = useFableBuilderStore((s) => s.autoLayout)
+  const { t } = useTranslation('configure')
   const layoutDirection = useFableBuilderStore((s) => s.layoutDirection)
   const nodesLocked = useFableBuilderStore((s) => s.nodesLocked)
   const isMiniMapOpen = useFableBuilderStore((s) => s.isMiniMapOpen)
-
-  const setEdgeStyle = useFableBuilderStore((s) => s.setEdgeStyle)
-  const setAutoLayout = useFableBuilderStore((s) => s.setAutoLayout)
   const setLayoutDirection = useFableBuilderStore((s) => s.setLayoutDirection)
   const setNodesLocked = useFableBuilderStore((s) => s.setNodesLocked)
   const toggleMiniMap = useFableBuilderStore((s) => s.toggleMiniMap)
+  const triggerLayout = useFableBuilderStore((s) => s.triggerLayout)
   const triggerFitView = useFableBuilderStore((s) => s.triggerFitView)
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        render={
-          <Button
-            variant="default"
-            size="sm"
-            className="h-8 w-8 p-0 shadow-sm"
-            aria-label="Graph options"
-          />
-        }
+        render={<Button variant="outline" size="sm" className="h-8 gap-1.5" />}
       >
-        <MoreHorizontal className="h-4 w-4" />
+        <Eye className="h-4 w-4" />
+        {t('graphOptions.view')}
+        <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-48">
         <DropdownMenuGroup>
-          <DropdownMenuLabel>View</DropdownMenuLabel>
           <DropdownMenuItem
             onClick={() => {
-              // Force layout recalculation by enabling auto-layout if needed
-              if (!autoLayout) {
-                setAutoLayout(true)
-              }
-              // Trigger fit view with a slight delay to allow layout to recalculate
+              triggerLayout()
+              // Fit after the layout pass has committed.
               setTimeout(triggerFitView, 50)
             }}
           >
             <Sparkles />
-            Tidy up configuration
+            {t('graphOptions.tidyUp')}
           </DropdownMenuItem>
           <DropdownMenuItem onClick={() => setNodesLocked(!nodesLocked)}>
             {nodesLocked ? <Lock /> : <LockOpen />}
-            {nodesLocked ? 'Unlock nodes' : 'Lock nodes'}
+            {nodesLocked
+              ? t('graphOptions.unlockNodes')
+              : t('graphOptions.lockNodes')}
           </DropdownMenuItem>
           <DropdownMenuCheckboxItem
             checked={isMiniMapOpen}
             onCheckedChange={toggleMiniMap}
           >
             <Map />
-            Show minimap
+            {t('graphOptions.showMinimap')}
           </DropdownMenuCheckboxItem>
         </DropdownMenuGroup>
-
         <DropdownMenuSeparator />
-
         <DropdownMenuGroup>
-          <DropdownMenuLabel>Layout</DropdownMenuLabel>
-          <DropdownMenuCheckboxItem
-            checked={autoLayout}
-            onCheckedChange={setAutoLayout}
-          >
-            <Workflow />
-            Auto-layout
-          </DropdownMenuCheckboxItem>
-
-          {autoLayout && (
-            <DropdownMenuSub>
-              <DropdownMenuSubTrigger>Direction</DropdownMenuSubTrigger>
-              <DropdownMenuSubContent>
-                <DropdownMenuRadioGroup
-                  value={layoutDirection}
-                  onValueChange={(value) =>
-                    setLayoutDirection(value as LayoutDirection)
-                  }
-                >
-                  <DropdownMenuRadioItem value="TB">
-                    ↓ Top to Bottom
-                  </DropdownMenuRadioItem>
-                  <DropdownMenuRadioItem value="LR">
-                    → Left to Right
-                  </DropdownMenuRadioItem>
-                </DropdownMenuRadioGroup>
-              </DropdownMenuSubContent>
-            </DropdownMenuSub>
-          )}
-        </DropdownMenuGroup>
-
-        <DropdownMenuSeparator />
-
-        <DropdownMenuGroup>
-          <DropdownMenuLabel>Edges</DropdownMenuLabel>
+          <DropdownMenuLabel>{t('graphOptions.layout')}</DropdownMenuLabel>
           <DropdownMenuSub>
-            <DropdownMenuSubTrigger>Style</DropdownMenuSubTrigger>
+            <DropdownMenuSubTrigger>
+              {t('graphOptions.direction')}
+            </DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
               <DropdownMenuRadioGroup
-                value={edgeStyle}
-                onValueChange={(value) => setEdgeStyle(value as EdgeStyle)}
+                value={layoutDirection}
+                onValueChange={(value) =>
+                  setLayoutDirection(value as LayoutDirection)
+                }
               >
-                <DropdownMenuRadioItem value="bezier">
-                  Curved
+                <DropdownMenuRadioItem value="TB">
+                  {t('graphOptions.topToBottom')}
                 </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="smoothstep">
-                  Rounded
-                </DropdownMenuRadioItem>
-                <DropdownMenuRadioItem value="step">
-                  Orthogonal
+                <DropdownMenuRadioItem value="LR">
+                  {t('graphOptions.leftToRight')}
                 </DropdownMenuRadioItem>
               </DropdownMenuRadioGroup>
             </DropdownMenuSubContent>

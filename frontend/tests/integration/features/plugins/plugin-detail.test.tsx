@@ -48,6 +48,7 @@ const mockPlugin: PluginInfo = {
   hasUpdate: false,
   updatedAt: null,
   errorDetail: null,
+  errorSeverity: null,
   comment: null,
   pipSource: null,
   moduleName: null,
@@ -55,7 +56,7 @@ const mockPlugin: PluginInfo = {
 
 describe('Plugin Detail Page', () => {
   describe('Plugin Header', () => {
-    it('renders plugin name, author, and version', async () => {
+    it('renders plugin name and author, with the version as a labelled value', async () => {
       const screen = await renderWithRouter(
         <PluginDetailPage plugin={mockPlugin} catalogue={mockCatalogue} />,
       )
@@ -63,16 +64,74 @@ describe('Plugin Detail Page', () => {
       await expect
         .element(screen.getByRole('heading', { name: 'ECMWF Plugin' }))
         .toBeVisible()
-      // Author and version are combined in a single text element
-      await expect.element(screen.getByText('ECMWF · v0.0.1')).toBeVisible()
+      await expect
+        .element(screen.getByText('ECMWF', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText('Version', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText('v0.0.1', { exact: true }))
+        .toBeVisible()
     })
 
-    it('renders plugin status badge', async () => {
+    it('shows the version an update brings', async () => {
+      const outdated: PluginInfo = {
+        ...mockPlugin,
+        latestVersion: '0.0.2',
+        hasUpdate: true,
+      }
+      const screen = await renderWithRouter(
+        <PluginDetailPage plugin={outdated} catalogue={mockCatalogue} />,
+      )
+
+      await expect.element(screen.getByText('→ v0.0.2')).toBeVisible()
+    })
+
+    it('renders the status as plain text', async () => {
       const screen = await renderWithRouter(
         <PluginDetailPage plugin={mockPlugin} catalogue={mockCatalogue} />,
       )
 
+      await expect
+        .element(screen.getByText('Status', { exact: true }))
+        .toBeVisible()
       await expect.element(screen.getByText('Loaded')).toBeVisible()
+    })
+
+    it('keeps the diagnostics out of the status hover', async () => {
+      const warned: PluginInfo = {
+        ...mockPlugin,
+        errorDetail: [
+          {
+            source: 'load',
+            detail: "version mismatch: DB has '0.0.0'",
+            severity: 'warning',
+          },
+        ],
+        errorSeverity: 'warning',
+      }
+      const screen = await renderWithRouter(
+        <PluginDetailPage plugin={warned} catalogue={mockCatalogue} />,
+      )
+
+      const status = screen.getByText('Warning', { exact: true })
+      await expect.element(status).toBeVisible()
+      // No tooltip to open: the box below lists the diagnostic.
+      expect(
+        status.element().closest('[data-slot="tooltip-trigger"]'),
+      ).toBeNull()
+      await expect.element(screen.getByText(/version mismatch/)).toBeVisible()
+    })
+
+    it('shows a Disabled badge for a loaded-but-disabled plugin', async () => {
+      // Loaded-but-disabled: surface "Disabled", not the misleading "Loaded".
+      const disabled: PluginInfo = { ...mockPlugin, isEnabled: false }
+      const screen = await renderWithRouter(
+        <PluginDetailPage plugin={disabled} catalogue={mockCatalogue} />,
+      )
+
+      await expect.element(screen.getByText('Disabled')).toBeVisible()
     })
   })
 
@@ -115,11 +174,13 @@ describe('Plugin Detail Page', () => {
         <PluginDetailPage plugin={mockPlugin} catalogue={mockCatalogue} />,
       )
 
-      // ecmwf/ecmwf-base has 4 factories — use heading role to avoid
+      // Use heading role to avoid
       // matching descriptions that contain similar text (vitest browser
       // mode uses case-insensitive getByText)
       await expect
-        .element(screen.getByRole('heading', { name: 'Earthkit Data Source' }))
+        .element(
+          screen.getByRole('heading', { name: 'Operational forecast source' }),
+        )
         .toBeInTheDocument()
       await expect
         .element(screen.getByRole('heading', { name: 'Ensemble Statistics' }))
@@ -139,12 +200,14 @@ describe('Plugin Detail Page', () => {
 
       // Wait for blocks to render
       await expect
-        .element(screen.getByRole('heading', { name: 'Earthkit Data Source' }))
+        .element(
+          screen.getByRole('heading', { name: 'Operational forecast source' }),
+        )
         .toBeInTheDocument()
 
       // The source block button should be enabled
       const sourceButton = screen.getByRole('button', {
-        name: /Use Source in Configuration/i,
+        name: /Use Source in a Workflow/i,
       })
       await expect.element(sourceButton).toBeInTheDocument()
       await expect.element(sourceButton).not.toBeDisabled()
@@ -162,7 +225,7 @@ describe('Plugin Detail Page', () => {
 
       // Product block buttons should be disabled (2 product factories)
       const productButtons = screen.getByRole('button', {
-        name: /Use Product in Configuration/i,
+        name: /Use Product in a Workflow/i,
       })
       await expect.element(productButtons.first()).toBeDisabled()
       await expect.element(productButtons.nth(1)).toBeDisabled()
@@ -180,27 +243,25 @@ describe('Plugin Detail Page', () => {
 
       // Hover over a disabled product button's tooltip trigger
       const productButtons = screen.getByRole('button', {
-        name: /Use Product in Configuration/i,
+        name: /Use Product in a Workflow/i,
       })
       await productButtons.first().hover()
 
       // Tooltip text should appear
       await expect
-        .element(
-          screen.getByText('Configurations must start with a source block'),
-        )
+        .element(screen.getByText('Workflows must start with a source block'))
         .toBeVisible()
     })
   })
 
-  describe('Back to Plugins Button', () => {
+  describe('Back to plugins Button', () => {
     it('renders Back to Plugins button', async () => {
       const screen = await renderWithRouter(
         <PluginDetailPage plugin={mockPlugin} catalogue={mockCatalogue} />,
       )
 
       await expect
-        .element(screen.getByRole('button', { name: /Back to Plugins/i }))
+        .element(screen.getByRole('button', { name: /Back to plugins/i }))
         .toBeVisible()
     })
   })

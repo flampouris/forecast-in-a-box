@@ -13,7 +13,9 @@
 * there is pre-commit configured. Ideally do `uv run prek` before every commit. The `prek` itself is declared as a `dev` dependency in the `backend`s venv managed by `uv`
 
 # General
-* do not use fancy unicode or emoji characters when creating text/markdown files
+* do not use fancy unicode or emoji characters when writing text/markdown files, commit messages, comments, or docstring
+* keep docstrings to a plain statement of current behaviour/contract; avoid trailing "so that" / "instead of" / "rather than" / "as before" explanatory clauses that explain why the behaviour matters to callers or contrast it with some other (hypothetical or historical) behaviour
+* do not use double space after `.` when writing comments and doc strings
 * when asked to fetch PR review comments, use the GitHub GraphQL API to fetch only **unresolved** threads:
   ```bash
   gh api graphql -f query='
@@ -33,6 +35,10 @@
   }' | jq -r '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | "File: \(.comments.nodes[0].path)\nLine: \(.comments.nodes[0].line // .comments.nodes[0].originalLine)\nComment: \(.comments.nodes[0].body)\n---"'
   ```
   This provides the actual inline review comments which `gh pr view` doesn't show properly, and filters out resolved threads
+
+# CI/CD
+* GitHub Actions workflows live in `.github/workflows/`
+* Reusable shell helpers consumed by the workflows are in `scripts/cicd/`; see `scripts/cicd/README.md` for how to extend them
 
 # Backend
 * for development related to backend or backend/packages, consult `backend/development.md`

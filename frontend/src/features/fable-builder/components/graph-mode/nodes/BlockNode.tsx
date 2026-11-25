@@ -8,21 +8,20 @@
  * does it submit to any jurisdiction.
  */
 
-import { memo, useMemo, useState } from 'react'
+import { memo, useRef } from 'react'
 import { Handle, Position } from '@xyflow/react'
-import {
-  Bookmark,
-  Copy,
-  CopyPlus,
-  MoreHorizontal,
-  Settings,
-  Trash2,
-} from 'lucide-react'
+import { Plus, Settings, Trash2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 
 import type { Node, NodeProps } from '@xyflow/react'
 import type { FableNodeData } from '@/features/fable-builder/utils/fable-to-graph'
+import type {
+  BlockConfigurationOption,
+  BlockValidationState,
+} from '@/api/types/fable.types'
 import { AddNodeButton } from '@/features/fable-builder/components/graph-mode/AddNodeButton'
 import { useNodeDimensions } from '@/features/fable-builder/hooks/useNodeDimensions'
+import { useConfigValueLabels } from '@/features/fable-builder/hooks/useConfigValueLabels'
 import {
   useBlockValidation,
   useFableBuilderStore,
@@ -42,13 +41,15 @@ import {
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover'
+  BlockActionMenu,
+  BlockContextMenu,
+} from '@/features/fable-builder/components/shared/BlockActionMenu'
 import { BlockErrorOverlay } from '@/features/fable-builder/components/graph-mode/nodes/BlockErrorOverlay'
-import { parseGlyphSegments } from '@/features/fable-builder/utils/glyph-display'
+import { TOUR, tourAttr } from '@/features/tutorials/anchors'
 import { cn } from '@/lib/utils'
+import { BlockName } from '@/features/fable-builder/components/shared/BlockName'
+import { BlockValueChips } from '@/features/fable-builder/components/graph-mode/nodes/BlockValueChips'
+import { blockValueEntries } from '@/features/fable-builder/utils/block-values'
 
 export type FableNode = Node<FableNodeData>
 
@@ -67,23 +68,19 @@ export const BlockNode = memo(function ({
   data,
   selected,
 }: NodeProps<FableNode>) {
-  const { factory, instance, catalogue } = data
+  const { t } = useTranslation('configure')
+  const { factory, instance, catalogue, label } = data
   const metadata = BLOCK_KIND_METADATA[factory.kind]
   const IconComponent = getBlockKindIcon(factory.kind)
 
   const containerRef = useNodeDimensions(id)
-  const [menuOpen, setMenuOpen] = useState(false)
 
-  const selectedBlockId = useFableBuilderStore((state) => state.selectedBlockId)
   const selectBlock = useFableBuilderStore((state) => state.selectBlock)
   const validationState = useFableBuilderStore((state) => state.validationState)
   const layoutDirection = useFableBuilderStore((state) => state.layoutDirection)
+  const draggedFactory = useFableBuilderStore((state) => state.draggedFactory)
   const removeBlockCascade = useFableBuilderStore(
     (state) => state.removeBlockCascade,
-  )
-  const duplicateBlock = useFableBuilderStore((state) => state.duplicateBlock)
-  const duplicateBlockWithChildren = useFableBuilderStore(
-    (state) => state.duplicateBlockWithChildren,
   )
   const openMobileConfig = useFableBuilderStore(
     (state) => state.openMobileConfig,
@@ -94,20 +91,20 @@ export const BlockNode = memo(function ({
   const outputPosition = OUTPUT_POSITIONS[layoutDirection]
   const isHorizontalLayout = layoutDirection === 'LR'
 
-  const fable = useFableBuilderStore((state) => state.fable)
+  // Handles a dragged palette block can connect to — highlighted during a drag.
+  const inputHandleDroppable =
+    draggedFactory !== null && draggedFactory.factory.kind !== 'sink'
+  const outputHandleDroppable =
+    draggedFactory !== null && draggedFactory.factory.inputs.length > 0
 
-  const isSelected = selected || selectedBlockId === id
+  // React Flow drives selection via the `selected` prop, so the node never
+  // subscribes to `selectedBlockId` — that would re-render every node on any
+  // selection change.
+  const isSelected = selected
   const hasErrors = blockValidation?.hasErrors ?? false
   const errors = blockValidation?.errors ?? []
   const possibleExpansions =
     validationState?.blockStates[id]?.possibleExpansions ?? []
-  const hasDownstream = useMemo(
-    () =>
-      Object.values(fable.blocks).some((block) =>
-        Object.values(block.input_ids).includes(id),
-      ),
-    [fable.blocks, id],
-  )
 
   function handleClick(): void {
     selectBlock(id)
@@ -117,271 +114,226 @@ export const BlockNode = memo(function ({
     removeBlockCascade(id)
   }
 
-  function handleDuplicate(): void {
-    duplicateBlock(id)
-    setMenuOpen(false)
-  }
-
-  function handleDuplicateWithChildren(): void {
-    duplicateBlockWithChildren(id)
-    setMenuOpen(false)
-  }
-
-  function handleSaveAsPreset(): void {
-    alert(
-      'Coming soon: Saving configurations as presets will be available soon.',
-    )
-    setMenuOpen(false)
-  }
-
   function handleOpenConfig(e: React.MouseEvent): void {
     e.stopPropagation()
     openMobileConfig(id)
   }
 
-  const configSummary = Object.entries(instance.configuration_values)
-    .filter(([, value]) => value)
-    .slice(0, 3)
+  const valueEntries = blockValueEntries(
+    instance.configuration_values,
+    factory.configuration_options,
+  )
 
-  const configValueCount = Object.keys(instance.configuration_values).length
-  const remainingConfigCount = configValueCount - 3
+  // Last-known restrictions; validationState is null mid-edit.
+  const restrictionsRef = useRef<Record<string, string>>({})
+  if (validationState) {
+    // The keys may be absent at runtime; casts surface undefined.
+    const blockState = validationState.blockStates[id] as
+      BlockValidationState | undefined
+    restrictionsRef.current = blockState?.configurationRestrictions ?? {}
+  }
+  const valueLabels = useConfigValueLabels(
+    Object.fromEntries(valueEntries.map(({ key, value }) => [key, value])),
+    Object.fromEntries(
+      valueEntries.map(({ key }) => [
+        key,
+        (restrictionsRef.current[key] as string | undefined) ??
+          (
+            factory.configuration_options[key] as
+              BlockConfigurationOption | undefined
+          )?.value_type,
+      ]),
+    ),
+  )
 
   return (
-    <div
-      ref={containerRef}
-      role="button"
-      tabIndex={0}
-      onClick={handleClick}
-      onKeyDown={(e) => e.key === 'Enter' && handleClick()}
-      className={cn(
-        'relative w-70 rounded-2xl border bg-card shadow-sm',
-        'cursor-pointer transition-all duration-200',
-        // Hover: subtle border hint (distinct from full selection)
-        !isSelected &&
-          !hasErrors &&
-          'hover:shadow-md hover:ring-1 hover:ring-primary/20',
-        // Selected: prominent blue ring + lifted scale
-        isSelected &&
-          'scale-[1.02] shadow-[0_0_0_2.5px_rgba(18,69,222,1),0_20px_40px_-5px_rgba(18,69,222,0.2)]',
-        // Error (unselected): red ring
-        hasErrors &&
-          !isSelected &&
-          'shadow-[0_0_0_2px_rgba(220,38,38,1),0_15px_35px_-5px_rgba(220,38,38,0.15)]',
-      )}
-    >
+    <BlockContextMenu instanceId={id} catalogue={catalogue}>
       <div
+        ref={containerRef}
+        role="button"
+        tabIndex={0}
+        onClick={handleClick}
+        onKeyDown={(e) => e.key === 'Enter' && handleClick()}
+        data-block-kind={factory.kind}
+        {...tourAttr(TOUR.configure.block)}
         className={cn(
-          'h-1.5 w-full rounded-t-2xl opacity-80',
-          metadata.topBarColor,
+          'relative w-70 rounded-2xl border bg-card shadow-sm',
+          'cursor-pointer transition-all duration-200',
+          // Hover: subtle border hint (distinct from full selection)
+          !isSelected &&
+            !hasErrors &&
+            'hover:shadow-md hover:ring-1 hover:ring-primary/20',
+          // Selected: blue ring only — a scale would shift handles, kinking edges.
+          isSelected &&
+            'shadow-[0_0_0_2.5px_rgba(18,69,222,1),0_20px_40px_-5px_rgba(18,69,222,0.2)]',
+          // Error (unselected): red ring
+          hasErrors &&
+            !isSelected &&
+            'shadow-[0_0_0_2px_rgba(220,38,38,1),0_15px_35px_-5px_rgba(220,38,38,0.15)]',
         )}
-      />
-
-      <div className="p-5">
-        <div className="mb-3 flex items-start justify-between">
-          <div className="flex items-center gap-2">
-            <IconComponent className={cn('h-5 w-5', metadata.color)} />
-            <span className="text-sm font-semibold tracking-wider text-muted-foreground uppercase">
-              {metadata.label}
-            </span>
-          </div>
-          <div className="flex items-center gap-1">
-            {/* Settings button - mobile only */}
-            <Button
-              variant="ghost"
-              size="icon"
-              className="nodrag h-7 w-7 text-muted-foreground hover:text-primary md:hidden"
-              onClick={handleOpenConfig}
-              aria-label="Configure block"
-            >
-              <Settings className="h-4 w-4" />
-            </Button>
-
-            <AlertDialog>
-              <AlertDialogTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="nodrag h-7 w-7 text-muted-foreground hover:text-destructive"
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                }
-              >
-                <Trash2 className="h-4 w-4" />
-              </AlertDialogTrigger>
-              <AlertDialogContent onClick={(e) => e.stopPropagation()}>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete Block</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    Are you sure you want to delete "{factory.title}" and all
-                    connected downstream blocks? This action cannot be undone.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction onClick={handleDelete}>
-                    Delete
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-
-            <Popover open={menuOpen} onOpenChange={setMenuOpen}>
-              <PopoverTrigger
-                render={
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="nodrag h-7 w-7 text-muted-foreground hover:text-foreground"
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                }
-              >
-                <MoreHorizontal className="h-4 w-4" />
-              </PopoverTrigger>
-              <PopoverContent
-                className="w-48 p-1"
-                align="end"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <button
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-accent"
-                  onClick={handleDuplicate}
-                >
-                  <Copy className="h-4 w-4" />
-                  Duplicate
-                </button>
-                <button
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-accent"
-                  onClick={handleDuplicateWithChildren}
-                >
-                  <CopyPlus className="h-4 w-4" />
-                  Duplicate with children
-                </button>
-                <button
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-accent"
-                  onClick={handleSaveAsPreset}
-                >
-                  <Bookmark className="h-4 w-4" />
-                  Save config as preset
-                </button>
-              </PopoverContent>
-            </Popover>
-          </div>
+      >
+        {/* Overlay clips the bar to the card radius — a 6px bar can't render it itself. */}
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]"
+        >
+          <div
+            className={cn('h-1.5 w-full opacity-80', metadata.topBarColor)}
+          />
         </div>
 
-        <H3 className="mb-1 text-lg font-semibold text-foreground">
-          {factory.title}
-        </H3>
-
-        <P className="mb-4 line-clamp-2 text-muted-foreground">
-          {factory.description}
-        </P>
-
-        {configSummary.length > 0 && (
-          <div className="flex flex-wrap gap-1.5">
-            {configSummary.map(([key, value]) => {
-              const stringValue = String(value)
-              const truncated =
-                stringValue.length > 15
-                  ? `${stringValue.slice(0, 15)}...`
-                  : stringValue
-              const segments = parseGlyphSegments(truncated)
-              const hasGlyphs = segments.some((s) => s.isGlyph)
-              return (
-                <span
-                  key={key}
-                  className={cn(
-                    'rounded-md border px-2 py-0.5 text-xs font-bold',
-                    metadata.bgColor,
-                    metadata.borderColor,
-                    metadata.color,
-                  )}
-                >
-                  {hasGlyphs
-                    ? segments.map((seg, i) =>
-                        seg.isGlyph ? (
-                          <span
-                            key={i}
-                            className="rounded bg-primary/15 px-0.5 font-mono text-primary"
-                          >
-                            {seg.text}
-                          </span>
-                        ) : (
-                          <span key={i}>{seg.text}</span>
-                        ),
-                      )
-                    : truncated}
-                </span>
-              )
-            })}
-            {remainingConfigCount > 0 && (
-              <span className="rounded-md border bg-muted px-2 py-0.5 text-xs font-bold text-muted-foreground">
-                +{remainingConfigCount} more
+        <div className="px-5 pt-6.5 pb-5">
+          <div className="mb-3 flex items-start justify-between">
+            <div className="flex items-center gap-2">
+              <IconComponent className={cn('h-5 w-5', metadata.color)} />
+              <span className="text-sm font-semibold tracking-wider text-muted-foreground uppercase">
+                {metadata.label}
               </span>
-            )}
+            </div>
+            <div className="flex items-center gap-1">
+              {/* Settings button - mobile only */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className="nodrag h-7 w-7 text-muted-foreground hover:text-primary lg:hidden"
+                onClick={handleOpenConfig}
+                aria-label={t('blockNode.configureBlock')}
+              >
+                <Settings className="h-4 w-4" />
+              </Button>
+
+              <AlertDialog>
+                <AlertDialogTrigger
+                  render={
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="nodrag h-7 w-7 text-muted-foreground hover:text-danger"
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  }
+                >
+                  <Trash2 className="h-4 w-4" />
+                </AlertDialogTrigger>
+                <AlertDialogContent onClick={(e) => e.stopPropagation()}>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>
+                      {t('blockNode.deleteBlock')}
+                    </AlertDialogTitle>
+                    <AlertDialogDescription>
+                      {t('blockNode.deleteConfirm', { title: label })}
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>
+                      {t('blockNode.cancel')}
+                    </AlertDialogCancel>
+                    <AlertDialogAction onClick={handleDelete}>
+                      {t('blockNode.delete')}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+
+              <BlockActionMenu
+                instanceId={id}
+                catalogue={catalogue}
+                // nopan: the menu opens on mouse-down, which canvas panning would take.
+                triggerClassName="nodrag nopan h-7 w-7"
+                stopPropagation
+              />
+            </div>
           </div>
-        )}
-      </div>
-      <BlockErrorOverlay errors={errors} />
 
-      {factory.inputs.map((inputName, index) => {
-        const percent = ((index + 1) / (factory.inputs.length + 1)) * 100
+          <H3 className="mb-1 text-lg font-semibold text-foreground">
+            <BlockName name={label} />
+          </H3>
 
-        return (
-          <Handle
-            key={inputName}
-            type="target"
-            position={inputPosition}
-            id={inputName}
-            title={inputName}
-            className={cn(
-              'h-5! w-5! rounded-full! border-4! bg-card!',
-              isHorizontalLayout ? '-left-2.5!' : '-top-2.5!',
-              inputPosition === Position.Right && '-right-2.5! left-auto!',
-              inputPosition === Position.Bottom && 'top-auto! -bottom-2.5!',
-              'border-foreground/30!',
-              'transition-all hover:scale-110',
+          <P className="mb-4 line-clamp-2 text-muted-foreground">
+            {factory.description}
+          </P>
+
+          <BlockValueChips
+            entries={valueEntries}
+            labels={valueLabels}
+            choiceClassName={cn(
+              metadata.bgColor,
+              metadata.borderColor,
+              metadata.color,
             )}
-            style={
-              isHorizontalLayout
-                ? { top: `${percent}%`, transform: 'translateY(-50%)' }
-                : { left: `${percent}%`, transform: 'translateX(-50%)' }
-            }
           />
-        )
-      })}
+        </div>
+        <BlockErrorOverlay errors={errors} />
 
-      {factory.kind !== 'sink' && (
-        <>
-          <Handle
-            type="source"
-            position={outputPosition}
-            id="output"
-            title="Output"
-            className={cn(
-              'h-5! w-5! rounded-full! border-4! bg-card!',
-              'border-foreground/30!',
-              isHorizontalLayout ? '-right-2.5!' : '-bottom-2.5!',
-              outputPosition === Position.Left && 'right-auto! -left-2.5!',
-              outputPosition === Position.Top && '-top-2.5! bottom-auto!',
-              'transition-all hover:scale-110',
-            )}
-            style={
-              isHorizontalLayout
-                ? { top: '50%', transform: 'translateY(-50%)' }
-                : { left: '50%', transform: 'translateX(-50%)' }
-            }
-          />
+        {factory.inputs.map((inputName, index) => {
+          const percent = ((index + 1) / (factory.inputs.length + 1)) * 100
+
+          return (
+            <Handle
+              key={inputName}
+              type="target"
+              position={inputPosition}
+              id={inputName}
+              title={inputName}
+              className={cn(
+                'h-5! w-5! rounded-full! border-4! bg-card!',
+                isHorizontalLayout ? '-left-2.5!' : '-top-2.5!',
+                inputPosition === Position.Right && '-right-2.5! left-auto!',
+                inputPosition === Position.Bottom && 'top-auto! -bottom-2.5!',
+                'border-foreground/30!',
+                'transition-all hover:scale-110',
+                inputHandleDroppable && 'dnd-droppable',
+              )}
+              style={
+                isHorizontalLayout
+                  ? { top: `${percent}%`, transform: 'translateY(-50%)' }
+                  : { left: `${percent}%`, transform: 'translateX(-50%)' }
+              }
+            />
+          )
+        })}
+
+        {factory.kind !== 'sink' && (
           <AddNodeButton
             sourceBlockId={id}
             possibleExpansions={possibleExpansions}
-            hasErrors={hasErrors}
-            hasDownstream={hasDownstream}
             catalogue={catalogue}
-          />
-        </>
-      )}
-    </div>
+          >
+            {/* Output handle doubles as the add-block control: click opens the
+              menu, drag draws a connection. */}
+            <Handle
+              type="source"
+              position={outputPosition}
+              id="output"
+              title={t('blockNode.outputHandle')}
+              onClick={(e) => e.stopPropagation()}
+              data-block-kind={factory.kind}
+              {...tourAttr(TOUR.configure.addDownstream)}
+              className={cn(
+                'flex! h-5! w-5! cursor-pointer! items-center justify-center rounded-full! border-4! bg-card!',
+                'border-foreground/30! hover:border-primary!',
+                isHorizontalLayout ? '-right-2.5!' : '-bottom-2.5!',
+                outputPosition === Position.Left && 'right-auto! -left-2.5!',
+                outputPosition === Position.Top && '-top-2.5! bottom-auto!',
+                'transition-all hover:scale-110',
+                outputHandleDroppable && 'dnd-droppable',
+              )}
+              style={
+                isHorizontalLayout
+                  ? { top: '50%', transform: 'translateY(-50%)' }
+                  : { left: '50%', transform: 'translateX(-50%)' }
+              }
+            >
+              <Plus
+                className={cn(
+                  'h-2.5 w-2.5',
+                  hasErrors ? 'text-danger' : 'text-muted-foreground',
+                )}
+              />
+            </Handle>
+          </AddNodeButton>
+        )}
+      </div>
+    </BlockContextMenu>
   )
 })

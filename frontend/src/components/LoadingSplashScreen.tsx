@@ -21,6 +21,7 @@
  */
 
 import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { H2, P } from '@/components/base/typography'
 
 interface LoadingSplashScreenProps {
@@ -36,6 +37,7 @@ export function LoadingSplashScreen({
   onRetry,
 }: LoadingSplashScreenProps) {
   const [dots, setDots] = useState('')
+  const { t } = useTranslation('common')
 
   // Animate dots for loading message
   useEffect(() => {
@@ -60,7 +62,7 @@ export function LoadingSplashScreen({
         {error && (
           <div className="flex h-16 w-16 items-center justify-center rounded-full bg-destructive/10">
             <svg
-              className="h-8 w-8 text-destructive"
+              className="h-8 w-8 text-danger"
               fill="none"
               viewBox="0 0 24 24"
               stroke="currentColor"
@@ -79,25 +81,22 @@ export function LoadingSplashScreen({
         {!error && (
           <div className="space-y-2">
             <H2 className="text-xl font-semibold">
-              Loading configuration{dots}
+              {t('splash.loading')}
+              {dots}
             </H2>
-            <P className="text-muted-foreground">
-              Please wait while we set up the application
-            </P>
+            <P className="text-muted-foreground">{t('splash.loadingHint')}</P>
           </div>
         )}
 
         {/* Error Message */}
         {error && (
           <div className="max-w-md space-y-4">
-            <H2 className="text-xl font-semibold text-destructive">
-              Configuration Error
+            <H2 className="text-xl font-semibold text-danger">
+              {t('splash.errorTitle')}
             </H2>
-            <P className="text-muted-foreground">
-              Failed to load application configuration:
-            </P>
+            <P className="text-muted-foreground">{t('splash.errorIntro')}</P>
             <div className="rounded-lg bg-destructive/10 p-4">
-              <P className="font-mono text-destructive">{error}</P>
+              <P className="font-mono text-danger">{error}</P>
             </div>
 
             {/* Retry Button */}
@@ -119,13 +118,11 @@ export function LoadingSplashScreen({
                     d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
                   />
                 </svg>
-                Retry
+                {t('retry')}
               </button>
             )}
 
-            <P className="text-muted-foreground">
-              If the problem persists, please contact support.
-            </P>
+            <P className="text-muted-foreground">{t('splash.errorHint')}</P>
           </div>
         )}
       </div>

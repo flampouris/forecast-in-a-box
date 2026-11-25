@@ -8,9 +8,22 @@
 # nor does it submit to any jurisdiction.
 
 import dataclasses
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, TypeVar
 
 _T = TypeVar("_T")
+
+
+def freeze_recursively(value: object) -> object:
+    """Recursively copy common containers into immutable equivalents."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: freeze_recursively(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze_recursively(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(freeze_recursively(item) for item in value)
+    return value
 
 
 def frozendc(cls: type[_T]) -> type[_T]:

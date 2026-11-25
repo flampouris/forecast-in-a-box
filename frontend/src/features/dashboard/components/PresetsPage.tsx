@@ -8,25 +8,37 @@
  * does it submit to any jurisdiction.
  */
 
-import { useMemo, useState } from 'react'
-import {
-  Bookmark,
-  ChevronLeft,
-  ChevronRight,
-  MoreVertical,
-  Pencil,
-  Search,
-  Star,
-  Trash2,
-} from 'lucide-react'
+/** The Workflows page — search and filter saved workflows and templates. */
+
+import { memo, useCallback, useDeferredValue, useMemo, useState } from 'react'
+import { Bookmark, MoreVertical, Pencil, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { Link } from '@tanstack/react-router'
+import { Link, useSearch } from '@tanstack/react-router'
 import { useConfigPresets } from '../hooks/useConfigPresets'
+import {
+  templateConfigureSearch,
+  useTemplatePresets,
+} from '../hooks/useTemplatePresets'
+import { BookmarkToggle } from './BookmarkToggle'
 import type { PresetEntry } from '../hooks/useConfigPresets'
-import { useFableRetrieve, useUpsertFable } from '@/api/hooks/useFable'
+import type { TemplateEntry } from '../hooks/useTemplatePresets'
+import type {
+  FacetKey,
+  FacetToken,
+  ParsedQuery,
+} from '@/features/journal/facets/facet-types'
+import { useFableRetrieve } from '@/api/hooks/useFable'
+import { FableMiniFlow } from '@/features/journal/components/FableMiniFlow'
+import { JournalChip } from '@/features/journal/components/JournalChip'
+import { RunMetadataDialog } from '@/features/journal/components/RunMetadataDialog'
+import { FacetSearchBar } from '@/features/journal/facets/FacetSearchBar'
+import { addToken, parseQuery } from '@/features/journal/facets/parse-query'
+import { applyFacetQuery } from '@/features/journal/facets/apply-facet-query'
+import { EmptyState } from '@/components/common/EmptyState'
+import { ListPageContainer } from '@/components/common/ListPageContainer'
 import { PageHeader } from '@/components/common/PageHeader'
-import { H2, P } from '@/components/base/typography'
-import { Badge } from '@/components/ui/badge'
+import { Pagination } from '@/components/common/Pagination'
+import { H2 } from '@/components/base/typography'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -35,194 +47,142 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import {
-  Popover,
-  PopoverContent,
-  PopoverHeader,
-  PopoverTitle,
-  PopoverTrigger,
-} from '@/components/ui/popover'
+import { Switch } from '@/components/ui/switch'
 import { useUiStore } from '@/stores/uiStore'
+import {
+  templateBookmarkKey,
+  useTemplateBookmarksStore,
+} from '@/stores/templateBookmarksStore'
 import { cn } from '@/lib/utils'
 
-function RenamePopover({
-  blueprintId,
-  currentTitle,
-  currentComments,
-}: {
-  blueprintId: string
-  currentTitle: string
-  currentComments: string
-}) {
-  const { t } = useTranslation('dashboard')
-  const [open, setOpen] = useState(false)
-  const [title, setTitle] = useState(currentTitle)
-  const [comments, setComments] = useState(currentComments)
-  const upsertFable = useUpsertFable()
-  const { data: fableData } = useFableRetrieve(blueprintId)
-
-  function handleOpen(nextOpen: boolean) {
-    if (nextOpen) {
-      setTitle(currentTitle)
-      setComments(currentComments)
-    }
-    setOpen(nextOpen)
-  }
-
-  function handleSave() {
-    const trimmed = title.trim()
-    if (!trimmed || !fableData) return
-    upsertFable.mutate({
-      fable: fableData.builder,
-      fableId: blueprintId,
-      fableVersion: fableData.version,
-      display_name: trimmed,
-      display_description: comments.trim(),
-      tags: fableData.tags,
-    })
-    setOpen(false)
-  }
-
-  return (
-    <Popover open={open} onOpenChange={handleOpen}>
-      <PopoverTrigger
-        render={
-          <button
-            className="text-muted-foreground transition-colors hover:text-primary"
-            aria-label={t('presets.rename')}
-          />
-        }
-      >
-        <Pencil className="h-3.5 w-3.5" />
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-72">
-        <PopoverHeader>
-          <PopoverTitle>{t('presets.renameTitle')}</PopoverTitle>
-          <P className="text-sm text-muted-foreground">
-            {t('presets.renameDescription')}
-          </P>
-        </PopoverHeader>
-
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor={`rename-title-${blueprintId}`}>Title</Label>
-          <Input
-            id={`rename-title-${blueprintId}`}
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') handleSave()
-            }}
-          />
-        </div>
-
-        <div className="flex flex-col gap-1.5">
-          <Label htmlFor={`rename-comments-${blueprintId}`}>Comments</Label>
-          <textarea
-            id={`rename-comments-${blueprintId}`}
-            rows={2}
-            value={comments}
-            onChange={(e) => setComments(e.target.value)}
-            className="w-full min-w-0 rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-xs transition-[color,box-shadow] outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30"
-          />
-        </div>
-
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" size="sm" onClick={() => setOpen(false)}>
-            Cancel
-          </Button>
-          <Button size="sm" onClick={handleSave} disabled={!title.trim()}>
-            Save
-          </Button>
-        </div>
-      </PopoverContent>
-    </Popover>
-  )
-}
-
-function PresetRow({
+/**
+ * One preset row — mirrors the Forecast Journal row layout for consistency.
+ * Memoised so a keystroke in the search box only re-renders changed rows.
+ */
+const PresetRow = memo(function ({
   preset,
   onDelete,
   onToggleFavourite,
+  onAddFacet,
 }: {
   preset: PresetEntry
   onDelete: (blueprintId: string, version: number) => void
   onToggleFavourite: (blueprintId: string) => void
+  /** Clicking a model/output/tag chip adds it to the faceted search. */
+  onAddFacet: (token: FacetToken) => void
 }) {
-  const { t } = useTranslation('dashboard')
+  const { t } = useTranslation(['dashboard', 'journal'])
+  const showFlow = useUiStore((state) => state.journalShowFlow)
+  // Cache-shared with useConfigPresets — a hit, not a new request.
+  const { data: blueprint } = useFableRetrieve(preset.blueprintId)
+  // Forked-from lineage (e.g. the template this preset was created from)
+  const { data: parent } = useFableRetrieve(blueprint?.parent_id ?? null)
+  const [metadataOpen, setMetadataOpen] = useState(false)
 
-  const title = preset.displayName || preset.blueprintId.slice(0, 8)
-  const comments = preset.displayDescription || ''
-  const tags = preset.tags
+  const builder = blueprint?.builder
+  const { modelLabel, outputKinds } = preset
+  const title = preset.displayName || t('journal:item.untitled')
+  const hasChips =
+    modelLabel !== null || outputKinds.length > 0 || preset.tags.length > 0
 
   return (
-    <div className="p-6 transition-colors hover:bg-muted/50">
+    <div className="group/row p-6 transition-colors hover:bg-muted/50">
       <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center">
-        {/* Content */}
-        <div className="grow">
-          <div className="mb-1 flex items-center gap-2">
-            <P className="truncate font-medium">{title}</P>
-            <RenamePopover
-              blueprintId={preset.blueprintId}
-              currentTitle={title}
-              currentComments={comments}
-            />
+        {/* Details */}
+        <div className="min-w-0 grow">
+          <div className="mb-1 flex min-w-0 items-center gap-1.5">
+            <Link
+              to="/configure"
+              search={{ fableId: preset.blueprintId }}
+              className="min-w-0 truncate text-sm font-medium hover:underline"
+            >
+              {title}
+            </Link>
+            {/* Reveal on row hover; always shown where hover is unavailable. */}
+            <button
+              type="button"
+              onClick={() => setMetadataOpen(true)}
+              aria-label={t('journal:item.editMetadata')}
+              className="shrink-0 text-muted-foreground opacity-0 transition-[color,opacity] group-focus-within/row:opacity-100 group-hover/row:opacity-100 hover:text-primary [@media(hover:none)]:opacity-100"
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
           </div>
-          {comments && (
-            <P className="mb-2 line-clamp-1 text-sm text-muted-foreground">
-              {comments}
-            </P>
+          {preset.displayDescription && (
+            <p className="mb-1 truncate text-sm text-muted-foreground">
+              {preset.displayDescription}
+            </p>
           )}
-          <div className="flex flex-wrap items-center gap-3">
-            {tags.length > 0 && (
-              <div className="flex flex-wrap gap-1.5">
-                {tags.map((tag) => (
-                  <Badge key={tag} variant="outline" className="text-xs">
-                    {tag}
-                  </Badge>
-                ))}
-              </div>
-            )}
+          <div className="mb-2 truncate text-sm text-muted-foreground">
+            {t('journal:item.outputs', { count: preset.outputCount })}
+            {parent?.display_name &&
+              ` · ${t('presets.basedOn', { name: parent.display_name })}`}
           </div>
+          {hasChips && (
+            <div className="flex flex-wrap items-center gap-2">
+              {modelLabel && (
+                <JournalChip
+                  label={modelLabel}
+                  variant="facet"
+                  onClick={() =>
+                    onAddFacet({ key: 'model', value: modelLabel })
+                  }
+                />
+              )}
+              {outputKinds.map((kind) => (
+                <JournalChip
+                  key={kind}
+                  label={kind}
+                  variant="facet"
+                  onClick={() => onAddFacet({ key: 'output', value: kind })}
+                />
+              ))}
+              {preset.tags.map((tag) => (
+                <JournalChip
+                  key={tag}
+                  label={tag}
+                  variant="tag"
+                  onClick={() => onAddFacet({ key: 'tag', value: tag })}
+                />
+              ))}
+            </div>
+          )}
         </div>
+
+        {/* Flow preview — aligned with the row actions. */}
+        {showFlow && builder && (
+          <FableMiniFlow
+            builder={builder}
+            className="max-w-[18rem] shrink-0"
+            monochrome
+          />
+        )}
 
         {/* Actions */}
         <div className="mt-2 flex w-full items-center justify-between gap-6 sm:mt-0 sm:w-auto sm:justify-end">
           <Button
             variant="outline"
             size="sm"
-            className="h-7 text-sm"
             render={
               <Link to="/configure" search={{ fableId: preset.blueprintId }} />
             }
             nativeButton={false}
           >
-            {t('presets.load')}
+            {t('dashboard:presets.load')}
           </Button>
 
           <div className="flex items-center gap-2 text-muted-foreground">
-            <button
-              onClick={() => onToggleFavourite(preset.blueprintId)}
-              className={cn(
-                'transition-colors hover:text-yellow-500',
-                preset.isFavourite && 'text-yellow-500',
-              )}
-              aria-label={t('presets.bookmark')}
-            >
-              <Star
-                className={cn(
-                  'h-5 w-5',
-                  preset.isFavourite && 'fill-yellow-500',
-                )}
-              />
-            </button>
+            <BookmarkToggle
+              bookmarked={preset.isFavourite}
+              onToggle={() => onToggleFavourite(preset.blueprintId)}
+            />
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
                   <button
+                    type="button"
                     className="transition-colors hover:text-primary"
-                    aria-label="More options"
+                    aria-label={t('journal:item.moreOptions')}
                   />
                 }
               >
@@ -230,110 +190,294 @@ function PresetRow({
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem
-                  className="text-destructive focus:text-destructive"
+                  className="text-danger focus:text-danger"
                   onClick={() => onDelete(preset.blueprintId, preset.version)}
                 >
                   <Trash2 className="mr-2 h-4 w-4" />
-                  {t('presets.delete')}
+                  {t('dashboard:presets.delete')}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
         </div>
       </div>
+
+      <RunMetadataDialog
+        blueprint={blueprint}
+        open={metadataOpen}
+        onOpenChange={setMetadataOpen}
+      />
     </div>
   )
-}
+})
+
+/**
+ * One plugin-template row — a starting point offered by a plugin. Read-only:
+ * it can be bookmarked and forked into the builder, not edited or deleted.
+ */
+const TemplateRow = memo(function ({
+  template,
+  bookmarked,
+  onToggleBookmark,
+}: {
+  template: TemplateEntry
+  bookmarked: boolean
+  onToggleBookmark: (template: TemplateEntry) => void
+}) {
+  const { t } = useTranslation(['dashboard', 'journal'])
+  const showFlow = useUiStore((state) => state.journalShowFlow)
+  const { data: blueprint } = useFableRetrieve(template.blueprintId)
+
+  const builder = blueprint?.builder
+  const title = template.displayName || t('journal:item.untitled')
+  const useTemplateSearch = templateConfigureSearch(template)
+
+  return (
+    <div className="group/row p-6 transition-colors hover:bg-muted/50">
+      <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center">
+        <div className="min-w-0 grow">
+          <div className="mb-1 flex min-w-0 items-center gap-2">
+            <Link
+              to="/configure"
+              search={useTemplateSearch}
+              className="min-w-0 truncate text-sm font-medium hover:underline"
+            >
+              {title}
+            </Link>
+            <JournalChip label={t('presets.templates.chip')} variant="tag" />
+          </div>
+          {template.displayDescription && (
+            <p className="mb-1 truncate text-sm text-muted-foreground">
+              {template.displayDescription}
+            </p>
+          )}
+          {template.pluginLabel && (
+            <div className="truncate text-sm text-muted-foreground">
+              {t('presets.templates.fromPlugin', {
+                plugin: template.pluginLabel,
+              })}
+            </div>
+          )}
+          {template.tags.length > 0 && (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              {template.tags.map((tag) => (
+                <JournalChip key={tag} label={tag} variant="tag" />
+              ))}
+            </div>
+          )}
+        </div>
+
+        {showFlow && builder && (
+          <FableMiniFlow
+            builder={builder}
+            className="max-w-[18rem] shrink-0"
+            monochrome
+          />
+        )}
+
+        <div className="mt-2 flex w-full items-center justify-end gap-3 sm:mt-0 sm:w-auto">
+          <Button
+            variant="outline"
+            size="sm"
+            render={<Link to="/configure" search={useTemplateSearch} />}
+            nativeButton={false}
+          >
+            {t('presets.templates.use')}
+          </Button>
+          {templateBookmarkKey(template) && (
+            <BookmarkToggle
+              bookmarked={bookmarked}
+              onToggle={() => onToggleBookmark(template)}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  )
+})
 
 const PAGE_SIZE = 10
 
-type PresetFilter = 'all' | 'bookmarked'
+type PresetFilter = 'all' | 'bookmarked' | 'templates'
 
-export function PresetsPage() {
-  const { t } = useTranslation('dashboard')
-  const layoutMode = useUiStore((state) => state.layoutMode)
-  const dashboardVariant = useUiStore((state) => state.dashboardVariant)
-  const panelShadow = useUiStore((state) => state.panelShadow)
+type ListRow =
+  | { kind: 'preset'; preset: PresetEntry }
+  | { kind: 'template'; template: TemplateEntry }
+const PRESET_FILTERS: ReadonlyArray<PresetFilter> = [
+  'all',
+  'bookmarked',
+  'templates',
+]
 
-  const { presets, deletePreset, toggleFavourite } = useConfigPresets()
-  const [searchQuery, setSearchQuery] = useState('')
-  const [filter, setFilter] = useState<PresetFilter>('all')
-  const [page, setPage] = useState(1)
+/** Case-insensitive substring test of a preset against one facet token. */
+function matchesPresetFacet(
+  preset: PresetEntry,
+  key: FacetKey,
+  value: string,
+): boolean {
+  const needle = value.toLowerCase()
+  if (key === 'model') {
+    return (preset.modelLabel ?? '').toLowerCase().includes(needle)
+  }
+  if (key === 'output') {
+    return preset.outputKinds.some((kind) =>
+      kind.toLowerCase().includes(needle),
+    )
+  }
+  return preset.tags.some((tag) => tag.toLowerCase().includes(needle))
+}
 
-  const filteredPresets = useMemo(() => {
-    let result = presets
-
-    if (filter === 'bookmarked') {
-      result = result.filter((p) => p.isFavourite)
-    }
-
-    if (searchQuery) {
-      const query = searchQuery.toLowerCase()
-      result = result.filter(
-        (p) =>
-          (p.displayName ?? '').toLowerCase().includes(query) ||
-          p.blueprintId.toLowerCase().includes(query) ||
-          p.tags.some((tag) => tag.toLowerCase().includes(query)),
-      )
-    }
-
-    return result
-  }, [presets, filter, searchQuery])
-
-  const totalPages = Math.max(1, Math.ceil(filteredPresets.length / PAGE_SIZE))
-  const paginatedPresets = filteredPresets.slice(
-    (page - 1) * PAGE_SIZE,
-    page * PAGE_SIZE,
+/** Apply the All/Bookmarked tab plus a faceted search query to the preset list. */
+function filterPresets(
+  presets: ReadonlyArray<PresetEntry>,
+  filter: PresetFilter,
+  query: ParsedQuery,
+): Array<PresetEntry> {
+  const byTab = presets.filter((preset) =>
+    filter === 'bookmarked' ? preset.isFavourite : true,
   )
 
-  const handleFilterChange = (newFilter: PresetFilter) => {
-    setFilter(newFilter)
+  return applyFacetQuery(byTab, query, {
+    supportedKeys: ['model', 'output', 'tag'],
+    matchFacet: matchesPresetFacet,
+    matchText: (preset, text) =>
+      (preset.displayName ?? '').toLowerCase().includes(text) ||
+      (preset.displayDescription ?? '').toLowerCase().includes(text) ||
+      preset.blueprintId.toLowerCase().includes(text) ||
+      (preset.modelLabel?.toLowerCase().includes(text) ?? false) ||
+      preset.tags.some((tag) => tag.toLowerCase().includes(text)),
+  })
+}
+
+export function PresetsPage() {
+  const { t } = useTranslation(['dashboard', 'journal'])
+  const showFlow = useUiStore((state) => state.journalShowFlow)
+  const setShowFlow = useUiStore((state) => state.setJournalShowFlow)
+
+  const { presets, deletePreset, toggleFavourite } = useConfigPresets()
+  const { templates } = useTemplatePresets()
+  const bookmarkKeys = useTemplateBookmarksStore((state) => state.keys)
+  const toggleTemplateKey = useTemplateBookmarksStore((state) => state.toggle)
+  const isTemplateBookmarked = useCallback(
+    (template: TemplateEntry) => {
+      const key = templateBookmarkKey(template)
+      return key !== null && bookmarkKeys.includes(key)
+    },
+    [bookmarkKeys],
+  )
+  const toggleTemplateBookmark = useCallback(
+    (template: TemplateEntry) => {
+      const key = templateBookmarkKey(template)
+      if (key) toggleTemplateKey(key)
+    },
+    [toggleTemplateKey],
+  )
+  const [query, setQuery] = useState('')
+  // Non-strict: the page also renders outside its route in tests.
+  const search = useSearch({ strict: false })
+  const [filter, setFilter] = useState<PresetFilter>(
+    () => PRESET_FILTERS.find((f) => f === search.filter) ?? 'all',
+  )
+  const [page, setPage] = useState(1)
+
+  // Defer filtering so typing in the search box stays responsive on long lists.
+  const deferredQuery = useDeferredValue(query)
+  const filteredPresets = useMemo(
+    () => filterPresets(presets, filter, parseQuery(deferredQuery)),
+    [presets, filter, deferredQuery],
+  )
+  // Templates support plain-text search only (no model/output/tag facets).
+  const filteredTemplates = useMemo(() => {
+    const text = parseQuery(deferredQuery).text.toLowerCase()
+    if (!text) return templates
+    return templates.filter(
+      (template) =>
+        (template.displayName ?? '').toLowerCase().includes(text) ||
+        (template.displayDescription ?? '').toLowerCase().includes(text) ||
+        (template.pluginLabel ?? '').toLowerCase().includes(text),
+    )
+  }, [templates, deferredQuery])
+
+  const handleAddFacet = useCallback((token: FacetToken) => {
+    setQuery((current) => addToken(current, token))
     setPage(1)
-  }
+  }, [])
+
+  const showTemplates = filter === 'templates'
+  // "Bookmarked" lists both kinds: workflows first, then templates.
+  const rows = useMemo<Array<ListRow>>(
+    () =>
+      showTemplates
+        ? filteredTemplates.map((template) => ({ kind: 'template', template }))
+        : [
+            ...filteredPresets.map((preset) => ({
+              kind: 'preset' as const,
+              preset,
+            })),
+            ...(filter === 'bookmarked'
+              ? filteredTemplates
+                  .filter(isTemplateBookmarked)
+                  .map((template) => ({ kind: 'template' as const, template }))
+              : []),
+          ],
+    [
+      showTemplates,
+      filter,
+      filteredPresets,
+      filteredTemplates,
+      isTemplateBookmarked,
+    ],
+  )
+  const activeCount = rows.length
+  const totalPages = Math.max(1, Math.ceil(activeCount / PAGE_SIZE))
+  // Clamp: a delete (or any list shrink) can leave `page` past the last page.
+  const currentPage = Math.min(page, totalPages)
+  const pageSlice = <T,>(items: Array<T>) =>
+    items.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
+  const paginatedRows = pageSlice(rows)
 
   return (
-    <div
-      className={cn(
-        'mx-auto space-y-8 px-4 py-8 sm:px-6 lg:px-8',
-        layoutMode === 'boxed' ? 'max-w-7xl' : 'max-w-none',
-      )}
-    >
+    <ListPageContainer>
       <PageHeader
         title={t('presets.page.title')}
         description={t('presets.page.description')}
       />
 
-      <Card
-        className="overflow-hidden"
-        variant={dashboardVariant}
-        shadow={panelShadow}
-      >
+      <Card className="overflow-hidden">
         {/* Header bar */}
         <div className="flex flex-col items-start justify-between gap-4 border-b border-border p-6 sm:flex-row sm:items-center">
-          <H2 className="text-xl font-semibold">{t('presets.page.title')}</H2>
-
-          <div className="flex w-full items-center gap-3 sm:w-auto">
-            <div className="relative flex-1 sm:flex-initial">
-              <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-muted-foreground">
-                <Search className="h-4 w-4" />
-              </span>
-              <Input
-                type="text"
-                placeholder={t('presets.searchPlaceholder')}
-                value={searchQuery}
-                onChange={(e) => {
-                  setSearchQuery(e.target.value)
-                  setPage(1)
-                }}
-                className="w-full pl-10 sm:w-64"
+          {/* Title + flow-preview toggles */}
+          <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1">
+            <H2 className="text-xl font-semibold">{t('presets.page.title')}</H2>
+            <div className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+              <span>{t('journal:flowToggle')}</span>
+              <Switch
+                checked={showFlow}
+                onCheckedChange={setShowFlow}
+                aria-label={t('journal:flowToggle')}
               />
             </div>
+          </div>
 
-            <div className="hidden items-center gap-1 text-sm font-medium text-muted-foreground md:flex">
-              {(['all', 'bookmarked'] as const).map((f) => (
+          {/* Faceted search — shared with the Forecast Journal — plus tabs. */}
+          <div className="flex w-full min-w-0 flex-wrap items-center gap-x-3 gap-y-2 sm:w-auto sm:justify-end">
+            <FacetSearchBar
+              value={query}
+              onChange={(value) => {
+                setQuery(value)
+                setPage(1)
+              }}
+            />
+
+            <div className="flex items-center gap-1 text-sm font-medium text-muted-foreground">
+              {(['all', 'bookmarked', 'templates'] as const).map((f) => (
                 <button
                   key={f}
-                  onClick={() => handleFilterChange(f)}
+                  type="button"
+                  onClick={() => {
+                    setFilter(f)
+                    setPage(1)
+                  }}
                   className={cn(
                     'rounded-md px-3 py-1.5 transition-colors',
                     filter === f
@@ -350,62 +494,48 @@ export function PresetsPage() {
 
         {/* List */}
         <div className="divide-y divide-border">
-          {paginatedPresets.length > 0 ? (
-            paginatedPresets.map((preset) => (
-              <PresetRow
-                key={preset.blueprintId}
-                preset={preset}
-                onDelete={deletePreset}
-                onToggleFavourite={toggleFavourite}
-              />
-            ))
-          ) : (
-            <div className="flex flex-col items-center gap-2 p-12 text-center text-muted-foreground">
-              <Bookmark className="h-8 w-8" />
-              {searchQuery || filter !== 'all' ? (
-                <P>{t('presets.empty.filtered')}</P>
+          {paginatedRows.length > 0 ? (
+            paginatedRows.map((row) =>
+              row.kind === 'template' ? (
+                <TemplateRow
+                  key={row.template.blueprintId}
+                  template={row.template}
+                  bookmarked={isTemplateBookmarked(row.template)}
+                  onToggleBookmark={toggleTemplateBookmark}
+                />
               ) : (
-                <>
-                  <P className="font-medium">{t('presets.empty.title')}</P>
-                  <P className="text-sm">{t('presets.empty.description')}</P>
-                </>
-              )}
-            </div>
+                <PresetRow
+                  key={row.preset.blueprintId}
+                  preset={row.preset}
+                  onDelete={deletePreset}
+                  onToggleFavourite={toggleFavourite}
+                  onAddFacet={handleAddFacet}
+                />
+              ),
+            )
+          ) : query || filter === 'bookmarked' ? (
+            <EmptyState icon={Bookmark} title={t('presets.empty.filtered')} />
+          ) : showTemplates ? (
+            <EmptyState
+              icon={Bookmark}
+              title={t('presets.templates.empty.title')}
+              description={t('presets.templates.empty.description')}
+            />
+          ) : (
+            <EmptyState
+              icon={Bookmark}
+              title={t('presets.empty.title')}
+              description={t('presets.empty.description')}
+            />
           )}
         </div>
 
-        {/* Pagination */}
-        {totalPages > 1 && (
-          <div className="border-t border-border p-4 text-center">
-            <div className="flex items-center justify-center gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={page <= 1}
-                onClick={() => setPage((p) => p - 1)}
-              >
-                <ChevronLeft className="mr-1 h-4 w-4" />
-                {t('presets.pagination.previous')}
-              </Button>
-              <span className="text-sm text-muted-foreground">
-                {t('presets.pagination.page', {
-                  current: page,
-                  total: totalPages,
-                })}
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={page >= totalPages}
-                onClick={() => setPage((p) => p + 1)}
-              >
-                {t('presets.pagination.next')}
-                <ChevronRight className="ml-1 h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-        )}
+        <Pagination
+          page={currentPage}
+          totalPages={totalPages}
+          onPageChange={setPage}
+        />
       </Card>
-    </div>
+    </ListPageContainer>
   )
 }

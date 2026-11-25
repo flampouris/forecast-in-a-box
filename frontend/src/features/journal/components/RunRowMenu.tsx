@@ -1,0 +1,292 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/** The run row's ⋯ menu — edit config, preset toggle, stop or delete (with confirm). */
+
+import { useState } from 'react'
+import {
+  BookmarkMinus,
+  BookmarkPlus,
+  CalendarClock,
+  CircleStop,
+  Columns2,
+  Loader2,
+  MoreVertical,
+  Pencil,
+  Trash2,
+} from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { useNavigate } from '@tanstack/react-router'
+import type { FableRetrieveResponse } from '@/api/types/fable.types'
+import type { ForecastRunViewModel } from '@/features/journal/types'
+import { useUpsertFable } from '@/api/hooks/useFable'
+import { useDeleteJob, useStopJob } from '@/api/hooks/useJobs'
+import { isStoppableStatus, isTerminalStatus } from '@/api/types/job.types'
+import { buildPreviousRunComparison } from '@/features/visualise/compare-runs'
+import {
+  isOneoffBlueprint,
+  withOneoffTag,
+  withoutOneoffTag,
+} from '@/lib/system-tags'
+import { showToast } from '@/lib/toast'
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+
+interface RunRowMenuProps {
+  run: ForecastRunViewModel
+  /** The run's blueprint — undefined until it loads. */
+  blueprint: FableRetrieveResponse | undefined
+}
+
+export function RunRowMenu({ run, blueprint }: RunRowMenuProps) {
+  const { t } = useTranslation(['journal', 'executions'])
+  const navigate = useNavigate()
+  const upsertFable = useUpsertFable()
+  const deleteJob = useDeleteJob()
+  const stopJob = useStopJob()
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [stopOpen, setStopOpen] = useState(false)
+  const [comparing, setComparing] = useState(false)
+
+  async function handleCompareWithPrevious() {
+    if (!run.scheduleId) return
+    setComparing(true)
+    try {
+      const result = await buildPreviousRunComparison({
+        runId: run.runId,
+        scheduleId: run.scheduleId,
+        createdAt: run.createdAt,
+        displayName: run.displayName,
+      })
+      if (!result.ok) {
+        showToast.error(
+          result.reason === 'noPrevious'
+            ? t('toast.noPreviousRun')
+            : t('toast.noGribOutput'),
+        )
+        return
+      }
+      void navigate({ to: '/visualise', search: result.search })
+    } catch (err) {
+      showToast.error(
+        err instanceof Error ? err.message : t('toast.compareFailed'),
+      )
+    } finally {
+      setComparing(false)
+    }
+  }
+
+  // No one-off marker means the blueprint is already a saved preset.
+  const isPreset = blueprint != null && !isOneoffBlueprint(blueprint.tags)
+
+  async function handleTogglePreset() {
+    if (!blueprint) return
+    try {
+      await upsertFable.mutateAsync({
+        fable: blueprint.builder,
+        fableId: blueprint.blueprint_id,
+        fableVersion: blueprint.version,
+        display_name: blueprint.display_name ?? '',
+        display_description: blueprint.display_description ?? '',
+        tags: isPreset
+          ? withOneoffTag(blueprint.tags)
+          : withoutOneoffTag(blueprint.tags),
+      })
+      showToast.success(
+        isPreset ? t('toast.removedFromPreset') : t('toast.savedAsPreset'),
+      )
+    } catch (error) {
+      showToast.error(
+        t('toast.presetFailed'),
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+
+  async function handleDelete() {
+    try {
+      await deleteJob.mutateAsync({
+        runId: run.runId,
+        attemptCount: run.attemptCount,
+      })
+      setDeleteOpen(false)
+      showToast.success(t('toast.runDeleted'))
+    } catch (error) {
+      showToast.error(
+        t('toast.deleteFailed'),
+        error instanceof Error ? error.message : String(error),
+      )
+    }
+  }
+
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <button
+              type="button"
+              className="hit-target-y flex size-6 items-center justify-center rounded-md transition-colors hover:text-primary"
+              aria-label={t('item.moreOptions')}
+            />
+          }
+        >
+          <MoreVertical className="h-5 w-5" />
+        </DropdownMenuTrigger>
+        {/* w-fit: size to content — the default matches the tiny trigger. */}
+        <DropdownMenuContent align="end" className="w-fit">
+          <DropdownMenuItem
+            onClick={() =>
+              navigate({
+                to: '/configure',
+                search: { fableId: run.blueprintId },
+              })
+            }
+          >
+            <Pencil className="h-4 w-4" />
+            {t('item.editConfig')}
+          </DropdownMenuItem>
+          {run.scheduleId && (
+            <DropdownMenuItem
+              onClick={() =>
+                navigate({
+                  to: '/schedules/$scheduleId',
+                  params: { scheduleId: run.scheduleId! },
+                })
+              }
+            >
+              <CalendarClock className="h-4 w-4" />
+              {t('item.openSchedule')}
+            </DropdownMenuItem>
+          )}
+          {run.scheduleId && run.status === 'completed' && (
+            <DropdownMenuItem
+              disabled={comparing}
+              onClick={() => void handleCompareWithPrevious()}
+            >
+              <Columns2 className="h-4 w-4" />
+              {t('item.compareWithPrevious')}
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            onClick={handleTogglePreset}
+            disabled={!blueprint || upsertFable.isPending}
+          >
+            {isPreset ? (
+              <BookmarkMinus className="h-4 w-4" />
+            ) : (
+              <BookmarkPlus className="h-4 w-4" />
+            )}
+            {isPreset ? t('item.removeFromPreset') : t('item.saveAsPreset')}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          {isStoppableStatus(run.status) && (
+            <DropdownMenuItem onClick={() => setStopOpen(true)}>
+              <CircleStop className="h-4 w-4" />
+              {t('executions:actions.stopRun')}
+            </DropdownMenuItem>
+          )}
+          {run.status === 'stopping' && (
+            <DropdownMenuItem disabled>
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {t('executions:actions.stopping')}
+            </DropdownMenuItem>
+          )}
+          {isTerminalStatus(run.status) && (
+            <DropdownMenuItem
+              onClick={() => setDeleteOpen(true)}
+              className="text-danger focus:text-danger"
+            >
+              <Trash2 className="h-4 w-4" />
+              {t('item.delete')}
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <AlertDialog open={stopOpen} onOpenChange={setStopOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t('executions:actions.stopJob')}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('executions:actions.confirmStop')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setStopOpen(false)}
+            >
+              {t('executions:actions.keepRunning')}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={() => {
+                stopJob.mutate({
+                  runId: run.runId,
+                  attemptCount: run.attemptCount,
+                })
+                setStopOpen(false)
+              }}
+            >
+              {t('executions:actions.stopRun')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('deleteRun.title')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('deleteRun.description')}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setDeleteOpen(false)}
+            >
+              {t('deleteRun.cancel')}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={deleteJob.isPending}
+            >
+              {t('deleteRun.confirm')}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  )
+}

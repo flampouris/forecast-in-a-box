@@ -1,0 +1,529 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * TemplateParamsDialog Component
+ *
+ * Collects a template's parameters when forking: required glyphs (seeded
+ * from plugin examples) plus the template's own defaults, collapsed.
+ * Values validate live against /blueprint/expand on a candidate builder.
+ * Parameters with example metadata render as labeled typed fields;
+ * the rest stay plain text.
+ */
+
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  CheckCircle2,
+  ChevronRight,
+  Loader2,
+  TriangleAlert,
+} from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { useQueryClient } from '@tanstack/react-query'
+import type {
+  ParameterUsage,
+  TemplateParameters,
+} from '@/features/fable-builder/utils/template-parameters'
+import type {
+  BlockFactoryCatalogue,
+  FableBuilderV1,
+} from '@/api/types/fable.types'
+import type { TemplateExampleValues } from '@/api/types/plugins.types'
+import type { GlyphInfo } from '@/features/fable-builder/hooks/useAllGlyphs'
+import { getFactory } from '@/api/types/fable.types'
+import { GlyphContext } from '@/features/fable-builder/context/GlyphContext'
+import {
+  fableKeys,
+  useCreateGlobalGlyph,
+  useFableValidation,
+} from '@/api/hooks/useFable'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { hasUnterminatedGlyph } from '@/features/fable-builder/utils/glyph-display'
+import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { FieldRenderer } from '@/components/base/fields/FieldRenderer'
+import { ResolvedPreview } from '@/components/base/fields/fields/GlyphFieldWrapper'
+import { useDebounce } from '@/hooks/useDebounce'
+import { cn } from '@/lib/utils'
+
+interface TemplateParamsDialogProps {
+  open: boolean
+  params: TemplateParameters
+  /** The forked template builder the values are validated against */
+  baseFable: FableBuilderV1
+  /** The plugin's example data: glyph suggestions + block config overlays */
+  examples: TemplateExampleValues | undefined
+  /** Apply the collected glyph values and continue into the builder */
+  onApply: (values: Record<string, string>) => void
+  /** Continue with the plugin's examples applied silently */
+  onSkip: () => void
+  /** Dialog copy overrides (defaults: template-fork wording) */
+  title?: string
+  description?: string
+  /** Resolves block/option display titles for the usage-context lines */
+  catalogue?: BlockFactoryCatalogue
+  /** Per-parameter local/global scope; global values are created on Apply. */
+  scopeSelectable?: boolean
+}
+
+/** Stable empty array — a new literal each render would remount every field. */
+const NO_GLYPHS: Array<GlyphInfo> = []
+
+export function TemplateParamsDialog({
+  open,
+  params,
+  baseFable,
+  examples,
+  onApply,
+  onSkip,
+  title,
+  description,
+  catalogue,
+  scopeSelectable = false,
+}: TemplateParamsDialogProps) {
+  const { t } = useTranslation(['configure', 'glyphs'])
+  const [values, setValues] = useState<Record<string, string>>({})
+  const [scopes, setScopes] = useState<Record<string, 'local' | 'global'>>({})
+  const [showPrefilled, setShowPrefilled] = useState(false)
+  const [applying, setApplying] = useState(false)
+  const [applyError, setApplyError] = useState<string | null>(null)
+  const createGlobal = useCreateGlobalGlyph()
+  const queryClient = useQueryClient()
+
+  // Re-seed the form whenever the dialog opens for a template
+  useEffect(() => {
+    if (!open) return
+    const seeded: Record<string, string> = {}
+    for (const name of params.required) {
+      seeded[name] = examples?.example_glyphs[name]?.example_value ?? ''
+    }
+    for (const [name, value] of Object.entries(params.prefilled)) {
+      seeded[name] = value
+    }
+    setValues(seeded)
+    setScopes({})
+    setApplyError(null)
+    setShowPrefilled(false)
+  }, [open, params, examples])
+
+  // Candidate builder: fork + example block values + the dialog's glyphs —
+  // the same overlay Apply performs, validated before the user commits.
+  const debouncedValues = useDebounce(values, 300)
+  const candidateFable = useMemo<FableBuilderV1>(() => {
+    const blocks = Object.fromEntries(
+      Object.entries(baseFable.blocks).map(([blockId, block]) => [
+        blockId,
+        examples?.example_values[blockId]
+          ? {
+              ...block,
+              configuration_values: {
+                ...block.configuration_values,
+                ...Object.fromEntries(
+                  Object.entries(examples.example_values[blockId]).map(
+                    ([optId, inp]) => [optId, inp.example_value],
+                  ),
+                ),
+              },
+            }
+          : block,
+      ]),
+    )
+    const glyphs = Object.fromEntries(
+      Object.entries(debouncedValues).filter(([, value]) => value !== ''),
+    )
+    return {
+      ...baseFable,
+      blocks,
+      local_glyphs: { ...baseFable.local_glyphs, ...glyphs },
+    }
+  }, [baseFable, examples, debouncedValues])
+
+  const valuesTyping = Object.values(values).some(hasUnterminatedGlyph)
+  const { data: expansion, isFetching: isValidating } = useFableValidation(
+    candidateFable,
+    open && !valuesTyping,
+  )
+  // The expansion lags the inputs (debounce + fetch) — verdicts wait for it.
+  const settled = !isValidating && debouncedValues === values
+  // The inputs `expansion` was actually computed for (frozen while revalidating).
+  const verdictValuesRef = useRef(values)
+  if (settled) verdictValuesRef.current = values
+  const verdictValues = verdictValuesRef.current
+
+  const errorCount = expansion
+    ? expansion.global_errors.length +
+      Object.values(expansion.block_errors).reduce(
+        (total, errors) => total + errors.length,
+        0,
+      )
+    : 0
+
+  /** Backend-resolved value at the parameter's first usage site */
+  function resolvedPreview(name: string): string | null {
+    // `in` guards, not `?.`: index access is typed non-nullable here
+    // (noUncheckedIndexedAccess off), so `?.`/`??` would read as unnecessary.
+    if (!expansion || !(name in params.usage)) return null
+    const site = params.usage[name][0]
+    const resolved = expansion.resolved_configuration_options
+    if (!(site.blockId in resolved)) return null
+    const options = resolved[site.blockId]
+    return site.optionId in options ? options[site.optionId] : null
+  }
+
+  /** True when the backend still reports this glyph as missing */
+  function isMissing(name: string): boolean {
+    if (!expansion) return false
+    return Object.values(expansion.missing_glyphs).some((options) =>
+      Object.values(options).some((names) => names.includes(name)),
+    )
+  }
+
+  const setValue = (name: string, value: string) =>
+    setValues((current) => ({ ...current, [name]: value }))
+
+  /** Create global-scoped values, then hand the rest to onApply as locals. */
+  async function handleApply() {
+    const globalEntries = Object.entries(values).filter(
+      ([name, value]) => scopes[name] === 'global' && value.trim() !== '',
+    )
+    const localValues = Object.fromEntries(
+      Object.entries(values).filter(([name]) => scopes[name] !== 'global'),
+    )
+    if (globalEntries.length === 0) {
+      onApply(values)
+      return
+    }
+    setApplying(true)
+    setApplyError(null)
+    try {
+      await Promise.all(
+        globalEntries.map(([name, value]) =>
+          createGlobal.mutateAsync({
+            key: name,
+            value: value.trim(),
+            public: false,
+            overriddable: null,
+          }),
+        ),
+      )
+      // Globals don't change the fable, so revalidate explicitly.
+      await queryClient.invalidateQueries({
+        queryKey: [...fableKeys.all, 'validation'],
+      })
+      onApply(localValues)
+    } catch (err) {
+      setApplyError(
+        err instanceof Error
+          ? err.message
+          : t('glyphs:field.defineVariable.globalCreateFailed'),
+      )
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  /** "Block → Option" with display titles when the catalogue knows them */
+  function usageLabel(site: ParameterUsage): string {
+    const block =
+      site.blockId in baseFable.blocks
+        ? baseFable.blocks[site.blockId]
+        : undefined
+    if (!block) return site.optionId
+    const factory = catalogue
+      ? getFactory(catalogue, block.factory_id)
+      : undefined
+    let option = site.optionId
+    if (factory && site.optionId in factory.configuration_options) {
+      const optionMeta = factory.configuration_options[site.optionId]
+      if (optionMeta.title) option = optionMeta.title
+    }
+    return t('template.dialog.usedIn', {
+      block: factory?.title ?? block.factory_id.factory,
+      option,
+    })
+  }
+
+  /** Display title of the option a usage site points at. */
+  function optionTitle(site: ParameterUsage): string {
+    if (!(site.blockId in baseFable.blocks)) return site.optionId
+    const block = baseFable.blocks[site.blockId]
+    const factory = catalogue
+      ? getFactory(catalogue, block.factory_id)
+      : undefined
+    if (factory && site.optionId in factory.configuration_options) {
+      return factory.configuration_options[site.optionId].title || site.optionId
+    }
+    return site.optionId
+  }
+
+  /** Display title of a block, for the group heading. */
+  function blockTitle(blockId: string): string {
+    if (!(blockId in baseFable.blocks)) return blockId
+    const block = baseFable.blocks[blockId]
+    const factory = catalogue
+      ? getFactory(catalogue, block.factory_id)
+      : undefined
+    return factory?.title ?? block.factory_id.factory
+  }
+
+  /** Group parameters by the block they configure, in pipeline order. */
+  function groupParameters(
+    names: ReadonlyArray<string>,
+  ): Array<{ blockId: string | null; names: Array<string> }> {
+    const byBlock = new Map<string, Array<string>>()
+    const ungrouped: Array<string> = []
+    for (const name of names) {
+      const sites = name in params.usage ? params.usage[name] : []
+      if (sites.length === 0) {
+        ungrouped.push(name)
+        continue
+      }
+      const { blockId } = sites[0]
+      const bucket = byBlock.get(blockId)
+      if (bucket) bucket.push(name)
+      else byBlock.set(blockId, [name])
+    }
+
+    const groups: Array<{ blockId: string | null; names: Array<string> }> =
+      Object.keys(baseFable.blocks)
+        .filter((blockId) => byBlock.has(blockId))
+        .map((blockId) => {
+          const optionOrder = Object.keys(
+            baseFable.blocks[blockId].configuration_values,
+          )
+          const inBlock = byBlock.get(blockId)!
+          // Within a block, follow the option order the template declares.
+          inBlock.sort(
+            (a, b) =>
+              optionOrder.indexOf(params.usage[a][0].optionId) -
+              optionOrder.indexOf(params.usage[b][0].optionId),
+          )
+          return { blockId, names: inBlock }
+        })
+    if (ungrouped.length > 0) groups.push({ blockId: null, names: ungrouped })
+    return groups
+  }
+
+  /** Render a list of parameters grouped by the block each one configures. */
+  function renderGroups(names: ReadonlyArray<string>) {
+    return groupParameters(names).map(({ blockId, names: groupNames }) => (
+      <div key={blockId ?? '_'} className="flex flex-col gap-3">
+        {blockId !== null && (
+          <p className="border-b pb-1 text-[0.65rem] font-semibold tracking-wide text-muted-foreground uppercase">
+            {blockTitle(blockId)}
+          </p>
+        )}
+        <div className="grid items-start gap-x-6 gap-y-4 sm:grid-cols-2">
+          {groupNames.map((name) => renderField(name, blockId !== null))}
+        </div>
+      </div>
+    ))
+  }
+
+  const renderField = (name: string, grouped = false) => {
+    // Verdicts flip only on settle — mid-validation flips bounce the dialog.
+    const verdictValue = verdictValues[name] ?? ''
+    const preview = resolvedPreview(name)
+    const missing = isMissing(name) && (values[name] ?? '') === verdictValue
+    const meta = examples?.example_glyphs[name]
+    // Templates declare their own types; nothing is inferred elsewhere.
+    const valueType = meta?.type_hint
+    const usageSites = name in params.usage ? params.usage[name] : []
+    const scope = scopes[name] === 'global' ? 'global' : 'local'
+    return (
+      <div key={name} className="flex flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <Label
+            htmlFor={`template-param-${name}`}
+            className={meta?.display_name ? 'text-sm' : 'font-mono text-xs'}
+            // tooltip keeps the raw glyph name reachable
+            title={meta?.display_name ? name : undefined}
+          >
+            {meta?.display_name ?? name}
+          </Label>
+          {scopeSelectable && params.required.includes(name) && (
+            <ToggleGroup
+              variant="outline"
+              size="sm"
+              value={[scope]}
+              onValueChange={(next) => {
+                const first = next[0]
+                if (first === 'local' || first === 'global') {
+                  setScopes((current) => ({ ...current, [name]: first }))
+                }
+              }}
+            >
+              <ToggleGroupItem
+                value="local"
+                className="h-6 px-2 text-xs"
+                title={t('glyphs:field.defineVariable.scopeLocalHint')}
+              >
+                {t('glyphs:field.defineVariable.scopeLocal')}
+              </ToggleGroupItem>
+              <ToggleGroupItem
+                value="global"
+                className="h-6 px-2 text-xs"
+                title={t('glyphs:field.defineVariable.scopeGlobalHint')}
+              >
+                {t('glyphs:field.defineVariable.scopeGlobal')}
+              </ToggleGroupItem>
+            </ToggleGroup>
+          )}
+        </div>
+        {meta?.display_description && (
+          <p
+            className="truncate text-xs text-muted-foreground"
+            title={meta.display_description}
+          >
+            {meta.display_description}
+          </p>
+        )}
+        {usageSites.length > 0 && (
+          <p
+            className="truncate text-xs text-muted-foreground"
+            title={usageSites.map(usageLabel).join('\n')}
+          >
+            {/* Grouped fields already sit under their block's heading. */}
+            {grouped
+              ? t('template.dialog.setsOption', {
+                  option: optionTitle(usageSites[0]),
+                })
+              : usageLabel(usageSites[0])}
+            {usageSites.length > 1 &&
+              ` ${t('template.dialog.usedInMore', { count: usageSites.length - 1 })}`}
+          </p>
+        )}
+        <div className="flex flex-col gap-1.5">
+          {valueType ? (
+            <FieldRenderer
+              id={`template-param-${name}`}
+              configKey={name}
+              valueType={valueType}
+              value={values[name] ?? ''}
+              onChange={(value) => setValue(name, value)}
+              inputClassName={cn(missing && 'border-amber-400')}
+            />
+          ) : (
+            <Input
+              id={`template-param-${name}`}
+              value={values[name] ?? ''}
+              onChange={(e) => setValue(name, e.target.value)}
+              aria-invalid={missing || undefined}
+              className={cn(missing && 'border-amber-400')}
+            />
+          )}
+          {missing ? (
+            <p className="text-xs text-amber-600 dark:text-amber-400">
+              {t('template.dialog.missingValue')}
+            </p>
+          ) : (
+            preview !== null &&
+            preview !== verdictValue && <ResolvedPreview preview={preview} />
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  const prefilledNames = Object.keys(params.prefilled)
+
+  return (
+    <Dialog open={open} onOpenChange={(next) => !next && onSkip()}>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{title ?? t('template.dialog.title')}</DialogTitle>
+          <DialogDescription>
+            {description ?? t('template.dialog.description')}
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* Variables are defined here, so no expression toggle. */}
+        <GlyphContext.Provider value={NO_GLYPHS}>
+          {/* min-w-0: keeps nowrap preview lines from widening the dialog grid */}
+          <div className="flex min-w-0 flex-col gap-4">
+            {params.required.length > 0 && (
+              <div className="flex flex-col gap-3">
+                {renderGroups(params.required)}
+              </div>
+            )}
+
+            {prefilledNames.length > 0 && (
+              <Collapsible open={showPrefilled} onOpenChange={setShowPrefilled}>
+                <CollapsibleTrigger className="flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+                  <ChevronRight
+                    className={cn(
+                      'h-4 w-4 transition-transform',
+                      showPrefilled && 'rotate-90',
+                    )}
+                  />
+                  {t('template.dialog.prefilled', {
+                    count: prefilledNames.length,
+                  })}
+                </CollapsibleTrigger>
+                <CollapsibleContent className="mt-3 flex flex-col gap-3">
+                  {renderGroups(prefilledNames)}
+                </CollapsibleContent>
+              </Collapsible>
+            )}
+
+            {/* Live validation status of the candidate configuration */}
+            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              {!settled ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  {t('template.dialog.validating')}
+                </>
+              ) : expansion && errorCount === 0 ? (
+                <>
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                  {t('template.dialog.valid')}
+                </>
+              ) : expansion ? (
+                <>
+                  <TriangleAlert className="h-3.5 w-3.5 text-amber-500" />
+                  {t('template.dialog.issues', { count: errorCount })}
+                </>
+              ) : null}
+            </div>
+          </div>
+        </GlyphContext.Provider>
+
+        {applyError && (
+          <p className="text-xs text-danger" role="alert">
+            {applyError}
+          </p>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onSkip} disabled={applying}>
+            {t('template.dialog.skip')}
+          </Button>
+          <Button onClick={() => void handleApply()} disabled={applying}>
+            {t('template.dialog.apply')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}

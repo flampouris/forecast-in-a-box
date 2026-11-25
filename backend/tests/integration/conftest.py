@@ -5,22 +5,43 @@ import socketserver
 import tempfile
 import time
 from http.server import SimpleHTTPRequestHandler
-from multiprocessing import Event, Process
+from multiprocessing import Event, Process, get_context
 from typing import Any, Generator
 
 import httpx
 import pytest
+from cascade.executor.platform import get_mp_ctx
 from fiab_core.artifacts import ArtifactStoreId
 from fiab_core.fable import PluginCompositeId, PluginId, PluginStoreId
 from pydantic import SecretStr
 
 import forecastbox.utility.config
 from forecastbox.entrypoint.main import launch_all
-from forecastbox.utility.config import ArtifactStoreConfig, FIABConfig, PluginCompositeIdReadable, PluginSettings, PluginStoreConfig
+from forecastbox.utility.config import (
+    ArtifactStoreConfig,
+    FIABConfig,
+    GatewayStartupParams,
+    LocalGateway,
+    PluginCompositeIdReadable,
+    PluginStoreConfig,
+    validate_runtime,
+)
 
-from .utils import extract_auth_token_from_response, prepare_cookie_with_auth_token
+from .utils import extract_auth_token_from_response, prepare_cookie_with_auth_token, retry_until
 
-fake_artifact_registry_port = 12001
+
+def _claim_free_port() -> int:
+    """Returns a port currently free on the loopback and wildcard interfaces, as picked by the OS."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture(scope="session")
+def fake_artifact_registry_port() -> int:
+    return _claim_free_port()
+
+
 fake_artifact_store_id = "test_store"
 test_model_artifact_id = "test_models_checkpoint"
 test_blueprint_artifact_id = "test_blueprint_checkpoint"
@@ -29,6 +50,7 @@ testPluginId = PluginCompositeIdReadable.from_str("localTest:single")
 
 class FakeArtifactRegistry(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
+        port = int(self.server.server_address[1])  # ty: ignore
         if self.path == "/artifacts.json":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -37,31 +59,45 @@ class FakeArtifactRegistry(SimpleHTTPRequestHandler):
             def make_artifact(i: int) -> dict:
                 checkpoint_id = f"{test_model_artifact_id}{i}"
                 return {
-                    "url": f"http://localhost:{fake_artifact_registry_port}/{checkpoint_id}",
-                    "display_name": f"Test Model Checkpoint {i}",
-                    "display_author": "Test Author",
-                    "display_description": f"A test model checkpoint {i} for integration tests",
-                    "comment": "",
-                    "disk_size_bytes": 1024,
-                    "pip_package_constraints": ["torch>=2.0.0"],
-                    "supported_platforms": ["linux", "macos"],
-                    "output_qube": {"test": "qube"},
-                    "input_characteristics": ["test_input"],
-                    "timestep": "1h",
+                    "artifact_type": "AnemoiCheckpoint",
+                    "common": {
+                        "url": f"http://localhost:{port}/{checkpoint_id}",
+                        "display_name": f"Test Model Checkpoint {i}",
+                        "display_author": "Test Author",
+                        "display_description": f"A test model checkpoint {i} for integration tests",
+                        "comment": "",
+                        "disk_size_bytes": 1024,
+                        "supported_platforms": ["linux", "macos"],
+                        "tags": {"integration-test": None, "index": str(i)},
+                    },
+                    "specific": {
+                        "pip_package_constraints": ["torch>=2.0.0"],
+                        "input_qube": {},
+                        "output_qube": {"test": "qube"},
+                        "input_characteristics": ["test_input"],
+                        "timestep": "1h",
+                    },
                 }
 
             small_artifact = {
-                "url": f"http://localhost:{fake_artifact_registry_port}/{test_blueprint_artifact_id}",
-                "display_name": "Small Test Checkpoint",
-                "display_author": "Test Author",
-                "display_description": "A small test checkpoint for artifact runtime dependency tests",
-                "comment": "",
-                "disk_size_bytes": 64,
-                "pip_package_constraints": [],
-                "supported_platforms": ["linux", "macos"],
-                "output_qube": {},
-                "input_characteristics": [],
-                "timestep": "1h",
+                "artifact_type": "AnemoiCheckpoint",
+                "common": {
+                    "url": f"http://localhost:{port}/{test_blueprint_artifact_id}",
+                    "display_name": "Small Test Checkpoint",
+                    "display_author": "Test Author",
+                    "display_description": "A small test checkpoint for artifact runtime dependency tests",
+                    "comment": "",
+                    "disk_size_bytes": 64,
+                    "supported_platforms": ["linux", "macos"],
+                    "tags": {},
+                },
+                "specific": {
+                    "pip_package_constraints": [],
+                    "input_qube": {},
+                    "output_qube": {},
+                    "input_characteristics": [],
+                    "timestep": "1h",
+                },
             }
 
             catalog = {
@@ -103,8 +139,8 @@ class FakeArtifactRegistry(SimpleHTTPRequestHandler):
             self.send_error(404, f"Not Found: {self.path}")
 
 
-def run_artifact_registry(shutdown_event: Any) -> None:
-    server_address = ("", fake_artifact_registry_port)
+def run_artifact_registry(shutdown_event: Any, port: int) -> None:
+    server_address = ("", port)
 
     class WhyExposeFieldsInConstructorWhenYouCanSubclass(socketserver.ThreadingTCPServer):
         allow_reuse_address = True
@@ -116,19 +152,36 @@ def run_artifact_registry(shutdown_event: Any) -> None:
         httpd.shutdown()
 
 
+def _register_user(backend_client: httpx.Client, email: str, password: str) -> None:
+    headers = {"Content-Type": "application/json"}
+    data = {"email": email, "password": password}
+    response = backend_client.post("/auth/register", headers=headers, json=data)
+    assert response.is_success, f"failed to register user with {email=}"
+
+
 @pytest.fixture(scope="session")
-def backend_client() -> Generator[httpx.Client, None, None]:
+def backend_client(fake_artifact_registry_port: int) -> Generator[httpx.Client, None, None]:
     td = None
     td_data = None
     handles = None
     shutdown_event_artifacts = None
     p_artifacts = None
     client = None
+    frontend_symlink = None
     try:
         td = tempfile.TemporaryDirectory()
         td_data = tempfile.TemporaryDirectory()
         os.environ["FIAB_ROOT"] = td.name
-        os.environ["FIAB_TEST_FRONTEND"] = str(pathlib.Path(__file__).parent / "static")
+
+        # The `static/` directory is normally produced by the frontend build and bundled into
+        # the wheel (see the `fiabwheel` recipe in the repo root's justfile). On a clean checkout
+        # it does not exist, so we symlink in a placeholder used purely for these integration
+        # tests. If a developer already has a real build in place, we leave it untouched.
+        assert forecastbox.utility.config.__file__ is not None
+        static_dir = pathlib.Path(forecastbox.utility.config.__file__).parent.parent / "static"
+        if not static_dir.exists():
+            static_dir.symlink_to(pathlib.Path(__file__).parent / "static", target_is_directory=True)
+            frontend_symlink = static_dir
         (pathlib.Path(td.name) / "pylock.toml.timestamp").write_text("1761908420:d0.0.1")
         # we need to monkeypath this, because of eager import this was already initialised
         # to user's personal config file
@@ -136,42 +189,76 @@ def backend_client() -> Generator[httpx.Client, None, None]:
 
         config = FIABConfig()
         config.auth.jwt_secret = SecretStr("x" * 32)
-        config.api.uvicorn_port = 30645
-        config.cascade.cascade_url = "tcp://localhost:30644"
+        config.backend.uvicorn_port = _claim_free_port()
+        config.cascade.gateway = LocalGateway(gateway_type="local", startup_params=GatewayStartupParams())
         config.db.sqlite_userdb_path = f"{td.name}/user.db"
         config.db.sqlite_jobdb_path = f"{td.name}/job.db"
-        config.api.data_path = td_data.name
-        config.api.allow_scheduler = True
-        config.product.artifact_stores = {
+        config.backend.data_path = f"file://{td_data.name}"
+        config.backend.allow_scheduler = True
+        plugin_test_loc = pathlib.Path(__file__).parent.parent.parent / "packages" / "fiab-plugin-test"
+        config.external.artifact_stores = {
             ArtifactStoreId(fake_artifact_store_id): ArtifactStoreConfig(
                 url=f"http://localhost:{fake_artifact_registry_port}/artifacts.json",
                 method="file",
             )
         }
-        config.product.plugin_stores = {
+        config.external.plugin_stores = {
             PluginStoreId("localTest"): PluginStoreConfig(
-                url="file://../../packages/fiab-plugin-test",
+                url=f"-e file://{plugin_test_loc}",
                 method="localSingle",
             ),
         }
-        config.product.plugins = {
-            testPluginId: PluginSettings(
-                pip_source="-e file://../../packages/fiab-plugin-test",
-                module_name="fiab_plugin_test",
-            ),
-        }
+        config.external.default_plugins = [testPluginId]
 
-        config.general.launch_browser = False
+        config.backend.launch_browser = False
         config.auth.domain_allowlist_registry = ["somewhere.org"]
         config.auth.passthrough = False
+        validate_runtime(config)
 
         # Start fake artifact registry before launching the app
         shutdown_event_artifacts = Event()
-        p_artifacts = Process(target=run_artifact_registry, args=(shutdown_event_artifacts,))
+        # NOTE we basically need a `fork/spawn` here, as forkserver makes us lose the envvars
+        p_artifacts = get_mp_ctx("other").Process(
+            target=run_artifact_registry, args=(shutdown_event_artifacts, fake_artifact_registry_port)
+        )
         p_artifacts.start()
 
         handles = launch_all(config)
-        client = httpx.Client(base_url=config.api.local_url() + "/api/v1", follow_redirects=True)
+        client = httpx.Client(base_url=config.backend.local_url() + "/api/v1", follow_redirects=True)
+        # we need to call admin register before yielding this to anybody, because the first registered user is admin
+        _register_user(client, "admin@somewhere.org", "adminPassword")
+
+        # Install the configured default plugins exactly the way an admin would through the API (the
+        # backend itself never installs plugins implicitly at startup -- see `default_plugins` in
+        # `ExternalServicesSettings`): log in as the just-registered admin, wait for the plugin subsystem
+        # to finish its asynchronous store initialization, submit an install for each default plugin id,
+        # then poll `/status` again for it to settle back to "ok" so every test can assume the default
+        # (test) plugin is already installed and loaded.
+        def _poll_status() -> dict:
+            response = client.get("/status", timeout=10)
+            response.raise_for_status()
+            return response.json()
+
+        def _plugins_settled(data: dict) -> dict | None:
+            return data if data.get("plugins") == "ok" else None
+
+        retry_until(_poll_status, _plugins_settled, attempts=60, sleep=1.0, error_msg="plugin stores did not become ready")
+
+        with httpx.Client(base_url=str(client.base_url), follow_redirects=True) as admin_setup_client:
+            login_response = admin_setup_client.post(
+                "/auth/jwt/login", data={"username": "admin@somewhere.org", "password": "adminPassword"}
+            )
+            assert login_response.is_success, f"admin login failed: {login_response.text}"
+            token = extract_auth_token_from_response(login_response)
+            assert token is not None, "admin token should not be None"
+            admin_setup_client.cookies.set(**prepare_cookie_with_auth_token(token))
+
+            for plugin_id in config.external.default_plugins:
+                install_response = admin_setup_client.post("/plugin/install", json=plugin_id.model_dump())
+                assert install_response.is_success, f"failed to submit install of {plugin_id}: {install_response.text}"
+
+        retry_until(_poll_status, _plugins_settled, attempts=60, sleep=1.0, error_msg="default plugin install did not settle")
+
         yield client
     finally:
         if client is not None:
@@ -191,19 +278,42 @@ def backend_client() -> Generator[httpx.Client, None, None]:
             td.cleanup()
         if td_data is not None:
             td_data.cleanup()
+        if frontend_symlink is not None:
+            frontend_symlink.unlink(missing_ok=True)
 
 
 @pytest.fixture(scope="session")
-def backend_client_with_auth(backend_client: httpx.Client) -> Generator[httpx.Client, None, None]:
-    headers = {"Content-Type": "application/json"}
-    data = {"email": "authenticated_user@somewhere.org", "password": "something"}
-    response = backend_client.post("/auth/register", headers=headers, json=data)
-    assert response.is_success
-    response = backend_client.post("/auth/jwt/login", data={"username": "authenticated_user@somewhere.org", "password": "something"})
-    token = extract_auth_token_from_response(response)
-    assert token is not None, "Token should not be None"
-    backend_client.cookies.set(**prepare_cookie_with_auth_token(token))
+def backend_client_user(backend_client: httpx.Client) -> Generator[httpx.Client, None, None]:
+    """A separate httpx.Client authenticated as a regular user.
 
-    response = backend_client.get("/users/me")
-    assert response.is_success, "Failed to authenticate user"
-    yield backend_client
+    Uses a dedicated client so that its auth cookies do not interfere with
+    backend_client or backend_client_admin. First calls a register.
+    """
+    with httpx.Client(base_url=str(backend_client.base_url), follow_redirects=True) as user_client:
+        _register_user(backend_client, "user1@somewhere.org", "user1Password")
+        response = user_client.post("/auth/jwt/login", data={"username": "user1@somewhere.org", "password": "user1Password"})
+        token = extract_auth_token_from_response(response)
+        assert token is not None, "Token should not be None"
+        user_client.cookies.set(**prepare_cookie_with_auth_token(token))
+
+        response = user_client.get("/users/me")
+        assert response.is_success, "Failed to authenticate user"
+        yield user_client
+
+
+@pytest.fixture(scope="session")
+def backend_client_admin(backend_client: httpx.Client) -> Generator[httpx.Client, None, None]:
+    """A separate httpx.Client authenticated as the admin user (admin@somewhere.org).
+
+    Does not register -- that already happens in the backend_client fixture setup,
+    to ensure adminness.
+    Uses a dedicated client so that its auth cookies do not interfere with
+    backend_client or backend_client_user.
+    """
+    with httpx.Client(base_url=str(backend_client.base_url), follow_redirects=True) as admin_client:
+        response = admin_client.post("/auth/jwt/login", data={"username": "admin@somewhere.org", "password": "adminPassword"})
+        assert response.is_success, f"Admin login failed: {response.text}"
+        token = extract_auth_token_from_response(response)
+        assert token is not None, "Admin token should not be None"
+        admin_client.cookies.set(**prepare_cookie_with_auth_token(token))
+        yield admin_client

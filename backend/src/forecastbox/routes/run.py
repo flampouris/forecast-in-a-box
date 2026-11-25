@@ -12,38 +12,47 @@ Run entity routes — /run/*. Corresponds to `domain.run` backend-managed entity
 
 Contains three categories of routes:
  - CRD+List endpoints (no update, this is backend-managed entity), and a restart endpoint (which is effectively another create),
- - Further detail endpoints -- inspecting outputs, getting logs
+ - Further detail endpoints -- inspecting outputs, getting logs, and retrieving compilation detail
 """
 
-import asyncio
-import io
 import logging
-import os
 import pathlib
-import zipfile
-from typing import Annotated, cast
+from functools import partial
+from typing import Annotated, Literal, cast
 
-import orjson
-from cascade.controller.report import JobId
-from cascade.gateway import api, client
 from cascade.low.core import DatasetId, TaskId
 from fastapi import APIRouter, Depends, Response
 from fastapi.exceptions import HTTPException
 from fiab_core.fable import BlockInstanceId
+from pydantic import Field
 
 from forecastbox.domain.auth.users import get_auth_context
 from forecastbox.domain.blueprint.types import BlueprintId
-from forecastbox.domain.run import db, service
-from forecastbox.domain.run.cascade import RunOutputs, encode_result
-from forecastbox.domain.run.exceptions import RunAccessDenied, RunNotFound
+from forecastbox.domain.run import db, service, stop
+from forecastbox.domain.run.cascade import RunOutputs, delete_cascade_datasets, retrieve_output_bytes
+from forecastbox.domain.run.detail import retrieve_compilation_detail
+from forecastbox.domain.run.exceptions import (
+    CompilationDetailCorrupted,
+    CompilationDetailNotFound,
+    OutputPathNotFound,
+    RunAccessDenied,
+    RunConcurrencyIssue,
+    RunLogsArchiveFailed,
+    RunNotDeletable,
+    RunNotFound,
+    RunNotStoppable,
+    RunOutputRetrievalFailed,
+)
+from forecastbox.domain.run.logs import get_output_archive, get_run_logs_archive
 from forecastbox.domain.run.types import RunId
-from forecastbox.routes.gateway import Globals
 from forecastbox.utility.auth import AuthContext
-from forecastbox.utility.config import config
+from forecastbox.utility.concurrency.manager import SubmissionRejected, TaskName, execution_manager
+from forecastbox.utility.config import ROUTE_PREFIX, ConcurrentPools
+from forecastbox.utility.httpx import get_encoding
 from forecastbox.utility.pagination import PaginationSpec
 from forecastbox.utility.pydantic import FiabBaseModel
 
-PREFIX = "/api/v1/run"
+PREFIX = f"{ROUTE_PREFIX}/run"
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +90,11 @@ class RunCreateResponse(FiabBaseModel):
 
 class RunOutputDetail(FiabBaseModel):
     mime_type: str
+    fetchable: bool = False
+    url_dataformat: Literal["gribdir", "zarr"] | None = None
+    skinnywms_issue: str | None = None
+    display_name: str | None = None
+    dimension_kvs: list[tuple[str, str]] | None = None
     original_block: BlockInstanceId
     is_available: bool
 
@@ -89,18 +103,27 @@ class RunOutputsResponse(FiabBaseModel):
     outputs: dict[TaskId, RunOutputDetail]
 
 
+# duplicated from db.py for domain separation
+RunDetailStatus = Literal["submitted", "preparing", "running", "stopping", "stopped", "completed", "failed", "unknown"]
+
+
 class RunDetailResponse(FiabBaseModel):
     run_id: RunId
     attempt_count: int
-    status: str
+    status: RunDetailStatus
     created_at: str
     updated_at: str
+    user: str
     blueprint_id: BlueprintId
     blueprint_version: int
     error: str | None = None
     progress: str | None = None
     cascade_job_id: str | None = None
+    lost_task_ids: dict[TaskId, str] = Field(default_factory=dict)
     outputs: RunOutputsResponse | None = None
+    completed_block_ids: list[BlockInstanceId] | None = None
+    planned_block_ids: list[BlockInstanceId] | None = None
+    resolution: dict[BlockInstanceId, dict[str, str | None]] | None = None
 
 
 class RunListResponse(FiabBaseModel):
@@ -124,10 +147,32 @@ class RunRestartResponse(FiabBaseModel):
 
 
 class RunDeleteRequest(FiabBaseModel):
-    """Identifies the attempt to delete. ``attempt_count`` must match the current latest attempt."""
+    """Identifies the attempt to delete."""
 
     run_id: RunId
     attempt_count: int
+
+
+class RunStopRequest(FiabBaseModel):
+    """Identifies the attempt to stop."""
+
+    run_id: RunId
+    attempt_count: int
+
+
+class CompilationDetailTask(FiabBaseModel):
+    """Task-level detail as returned by the /getCompilationDetail endpoint."""
+
+    task_id: TaskId
+    block: BlockInstanceId
+    display_name: str
+    parents: list[TaskId]
+
+
+class CompilationDetailResponse(FiabBaseModel):
+    """Response for /getCompilationDetail, containing a list of task-level details."""
+
+    tasks: list[CompilationDetailTask]
 
 
 # ---------------------------------------------------------------------------
@@ -144,84 +189,94 @@ def _to_run_detail(domain_detail: service.RunDetail) -> RunDetailResponse:
             outputs={
                 task_id: RunOutputDetail(
                     mime_type=char.mime_type,
+                    fetchable=char.fetchable,
+                    url_dataformat=char.url_dataformat.value if char.url_dataformat is not None else None,
+                    skinnywms_issue=char.skinnywms_issue,
+                    display_name=char.display_name,
+                    dimension_kvs=char.dimension_kvs,
                     original_block=char.original_block,
                     is_available=task_id in available,
                 )
                 for task_id, char in run_outputs.outputs.items()
             }
         )
+    maybe_list = lambda s: list(s) if s is not None else None
     return RunDetailResponse(
         run_id=domain_detail.run_id,
         attempt_count=domain_detail.attempt_count,
         status=domain_detail.status,
         created_at=domain_detail.created_at,
         updated_at=domain_detail.updated_at,
+        user=domain_detail.user,
         blueprint_id=domain_detail.blueprint_id,
         blueprint_version=domain_detail.blueprint_version,
         error=domain_detail.error,
         progress=domain_detail.progress,
         cascade_job_id=domain_detail.cascade_job_id,
+        lost_task_ids=domain_detail.lost_task_ids,
         outputs=outputs_response,
+        completed_block_ids=maybe_list(domain_detail.completed_block_ids),
+        planned_block_ids=maybe_list(domain_detail.planned_block_ids),
+        resolution=domain_detail.resolution,
     )
 
 
-async def _resolve_run_with_cascade(
+async def _poll_run(execution: db.RunRecord, detailed_report: bool = False) -> service.RunDetail:
+    """Run the blocking poll of a Run as a single task on the General pool."""
+    return await execution_manager.awaitable_submit(
+        ConcurrentPools.General, TaskName("run.poll"), partial(service.poll_and_update, execution, detailed_report)
+    )
+
+
+async def _resolve_run_record(
     execution_spec: RunLookup,
     auth_context: AuthContext,
-) -> tuple[db.Run, str]:
-    """Fetch a Run and validate it has a cascade_job_id.
-
-    Raises HTTP 404 if not found or access denied, HTTP 409 if not yet submitted.
-    """
+) -> db.RunRecord:
+    """Fetch a Run. Raises HTTP 404 if not found or access denied."""
     try:
-        execution = await db.get_run(execution_spec.run_id, execution_spec.attempt_count, auth_context=auth_context)
+        execution = cast(
+            db.RunRecord,
+            await execution_manager.await_jobs_db(
+                "run.get", partial(db.get_run, execution_spec.run_id, execution_spec.attempt_count, auth_context=auth_context)
+            ),
+        )
     except RunNotFound:
         raise HTTPException(status_code=404, detail=f"Run {execution_spec.run_id!r} not found.")
     except RunAccessDenied:
         raise HTTPException(status_code=403, detail=f"Access denied to execution {execution_spec.run_id!r}.")
-    cascade_job_id = cast(str | None, execution.cascade_job_id)
-    if cascade_job_id is None:
-        raise HTTPException(status_code=409, detail=f"Run {execution_spec.run_id!r} has not been submitted to cascade yet.")
-    return execution, cascade_job_id
+    return execution
 
 
-async def _build_run_logs_response(cascade_job_id: str, db_entity_ser: bytes) -> Response:
-    try:
-        request = api.JobProgressRequest(job_ids=[JobId(cascade_job_id)])
-        gw_state = client.request_response(request, f"{config.cascade.cascade_url}").model_dump()
-    except TimeoutError:
-        gw_state = {"progresses": {}, "datasets": {}, "error": "TimeoutError"}
-    except Exception as e:
-        gw_state = {"progresses": {}, "datasets": {}, "error": repr(e)}
+async def _retrieve_output_bytes(execution: db.RunRecord, spec: RunLookup, dataset_id: str) -> tuple[bytes, str]:
+    """Retrieve the value and the mime type of an output, from the local cache if possible, otherwise from cascade.
 
-    def _build_zip() -> tuple[bytes, str]:
+    Raises HTTPException if the run has not been submitted, or the output is not available.
+    """
+    if execution.cascade_job_id is None:
+        raise HTTPException(status_code=409, detail=f"Run {spec.run_id!r} has not been submitted to cascade yet.")
+    dataset = DatasetId(task=TaskId(dataset_id), output="0")
+
+    # Serve from locally cached value when available, without contacting cascade.
+    raw_outputs = cast(dict | None, execution.outputs)
+    if raw_outputs is not None:
         try:
-            buffer = io.BytesIO()
-            with zipfile.ZipFile(buffer, "a", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("db_entity.json", db_entity_ser)
-                zf.writestr("gw_state.json", orjson.dumps(gw_state))
-                if not Globals.logs_directory:
-                    zf.writestr("logs_directory.error.txt", "logs directory missing")
-                else:
-                    p = pathlib.Path(Globals.logs_directory.name)
-                    f = ""
-                    try:
-                        for f in os.listdir(p):
-                            j_pref = f"job_{cascade_job_id}"
-                            if f.startswith("gateway") or f.startswith(j_pref):
-                                zf.write(f"{p / f}", arcname=f)
-                    except Exception as e:
-                        zf.writestr("logs_directory.error.txt", f"{f} => {repr(e)}")
-            return buffer.getvalue(), ""
-        except Exception as e:
-            logger.exception("building zip")
-            return b"", repr(e)
+            outputs_model = RunOutputs.model_validate(raw_outputs)
+            char = outputs_model.outputs.get(TaskId(dataset_id))
+            if char is not None and char.value is not None:
+                return char.value.encode(get_encoding(char.mime_type)), char.mime_type
+        except Exception:
+            pass  # fall through to cascade
 
-    loop = asyncio.get_running_loop()
-    bytez, error = await loop.run_in_executor(None, _build_zip)
-    if not error:
-        return Response(content=bytez, status_code=200, media_type="application/zip")
-    return Response(content=error, status_code=500, media_type="text/plain")
+    char_result = service.get_characteristic_of_output(execution, dataset)
+    if char_result.t is None:
+        raise HTTPException(500, f"Result mime lookup failed: {char_result.e}")
+    try:
+        decoded = await execution_manager.awaitable_submit(
+            ConcurrentPools.General, TaskName("run.output.retrieve"), partial(retrieve_output_bytes, execution.cascade_job_id, dataset)
+        )
+    except RunOutputRetrievalFailed as e:
+        raise HTTPException(500, str(e))
+    return decoded, char_result.t.mime_type
 
 
 # ---------------------------------------------------------------------------
@@ -257,13 +312,27 @@ async def list_runs(
 
     Admins see all executions; regular users see only their own.
     """
-    total = await db.count_runs(auth_context=auth_context)
+    total = cast(int, await execution_manager.await_jobs_db("run.count", partial(db.count_runs, auth_context=auth_context)))
     start = pagination.start()
     total_pages = pagination.total_pages(total)
     if start >= total and total > 0:
         raise HTTPException(status_code=404, detail="Page number out of range.")
-    executions = list(await db.list_runs(auth_context=auth_context, offset=start, limit=pagination.page_size))
-    details = [_to_run_detail(await service.poll_and_update(e)) for e in executions]
+    executions = list(
+        cast(
+            list[db.RunRecord],
+            await execution_manager.await_jobs_db(
+                "run.list", partial(db.list_runs, auth_context=auth_context, offset=start, limit=pagination.page_size)
+            ),
+        )
+    )
+    details = []
+    for e in executions:
+        try:
+            details.append(_to_run_detail(await _poll_run(e)))
+        except RunNotFound:
+            continue  # NOTE deleted while we were polling
+        except RunConcurrencyIssue as ex:
+            raise HTTPException(status_code=503, detail=str(ex))
     return RunListResponse(runs=details, total=total, page=pagination.page, page_size=pagination.page_size, total_pages=total_pages)
 
 
@@ -273,13 +342,55 @@ async def get_run(
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> RunDetailResponse:
     try:
-        execution = await db.get_run(spec.run_id, spec.attempt_count, auth_context=auth_context)
-        domain_detail = await service.poll_and_update(execution)
+        execution = cast(
+            db.RunRecord,
+            await execution_manager.await_jobs_db(
+                "run.get", partial(db.get_run, spec.run_id, spec.attempt_count, auth_context=auth_context)
+            ),
+        )
+        domain_detail = await _poll_run(execution, detailed_report=True)
     except RunNotFound:
         raise HTTPException(status_code=404, detail=f"Run {spec.run_id!r} not found.")
     except RunAccessDenied:
         raise HTTPException(status_code=403, detail=f"Access denied to execution {spec.run_id!r}.")
+    except RunConcurrencyIssue as e:
+        raise HTTPException(status_code=503, detail=str(e))
     return _to_run_detail(domain_detail)
+
+
+@router.get("/getCompilationDetail")
+async def get_compilation_detail(
+    spec: Annotated[RunLookup, Depends()],
+    block_id: str | None = None,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> CompilationDetailResponse:
+    """Return task-level compilation detail for a run.
+
+    If ``block_id`` is provided, only tasks belonging to that block are returned.
+    Returns 404 if no compilation detail is available (e.g. run not yet submitted,
+    or cache entry expired), 403/404 if the run is not accessible to the caller.
+    """
+    await _resolve_run_record(spec, auth_context)
+    try:
+        detail = retrieve_compilation_detail(spec.run_id)
+    except CompilationDetailNotFound:
+        raise HTTPException(status_code=404, detail=f"Compilation detail for run {spec.run_id!r} not found.")
+    except CompilationDetailCorrupted:
+        raise HTTPException(status_code=500, detail=f"Compilation detail for run {spec.run_id!r} is corrupted.")
+    task_detail = detail.task_detail
+    if block_id is not None:
+        filter_block = BlockInstanceId(block_id)  # ty: ignore[invalid-argument-type]
+        task_detail = {k: v for k, v in task_detail.items() if v.block == filter_block}
+    tasks = [
+        CompilationDetailTask(
+            task_id=task_id,
+            block=td.block,
+            display_name=td.display_name,
+            parents=td.parents,
+        )
+        for task_id, td in task_detail.items()
+    ]
+    return CompilationDetailResponse(tasks=tasks)
 
 
 @router.post("/delete")
@@ -287,39 +398,70 @@ async def delete_run(
     request: RunDeleteRequest,
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> None:
-    """Delete an execution from the database and cascade.
+    """Delete a completed, failed or stopped run from the database, and its datasets from cascade.
 
-    ``attempt_count`` must match the current latest attempt to prevent races.
-    Returns 409 if it does not match.
+    A run in any other status is refused with 409, it needs to be stopped first.
+    """
+    spec = RunLookup(run_id=request.run_id, attempt_count=request.attempt_count)
+    run_record = await _resolve_run_record(spec, auth_context)
+    try:
+        stop.ensure_deletable(run_record)
+    except RunNotDeletable as e:
+        raise HTTPException(409, str(e))
+    if run_record.cascade_job_id is not None:
+        try:
+            # NOTE errors reported by gateway are ignored, most likely the job has been evicted already.
+            # A timeout, such as due to a busy gateway, is reported, and we dont delete the db entity to not increase inconsistency
+            await execution_manager.awaitable_submit(
+                ConcurrentPools.General, TaskName("run.delete.datasets"), partial(delete_cascade_datasets, run_record.cascade_job_id)
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Job deletion failed: {e}")
+    try:
+        await execution_manager.await_jobs_db(
+            "run.delete", partial(stop.soft_delete_run_cas, request.run_id, request.attempt_count, auth_context=auth_context)
+        )
+    except RunNotFound:
+        # NOTE could only happen in a double delete which is from caller's PoV ok
+        logger.warning(f"presumably double delete on {request=}, ignoring")
+    except RunAccessDenied:
+        raise HTTPException(status_code=403, detail=f"Access denied to execution {spec.run_id!r}.")
+    except RunNotDeletable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.post("/stop")
+async def stop_run(
+    request: RunStopRequest,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> None:
+    """Request stopping of a run that has not completed, failed, or been stopped yet.
+
+    The run is marked `stopping`, and the actual termination in cascade is enqueued and happens
+    in the background. The run becomes `stopped` once cascade confirms, which is reconciled
+    by the status polling. Stopping a run that is already stopping or stopped is accepted.
+    Returns 409 for a run in a status that does not allow stopping.
     """
     try:
-        current = await db.get_run(request.run_id, auth_context=auth_context)
+        run_record = cast(
+            db.RunRecord,
+            await execution_manager.await_jobs_db(
+                "run.stop", partial(stop.stop_run, request.run_id, request.attempt_count, auth_context=auth_context)
+            ),
+        )
     except RunNotFound:
         raise HTTPException(status_code=404, detail=f"Run {request.run_id!r} not found.")
     except RunAccessDenied:
         raise HTTPException(status_code=403, detail=f"Access denied to execution {request.run_id!r}.")
-    if cast(int, current.attempt_count) != request.attempt_count:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Attempt count conflict for execution {request.run_id!r}: "
-                f"expected {request.attempt_count}, current is {current.attempt_count}."
-            ),
-        )
-    spec = RunLookup(run_id=request.run_id, attempt_count=request.attempt_count)
-    _, cascade_job_id = await _resolve_run_with_cascade(spec, auth_context)
-    try:
-        client.request_response(
-            api.ResultDeletionRequest(datasets={cascade_job_id: []}),  # type: ignore[invalid-argument-type]
-            f"{config.cascade.cascade_url}",
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Job deletion failed: {e}")
-    finally:
+    except RunNotStoppable as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if run_record.status == "stopping" and run_record.cascade_job_id is not None:
+        # NOTE if there is no cascade_job_id yet, the background submission checks for the stopping status once it has one
         try:
-            await db.soft_delete_run(request.run_id, auth_context=auth_context)
-        except (RunNotFound, RunAccessDenied):
-            pass
+            stop.submit_stop_cascade(request.run_id, request.attempt_count, run_record.cascade_job_id)
+        except SubmissionRejected as e:
+            # NOTE the run stays stopping, and gets the stop re-issued during polling
+            raise HTTPException(status_code=503, detail=f"Stop was recorded but could not be enqueued: {e}")
 
 
 @router.post("/restart")
@@ -333,12 +475,14 @@ async def restart_run(
     Returns 409 if it does not match.
     """
     try:
-        current = await db.get_run(request.run_id, auth_context=auth_context)
+        current = cast(
+            db.RunRecord, await execution_manager.await_jobs_db("run.get", partial(db.get_run, request.run_id, auth_context=auth_context))
+        )
     except RunNotFound:
         raise HTTPException(status_code=404, detail=f"Run {request.run_id!r} not found.")
     except RunAccessDenied:
         raise HTTPException(status_code=403, detail=f"Access denied to execution {request.run_id!r}.")
-    if cast(int, current.attempt_count) != request.attempt_count:
+    if current.attempt_count != request.attempt_count:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -369,20 +513,49 @@ async def get_run_output_content(
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> Response:
     """Retrieve the result of a specific output task, encoded as bytes."""
-    _, cascade_job_id = await _resolve_run_with_cascade(spec, auth_context)
-    response = client.request_response(
-        api.ResultRetrievalRequest(job_id=JobId(cascade_job_id), dataset_id=DatasetId(task=TaskId(dataset_id), output="0")),
-        f"{config.cascade.cascade_url}",
-    )
-    response = cast(api.ResultRetrievalResponse, response)
-    if response.error:
-        raise HTTPException(500, f"Result retrieval failed: {response.error}")
+    execution = await _resolve_run_record(spec, auth_context)
+    decoded, mime_type = await _retrieve_output_bytes(execution, spec, dataset_id)
+    return Response(decoded, media_type=mime_type)
+
+
+@router.get("/outputZipped")
+async def get_run_output_zipped(
+    spec: Annotated[RunLookup, Depends()],
+    dataset_id: str,
+    auth_context: AuthContext = Depends(get_auth_context),
+) -> Response:
+    """Retrieve a fetchable output, ie, one whose value is a path to a file or a directory tree, as a zip archive.
+
+    The archive is named after the last component of the path, and contains that file, or the whole directory
+    tree below it with relative paths preserved. Returns 400 if the output is not of a fetchable mime type.
+    """
+    execution = await _resolve_run_record(spec, auth_context)
+    if execution.cascade_job_id is None:
+        raise HTTPException(status_code=409, detail=f"Run {spec.run_id!r} has not been submitted to cascade yet.")
+    char_result = service.get_characteristic_of_output(execution, DatasetId(task=TaskId(dataset_id), output="0"))
+    if char_result.t is None:
+        raise HTTPException(500, f"Result mime lookup failed: {char_result.e}")
+    if not char_result.t.fetchable:
+        raise HTTPException(400, f"Output {dataset_id!r} of mime type {char_result.t.mime_type!r} is not fetchable as a zip.")
+    decoded, _ = await _retrieve_output_bytes(execution, spec, dataset_id)
     try:
-        bytez, media_type = encode_result(response)
+        path_str = decoded.decode(get_encoding(char_result.t.mime_type)).strip()
     except Exception as e:
-        logger.exception("decoding failure")
-        raise HTTPException(500, f"Result decoding failed: {repr(e)}")
-    return Response(bytez, media_type=media_type)
+        raise HTTPException(500, f"Output path decoding failed: {e}")
+    if path_str.startswith("file://"):
+        path_str = path_str[len("file://") :]
+    try:
+        archive, root_name = await get_output_archive(pathlib.Path(path_str))
+    except OutputPathNotFound:
+        raise HTTPException(status_code=404, detail=f"Output path {path_str!r} does not exist.")
+    except RunLogsArchiveFailed as e:
+        return Response(content=repr(e.__cause__ or e), status_code=500, media_type="text/plain")
+    return Response(
+        content=archive,
+        status_code=200,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{root_name}.zip"'},
+    )
 
 
 @router.get("/logs")
@@ -391,6 +564,12 @@ async def get_run_logs(
     auth_context: AuthContext = Depends(get_auth_context),
 ) -> Response:
     """Return a zip archive of logs for the given execution attempt."""
-    db_entity, cascade_job_id = await _resolve_run_with_cascade(spec, auth_context)
-    entity_dict = {col.name: getattr(db_entity, col.name) for col in db_entity.__table__.columns}
-    return await _build_run_logs_response(cascade_job_id, orjson.dumps(entity_dict))
+    logger.info("will fetch logs for {spec=}")  # NOTE we log this at info to include this line in the output even if debug=off
+    run_record = await _resolve_run_record(spec, auth_context)
+    if run_record.cascade_job_id is None:
+        raise HTTPException(status_code=409, detail=f"Run {spec.run_id!r} has not been submitted to cascade yet.")
+    try:
+        archive = await get_run_logs_archive(run_record)
+    except RunLogsArchiveFailed as e:
+        return Response(content=repr(e.__cause__ or e), status_code=500, media_type="text/plain")
+    return Response(content=archive, status_code=200, media_type="application/zip")

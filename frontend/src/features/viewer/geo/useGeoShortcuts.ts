@@ -1,0 +1,228 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * Compare-viewer keyboard shortcuts (TanStack Hotkeys, plain keys, never
+ * inside form fields):
+ *   B          toggle both sidebars
+ *   1–5        switch comparison mode
+ *   F          fit view
+ *   C          copy the view to the clipboard
+ *   E          export dialog
+ *   H          help dialog
+ *   ?          show the toolbar's keys until the next key or click
+ *   N          toggle the annotate tool (Esc disarms)
+ *   W/A/S/D    pan the map (arrow keys too)
+ *   + / -      zoom in / out one step
+ * Space (flicker) and hold-Z (loupe) live with their features; the swipe
+ * divider consumes its own arrow keys while focused (the pan guard
+ * yields to it).
+ */
+
+import { useCallback, useEffect, useEffectEvent, useState } from 'react'
+import { formatForDisplay, useHotkey } from '@tanstack/react-hotkeys'
+import { NAV_ZOOM_STEP } from './map-nav'
+import { COMPARE_MODES } from './types'
+import type { DisplayHotkey } from '@tanstack/react-hotkeys'
+import type { CompareMode } from './types'
+import { isTextEntry, useHoldPan } from '@/hooks/useHoldPan'
+
+/** The viewer's keymap — badges, tooltips, and help all render from it. */
+export const COMPARE_KEYS = {
+  sidebars: 'B',
+  fit: 'F',
+  projection: 'P',
+  copy: 'C',
+  export: 'E',
+  help: 'H',
+  badges: '?',
+  annotate: 'N',
+  /** Hold-to-magnify (handled in LoupeOverlay, not via useHotkey). */
+  loupe: 'Z',
+  modes: ['1', '2', '3', '4', '5'],
+  pan: ['W', 'A', 'S', 'D'],
+  /** Play/pause the shared time axis (raw handler; flicker mode keeps Space). */
+  play: 'Space',
+  /** Previous/next time step (raw handler, as the transport buttons). */
+  step: [',', '.'],
+  /** Raw keydown, not useHotkey: '+' needs Shift on some layouts, which hotkey matching rejects. */
+  zoom: ['+', '-'],
+} as const
+
+const ZOOM_DIRECTION: Partial<Record<string, number>> = {
+  '+': 1,
+  '=': 1,
+  '-': -1,
+  _: -1,
+}
+
+const ARROW_KEYS = new Set(['arrowup', 'arrowdown', 'arrowleft', 'arrowright'])
+
+/**
+ * Viewer keys yield to the focused widget that uses them: every key inside
+ * open selects/menus (typeahead) and dialogs, only arrows inside a slider
+ * (swipe divider, time track, range inputs). Text fields: see isTextEntry.
+ */
+export function viewerKeyBlocked(key: string): boolean {
+  const el = document.activeElement
+  if (!el || el === document.body) return false
+  if (
+    el.closest(
+      '[role="listbox"], [role="option"], [role="menu"], [role="dialog"]',
+    )
+  ) {
+    return true
+  }
+  return (
+    ARROW_KEYS.has(key.toLowerCase()) &&
+    el.closest('[role="slider"], input[type="range"]') !== null
+  )
+}
+
+/** Letter keys yield to open dialogs — C must not copy behind a modal. */
+export function dialogOpen(): boolean {
+  return (
+    document.querySelector('[role="dialog"], [role="alertdialog"]') !== null
+  )
+}
+
+/** Platform-aware display label for a hotkey (TanStack formatting). */
+export function keyLabel(hotkey: DisplayHotkey): string {
+  return formatForDisplay(hotkey)
+}
+
+export function useGeoShortcuts(handlers: {
+  onToggleSidebars: () => void
+  onMode: (mode: CompareMode) => void
+  onFit: (() => void) | null
+  /** Next available map projection. */
+  onProjectionCycle: () => void
+  onCopy: () => void
+  onExport: () => void
+  onHelp: () => void
+  onToggleBadges: () => void
+  onAnnotate: () => void
+  /** Disarm the annotate tool; active only while it's armed (and the
+   *  editor dialog is closed — the dialog owns Escape when open). */
+  onAnnotateDisarm: { enabled: boolean; disarm: () => void }
+  /** Pan the shared camera by (dx, dy) screen pixels. */
+  onPan: (dx: number, dy: number) => void
+  /** Zoom the shared camera by `delta` levels. */
+  onZoom: (delta: number) => void
+}): void {
+  const {
+    onToggleSidebars,
+    onMode,
+    onFit,
+    onProjectionCycle,
+    onCopy,
+    onExport,
+    onHelp,
+    onToggleBadges,
+    onAnnotate,
+    onAnnotateDisarm,
+    onPan,
+    onZoom,
+  } = handlers
+  const opts = { ignoreInputs: true }
+  const gated = (fn: () => void) => () => {
+    if (!dialogOpen()) fn()
+  }
+
+  useHotkey(COMPARE_KEYS.sidebars, gated(onToggleSidebars), opts)
+  useHotkey(
+    COMPARE_KEYS.modes[0],
+    gated(() => onMode(COMPARE_MODES[0])),
+    opts,
+  )
+  useHotkey(
+    COMPARE_KEYS.modes[1],
+    gated(() => onMode(COMPARE_MODES[1])),
+    opts,
+  )
+  useHotkey(
+    COMPARE_KEYS.modes[2],
+    gated(() => onMode(COMPARE_MODES[2])),
+    opts,
+  )
+  useHotkey(
+    COMPARE_KEYS.modes[3],
+    gated(() => onMode(COMPARE_MODES[3])),
+    opts,
+  )
+  useHotkey(
+    COMPARE_KEYS.modes[4],
+    gated(() => onMode(COMPARE_MODES[4])),
+    opts,
+  )
+  useHotkey(
+    COMPARE_KEYS.fit,
+    gated(() => onFit?.()),
+    opts,
+  )
+  useHotkey(COMPARE_KEYS.projection, gated(onProjectionCycle), opts)
+  useHotkey(COMPARE_KEYS.copy, gated(onCopy), opts)
+  useHotkey(COMPARE_KEYS.export, gated(onExport), opts)
+  useHotkey(COMPARE_KEYS.help, gated(onHelp), opts)
+  useHotkey(COMPARE_KEYS.badges, gated(onToggleBadges), opts)
+  useHotkey(COMPARE_KEYS.annotate, gated(onAnnotate), opts)
+  useHotkey('Escape', () => onAnnotateDisarm.disarm(), {
+    ...opts,
+    enabled: onAnnotateDisarm.enabled,
+  })
+  useHoldPan(onPan, { arrows: true, isBlocked: viewerKeyBlocked })
+
+  // One step per press, flat or globe: key repeat is ignored.
+  const zoomKey = useEffectEvent((e: KeyboardEvent) => {
+    const direction = ZOOM_DIRECTION[e.key]
+    if (!direction || e.repeat || e.metaKey || e.ctrlKey || e.altKey) return
+    if (isTextEntry(e.target)) return
+    if (viewerKeyBlocked(e.key) || dialogOpen()) return
+    e.preventDefault()
+    onZoom(direction * NAV_ZOOM_STEP)
+  })
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => zoomKey(e)
+    window.addEventListener('keydown', down)
+    return () => window.removeEventListener('keydown', down)
+  }, [])
+}
+
+/** The toggle itself and bare modifiers (Shift types `?`) keep the badges up. */
+const KEEPS_BADGES = new Set([
+  '?',
+  'Shift',
+  'Meta',
+  'Control',
+  'Alt',
+  'AltGraph',
+])
+
+/** `?` toggles the toolbar's key badges; the next key, click or blur hides them and still acts. */
+export function useKeyBadges(): { shown: boolean; toggle: () => void } {
+  const [shown, setShown] = useState(false)
+  useEffect(() => {
+    if (!shown) return
+    const hide = () => setShown(false)
+    const key = (e: KeyboardEvent) => {
+      if (!KEEPS_BADGES.has(e.key)) hide()
+    }
+    window.addEventListener('keydown', key, true)
+    window.addEventListener('pointerdown', hide, true)
+    window.addEventListener('blur', hide)
+    return () => {
+      window.removeEventListener('keydown', key, true)
+      window.removeEventListener('pointerdown', hide, true)
+      window.removeEventListener('blur', hide)
+    }
+  }, [shown])
+  const toggle = useCallback(() => setShown((v) => !v), [])
+  return { shown, toggle }
+}

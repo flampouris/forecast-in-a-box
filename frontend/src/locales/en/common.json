@@ -1,5 +1,11 @@
 {
   "loading": "Loading...",
+  "split": {
+    "hint": "Drag or select to resize",
+    "resize": "Resize panels",
+    "moveLeft": "Move divider left",
+    "moveRight": "Move divider right"
+  },
   "error": "Error",
   "retry": "Retry",
   "cancel": "Cancel",
@@ -15,12 +21,16 @@
   "search": "Search",
   "filter": "Filter",
   "clear": "Clear",
+  "removeTag": "Remove {{tag}}",
   "yes": "Yes",
   "no": "No",
+  "appName": "Forecast-in-a-Box",
+  "logoAlt": "Forecast-in-a-Box logo",
+  "spinnerLabel": "Loading",
   "activity": {
-    "label": "Notification Center",
-    "title": "Notification Center",
-    "help": "Shows long-running tasks such as model downloads, plugin installations, and forecast job executions. Completed items stay here until you dismiss them.",
+    "label": "Notification centre",
+    "title": "Notification centre",
+    "help": "Shows long-running tasks such as model downloads, plugin installations, and forecast runs. Completed items stay here until you dismiss them.",
     "clear": "Clear",
     "clearAll": "Clear all",
     "empty": "No notifications",
@@ -31,28 +41,237 @@
     "filterPlaceholder": "Filter notifications…",
     "noMatches": "No matches",
     "dismiss": "Dismiss",
-    "viewAll": "Open executions"
+    "viewAll": "Open runs",
+    "downloadStarting": "Starting download...",
+    "downloadProgress": "Downloading {{progress}}%",
+    "downloadComplete": "Download complete",
+    "downloadFailed": "Failed: {{error}}",
+    "jobLabel": "Run {{id}}",
+    "jobCompleted": "Completed",
+    "jobStopped": "Stopped",
+    "jobFailed": "Failed: {{error}}",
+    "unknownError": "Unknown error"
   },
   "nav": {
     "label": "Main navigation",
     "overview": "Overview",
-    "configuration": "Configuration",
-    "executions": "Executions"
+    "configuration": "Configure",
+    "executions": "Execute",
+    "visualise": "Visualise"
   },
   "status": {
-    "title": "System Status",
-    "allSystemsNormal": "All Systems Normal",
-    "partialOutage": "Partial Outage",
-    "systemOutage": "System Outage",
+    "title": "System status",
+    "allSystemsNormal": "All systems normal",
+    "partialOutage": "Partial outage",
+    "systemOutage": "System outage",
     "components": "Components",
     "componentUp": "Online",
     "componentDown": "Offline",
     "componentOff": "Disabled",
-    "apiServer": "API Server",
+    "apiServer": "API server",
     "cascade": "Cascade",
-    "ecmwfData": "ECMWF Data",
+    "ecmwfData": "ECMWF data",
     "scheduler": "Scheduler",
-    "refresh": "Refresh Status",
-    "lastUpdated": "Last updated"
+    "plugins": "Plugins",
+    "concurrency": "Concurrency",
+    "refresh": "Refresh status",
+    "lastUpdated": "Last updated",
+    "componentInitializing": "Loading"
+  },
+  "pagination": {
+    "first": "First page",
+    "previous": "Previous",
+    "next": "Next",
+    "last": "Last page",
+    "page": "Page {{current}} of {{total}}"
+  },
+  "splash": {
+    "loading": "Loading configuration",
+    "loadingHint": "Please wait while we set up the application",
+    "errorTitle": "Configuration error",
+    "errorIntro": "Failed to load application configuration:",
+    "errorHint": "If the problem persists, please contact support."
+  },
+  "header": {
+    "home": "home",
+    "about": "About",
+    "openMenu": "Open menu",
+    "closeMenu": "Close menu",
+    "login": "Sign in",
+    "logout": "Sign out",
+    "getStarted": "Get started"
+  },
+  "footer": {
+    "copyright": "© European Centre for Medium-Range Weather Forecasts",
+    "help": "Help",
+    "about": "About",
+    "logoEcmwf": "ECMWF",
+    "logoDestinationEarth": "Destination Earth",
+    "logoEu": "European Union",
+    "memberStates": "Flags of the ECMWF member and co-operating states"
+  },
+  "userMenu": {
+    "dashboard": "Overview",
+    "help": "Help",
+    "settings": "Settings",
+    "view": "View",
+    "theme": "Theme",
+    "themeLight": "Light",
+    "themeDark": "Dark",
+    "themeSystem": "System",
+    "timezone": "Timezone",
+    "welcomeTour": "Show welcome tour",
+    "helpSupport": "Help & support",
+    "documentation": "Documentation",
+    "account": "Account",
+    "profile": "Profile",
+    "userFallback": "User",
+    "administration": "Administration",
+    "plugins": "Plugins",
+    "artifacts": "ML models",
+    "globalVariables": "Global variables",
+    "signOut": "Sign out",
+    "timezoneDialogTitle": "Application timezone",
+    "timezoneDialogDescription": "All dates and times — including forecast base times — are shown and entered in this timezone. Defaults to UTC.",
+    "schedules": "Schedules",
+    "ecmwfKey": "ECMWF API key",
+    "ecmwfKeySet": "set"
+  },
+  "commandPalette": {
+    "title": "Command palette",
+    "description": "Search for a command to run...",
+    "placeholder": "Search pages, workflows, runs and blocks...",
+    "empty": "No results found.",
+    "navigate": "navigate",
+    "select": "select",
+    "close": "close",
+    "esc": "Esc",
+    "open": "Search and commands"
+  },
+  "commands": {
+    "newConfiguration": {
+      "label": "New workflow",
+      "description": "Start from a blank canvas"
+    },
+    "categoryGettingStarted": "Getting started",
+    "categoryNavigation": "Navigation",
+    "dashboard": {
+      "label": "Overview",
+      "description": "Go to the overview"
+    },
+    "configure": {
+      "label": "Configure",
+      "description": "Build a new workflow"
+    },
+    "executions": {
+      "label": "Execute",
+      "description": "Monitor forecast runs"
+    },
+    "admin": {
+      "label": "Administration",
+      "description": "Manage plugins and models"
+    },
+    "visualise": {
+      "label": "Visualise",
+      "description": "View and compare geo outputs on a map"
+    },
+    "categoryPresets": "Workflows",
+    "categoryRuns": "Recent runs",
+    "categoryBlocks": "Blocks",
+    "preset": {
+      "description": "Open in Configure"
+    },
+    "template": {
+      "description": "Workflow template"
+    },
+    "run": {
+      "untitled": "Untitled run"
+    },
+    "addBlock": {
+      "description": "Add to the canvas"
+    }
+  },
+  "timezone": {
+    "searchPlaceholder": "Search timezone…",
+    "searchLabel": "Search timezone",
+    "listLabel": "Timezones",
+    "empty": "No timezone found.",
+    "browser": "· Browser"
+  },
+  "dateTimeField": {
+    "timeLabel": "Time",
+    "timezoneTooltip": "Times are in {{timeZone}}"
+  },
+  "field": {
+    "selectPlaceholder": "Select an option...",
+    "addItemPlaceholder": "Add item...",
+    "noMatches": "No matches",
+    "staleValue": "{{value}} is no longer offered by the input. Remove it."
+  },
+  "geoDomain": {
+    "placeholder": "Select an area…",
+    "autoLabel": "Auto",
+    "autoHint": "Use the area the data covers",
+    "empty": "No area selected",
+    "tabPresets": "Presets",
+    "tabCountries": "Countries",
+    "tabMap": "Map",
+    "tabAdvanced": "Advanced",
+    "searchCountries": "Search countries…",
+    "noCountries": "No matching countries",
+    "modeSelect": "Countries",
+    "modeDraw": "Box",
+    "selectHint": "Click a country to add or remove it.",
+    "drawHint": "Drag to draw a box. Drag its handles to resize, or the box itself to move it.",
+    "bordersApprox": "Borders are approximate.",
+    "expand": "Expand map",
+    "collapse": "Collapse map",
+    "clear": "Clear",
+    "clearHint": "Clear (or press Delete)",
+    "boxSummary": "Box: {{west}}, {{south}}, {{east}}, {{north}}",
+    "advancedHint": "Enter a region, comma-separated countries, a bounding box in degrees (west,south,east,north), or a ${variable}."
+  },
+  "grid": {
+    "placeholder": "Select a grid…",
+    "search": "Search or type a grid",
+    "keep": "Keep input grid",
+    "latlon": "{{resolution}} lat/lon",
+    "degrees": "{{value}}°",
+    "pair": "{{dx}}° × {{dy}}°",
+    "spacing": "~{{km}} km",
+    "points": "{{count}} points",
+    "pointsApprox": "~{{count}} points",
+    "pointsGlobal": "Point counts are for the whole globe, before the domain cut-out",
+    "groupCustom": "Your entry",
+    "groupLatlon": "Regular lat/lon",
+    "groupOctahedral": "Octahedral Gaussian",
+    "groupReduced": "Reduced Gaussian",
+    "groupRegular": "Regular Gaussian",
+    "error": {
+      "notGrid": "Not a grid. Use a resolution such as 0.25, a pair such as 0.25/0.5, a Gaussian grid such as O96, or auto.",
+      "tooManyParts": "Use at most two resolutions: west-east/south-north.",
+      "notPositive": "{{resolution}} is not a positive number of degrees.",
+      "tooFine": "{{resolution}} is finer than the minimum of {{min}}°.",
+      "gaussianNumber": "The Gaussian grid number must be one of {{numbers}}.",
+      "leadingZeros": "Write the Gaussian grid number without leading zeros, as in O96."
+    }
+  },
+  "notificationBanner": {
+    "dismiss": "Dismiss notification"
+  },
+  "coreVersionMismatch": {
+    "label": "Core version mismatch",
+    "detail": "Built with fiab-core v{{stored}}; you're running v{{current}}. It should still work, but may behave unexpectedly.",
+    "detailUnknown": "This workflow was created with a different fiab-core major version. It should still work, but may behave unexpectedly."
+  },
+  "catalogue": {
+    "viewTable": "Table view",
+    "viewCard": "Card view",
+    "noMatches": "Nothing matches these filters",
+    "noMatchesHint": "Try another search term or status.",
+    "clearFilters": "Clear filters",
+    "sortBy": "Sort by",
+    "sortedAsc": "Sorted ascending",
+    "sortedDesc": "Sorted descending"
   }
 }

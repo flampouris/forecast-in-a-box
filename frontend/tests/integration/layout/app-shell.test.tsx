@@ -13,7 +13,7 @@
  *
  * Tests the layout components:
  * - PublicLayout renders header, content, and footer
- * - Footer renders expected links
+ * - Footer renders partner logos and external links
  * - Header renders logo and navigation
  */
 
@@ -54,7 +54,7 @@ describe('Layout', () => {
         .toHaveTextContent('Hello World')
     })
 
-    it('renders footer with expected links', async () => {
+    it('renders footer with partner logos', async () => {
       const screen = await renderWithRouter(
         <AuthContext.Provider value={anonymousAuth}>
           <PublicLayout>
@@ -63,8 +63,17 @@ describe('Layout', () => {
         </AuthContext.Provider>,
       )
 
-      await expect.element(screen.getByText('ECMWF')).toBeVisible()
-      await expect.element(screen.getByText('Destination Earth')).toBeVisible()
+      // Exact: the member-states strip's alt also contains "ECMWF".
+      await expect
+        .element(screen.getByAltText('ECMWF', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByAltText('Destination Earth'))
+        .toBeVisible()
+      await expect.element(screen.getByAltText('European Union')).toBeVisible()
+      await expect
+        .element(screen.getByAltText(/member and co-operating states/))
+        .toBeVisible()
     })
   })
 
@@ -114,8 +123,14 @@ describe('Layout', () => {
         </AuthContext.Provider>,
       )
 
-      const ecmwfLink = screen.getByText('ECMWF')
-      await expect.element(ecmwfLink).toBeVisible()
+      const ecmwfLink = screen.getByRole('link', { name: 'ECMWF' })
+      await expect
+        .element(ecmwfLink)
+        .toHaveAttribute('href', 'https://www.ecmwf.int/')
+      await expect.element(ecmwfLink).toHaveAttribute('target', '_blank')
+      await expect
+        .element(ecmwfLink)
+        .toHaveAttribute('rel', 'noopener noreferrer')
     })
 
     it('renders footer landmark', async () => {

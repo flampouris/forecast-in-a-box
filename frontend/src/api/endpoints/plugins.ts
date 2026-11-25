@@ -18,33 +18,21 @@
 import type {
   PluginCompositeId,
   PluginListing,
-  PluginsStatus,
+  PluginSettingsUpdate,
+  TemplateExampleValues,
 } from '@/api/types/plugins.types'
 import { apiClient } from '@/api/client'
 import { API_ENDPOINTS } from '@/api/endpoints'
 import {
   PluginListingSchema,
-  PluginsStatusSchema,
+  TemplateExampleValuesSchema,
 } from '@/api/types/plugins.types'
 
 /**
- * Get plugin system status
- */
-export async function getPluginStatus(): Promise<PluginsStatus> {
-  return apiClient.get(API_ENDPOINTS.plugin.status, {
-    schema: PluginsStatusSchema,
-  })
-}
-
-/**
  * Get all plugin details
- * @param forceRefresh - If true, forces a refresh from the backend
  */
-export async function getPluginDetails(
-  forceRefresh?: boolean,
-): Promise<PluginListing> {
-  return apiClient.get(API_ENDPOINTS.plugin.details, {
-    params: forceRefresh ? { forceRefresh: 'true' } : undefined,
+export async function getPluginList(): Promise<PluginListing> {
+  return apiClient.get(API_ENDPOINTS.plugin.list, {
     schema: PluginListingSchema,
   })
 }
@@ -80,35 +68,55 @@ export async function updatePlugin(
 }
 
 /**
- * Modify plugin enabled state (enable or disable)
+ * Update plugin settings (enabled flag, template exclusions, glyph remapping)
  * @param compositeId - The plugin composite ID { store, local }
- * @param isEnabled - Whether to enable (true) or disable (false) the plugin
+ * @param settings - Fields to change; omitted fields stay unchanged
  */
-export async function modifyPluginEnabled(
+export async function updatePluginSettings(
   compositeId: PluginCompositeId,
-  isEnabled: boolean,
+  settings: PluginSettingsUpdate,
 ): Promise<void> {
-  await apiClient.post(API_ENDPOINTS.plugin.modifyEnabled, compositeId, {
-    params: { isEnabled: String(isEnabled) },
+  await apiClient.post(API_ENDPOINTS.plugin.settings, {
+    pluginCompositeId: compositeId,
+    ...settings,
   })
 }
 
 /**
- * Enable a plugin (convenience wrapper for modifyPluginEnabled)
+ * Get example values/glyphs for a blueprint template from a loaded plugin
+ * @param compositeId - The plugin composite ID { store, local }
+ * @param displayName - The template's display name within the plugin
+ */
+export async function getTemplateExampleValues(
+  compositeId: PluginCompositeId,
+  displayName: string,
+): Promise<TemplateExampleValues> {
+  return apiClient.get(API_ENDPOINTS.plugin.templateExampleValues, {
+    params: {
+      store: compositeId.store,
+      local: compositeId.local,
+      displayName,
+    },
+    schema: TemplateExampleValuesSchema,
+  })
+}
+
+/**
+ * Enable a plugin (convenience wrapper for updatePluginSettings)
  * @param compositeId - The plugin composite ID { store, local }
  */
 export async function enablePlugin(
   compositeId: PluginCompositeId,
 ): Promise<void> {
-  await modifyPluginEnabled(compositeId, true)
+  await updatePluginSettings(compositeId, { isEnabled: true })
 }
 
 /**
- * Disable a plugin (convenience wrapper for modifyPluginEnabled)
+ * Disable a plugin (convenience wrapper for updatePluginSettings)
  * @param compositeId - The plugin composite ID { store, local }
  */
 export async function disablePlugin(
   compositeId: PluginCompositeId,
 ): Promise<void> {
-  await modifyPluginEnabled(compositeId, false)
+  await updatePluginSettings(compositeId, { isEnabled: false })
 }

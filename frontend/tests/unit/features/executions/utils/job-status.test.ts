@@ -19,29 +19,36 @@ const ALL_STATUSES: Array<JobStatus> = [
   'submitted',
   'preparing',
   'running',
+  'stopping',
+  'stopped',
   'completed',
   'failed',
 ]
 
 describe('getStatusBadgeClasses', () => {
-  it('returns blue classes for submitted', () => {
-    expect(getStatusBadgeClasses('submitted')).toContain('bg-blue-100')
+  it('returns amber classes for submitted', () => {
+    expect(getStatusBadgeClasses('submitted')).toContain('bg-amber-100')
   })
 
-  it('returns blue classes for preparing', () => {
-    expect(getStatusBadgeClasses('preparing')).toContain('bg-blue-100')
+  it('returns amber classes for preparing', () => {
+    expect(getStatusBadgeClasses('preparing')).toContain('bg-amber-100')
   })
 
-  it('returns amber classes for running', () => {
-    expect(getStatusBadgeClasses('running')).toContain('bg-amber-100')
+  it('returns brand-blue classes for running', () => {
+    expect(getStatusBadgeClasses('running')).toContain('bg-primary/10')
   })
 
-  it('returns green classes for completed', () => {
-    expect(getStatusBadgeClasses('completed')).toContain('bg-green-100')
+  it('returns emerald classes for completed', () => {
+    expect(getStatusBadgeClasses('completed')).toContain('bg-emerald-100')
   })
 
   it('returns red classes for failed', () => {
-    expect(getStatusBadgeClasses('failed')).toContain('bg-red-100')
+    expect(getStatusBadgeClasses('failed')).toContain('bg-red-50')
+  })
+
+  it('keeps stopping and stopped neutral, not red', () => {
+    expect(getStatusBadgeClasses('stopping')).toContain('bg-slate-100')
+    expect(getStatusBadgeClasses('stopped')).toContain('bg-slate-100')
   })
 
   it('returns a non-empty string for every status', () => {
@@ -52,16 +59,16 @@ describe('getStatusBadgeClasses', () => {
 })
 
 describe('getStatusBarColor', () => {
-  it('returns blue bar for submitted', () => {
-    expect(getStatusBarColor('submitted')).toBe('bg-blue-500')
+  it('returns amber bar for submitted', () => {
+    expect(getStatusBarColor('submitted')).toBe('bg-amber-500')
   })
 
-  it('returns amber bar for running', () => {
-    expect(getStatusBarColor('running')).toBe('bg-amber-500')
+  it('returns brand-blue bar for running', () => {
+    expect(getStatusBarColor('running')).toBe('bg-primary')
   })
 
-  it('returns green bar for completed', () => {
-    expect(getStatusBarColor('completed')).toBe('bg-green-500')
+  it('returns emerald bar for completed', () => {
+    expect(getStatusBarColor('completed')).toBe('bg-emerald-500')
   })
 
   it('returns red bar for failed', () => {

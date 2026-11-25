@@ -18,35 +18,40 @@
 import { z } from 'zod'
 
 /**
- * Composite artifact ID - identifies a model by store and checkpoint
+ * Composite artifact ID - identifies a model by store and local artifact id
  */
 export const CompositeArtifactIdSchema = z.object({
   artifact_store_id: z.string(),
-  ml_model_checkpoint_id: z.string(),
+  artifact_local_id: z.string(),
 })
 
 export type CompositeArtifactId = z.infer<typeof CompositeArtifactIdSchema>
 
+/** Config-value wire form; mirrors `CompositeArtifactId.to_str`. */
+export function artifactIdToWire(id: CompositeArtifactId): string {
+  return `${id.artifact_store_id}:${id.artifact_local_id}`
+}
+
 /**
  * Encode a CompositeArtifactId for use in URL path segments.
- * Format: "storeId--checkpointId"
+ * Format: "storeId--localId"
  */
 export function encodeArtifactId(id: CompositeArtifactId): string {
-  return `${id.artifact_store_id}--${id.ml_model_checkpoint_id}`
+  return `${id.artifact_store_id}--${id.artifact_local_id}`
 }
 
 /**
  * Decode a URL path segment back to a CompositeArtifactId.
- * Expects "storeId--checkpointId" format.
+ * Expects "storeId--localId" format.
  */
 export function decodeArtifactId(encoded: string): CompositeArtifactId {
   const separatorIndex = encoded.indexOf('--')
   if (separatorIndex === -1) {
-    return { artifact_store_id: encoded, ml_model_checkpoint_id: '' }
+    return { artifact_store_id: encoded, artifact_local_id: '' }
   }
   return {
     artifact_store_id: encoded.slice(0, separatorIndex),
-    ml_model_checkpoint_id: encoded.slice(separatorIndex + 2),
+    artifact_local_id: encoded.slice(separatorIndex + 2),
   }
 }
 
@@ -59,16 +64,17 @@ export const MlModelOverviewSchema = z.object({
   display_author: z.string(),
   disk_size_bytes: z.number(),
   supported_platforms: z.array(z.string()),
+  /** Arbitrary key → optional-detail labels from the store catalog. */
+  tags: z.record(z.string(), z.string().nullable()),
   is_available: z.boolean(),
+  is_locally_compatible: z.boolean(),
+  local_compatibility_detail: z.string().nullable(),
 })
 
 export type MlModelOverview = z.infer<typeof MlModelOverviewSchema>
 
 /**
- * Qube node — recursive enumeration tree describing a model's output structure.
- * Backend currently emits this under `output_characteristics` (replacing the legacy
- * list[str] shape) once the matching backend update lands; until then the field
- * still arrives as list[str] and we render the legacy bullet list.
+ * Qube node — recursive enumeration tree describing a model's input/output structure.
  */
 export type QubeNode = {
   key: string
@@ -95,37 +101,18 @@ export const QubeNodeSchema: z.ZodType<QubeNode> = z.lazy(() =>
 )
 
 /**
- * `output_characteristics` accepts either:
- *  - the structured QubeNode (post-backend-update shape), or
- *  - the legacy list[str] (current production backend shape).
- * Order matters in the union — structured first so it matches preferentially.
- */
-export const OutputCharacteristicsSchema = z.union([
-  QubeNodeSchema,
-  z.array(z.string()),
-])
-export type OutputCharacteristics = z.infer<typeof OutputCharacteristicsSchema>
-
-/**
  * ML model detail from detail endpoint (extends overview)
  */
 export const MlModelDetailSchema = MlModelOverviewSchema.extend({
   display_description: z.string(),
   url: z.string(),
   pip_package_constraints: z.array(z.string()),
-  output_characteristics: OutputCharacteristicsSchema,
+  input_qube: QubeNodeSchema,
+  output_qube: QubeNodeSchema,
   input_characteristics: z.array(z.string()),
-  timestep: z.string().optional(),
 })
 
 export type MlModelDetail = z.infer<typeof MlModelDetailSchema>
-
-/** Discriminator: did the backend return the structured qube shape? */
-export function isStructuredQube(
-  characteristics: OutputCharacteristics,
-): characteristics is QubeNode {
-  return !Array.isArray(characteristics)
-}
 
 /**
  * List models response
@@ -136,7 +123,7 @@ export const MlModelListSchema = z.array(MlModelOverviewSchema)
  * Download/delete response
  *
  * Note: The backend returns composite_id as a Python repr string
- * (e.g. "CompositeArtifactId(artifact_store_id='x', ml_model_checkpoint_id='y')")
+ * (e.g. "CompositeArtifactId(artifact_store_id='x', artifact_local_id='y')")
  * via str(), not as a JSON object. We accept it as a string here.
  */
 export const ArtifactActionResponseSchema = z.object({
@@ -171,7 +158,10 @@ export interface ArtifactInfo {
   diskSize: string
   diskSizeBytes: number
   platforms: Array<string>
+  tags: Record<string, string | null>
   isAvailable: boolean
+  isLocallyCompatible: boolean
+  localCompatibilityDetail: string | null
 }
 
 /**
@@ -186,6 +176,60 @@ export function toArtifactInfo(model: MlModelOverview): ArtifactInfo {
     diskSize: formatBytes(model.disk_size_bytes),
     diskSizeBytes: model.disk_size_bytes,
     platforms: model.supported_platforms,
+    tags: model.tags,
     isAvailable: model.is_available,
+    isLocallyCompatible: model.is_locally_compatible,
+    localCompatibilityDetail: model.local_compatibility_detail,
   }
+}
+
+/** Label per wire id; shared display names get the local id appended. */
+export function artifactLabels(
+  artifacts: ReadonlyArray<ArtifactInfo>,
+): ReadonlyMap<string, string> {
+  const nameCounts = new Map<string, number>()
+  for (const { displayName } of artifacts) {
+    nameCounts.set(displayName, (nameCounts.get(displayName) ?? 0) + 1)
+  }
+  return new Map(
+    artifacts.map(({ id, displayName }) => [
+      artifactIdToWire(id),
+      (nameCounts.get(displayName) ?? 0) > 1
+        ? `${displayName} · ${id.artifact_local_id}`
+        : displayName,
+    ]),
+  )
+}
+
+export const MATURITY_TAG = 'maturity'
+// Catalogues still send maturity under this key.
+const LEGACY_MATURITY_TAG = 'status'
+
+/** Tag entries with `status` shown as `maturity`; a `maturity` tag wins. */
+export function displayTags(
+  tags: Record<string, string | null>,
+): Array<[string, string | null]> {
+  return Object.entries(tags).flatMap<[string, string | null]>(
+    ([key, value]) => {
+      if (key !== LEGACY_MATURITY_TAG) return [[key, value]]
+      return Object.hasOwn(tags, MATURITY_TAG) ? [] : [[MATURITY_TAG, value]]
+    },
+  )
+}
+
+/** Display tags other than maturity, keyed as `displayTags` names them. */
+export function nonMaturityTags(
+  tags: Record<string, string | null>,
+): Record<string, string | null> {
+  return Object.fromEntries(
+    displayTags(tags).filter(([key]) => key !== MATURITY_TAG),
+  )
+}
+
+/** Maturity such as `demo`, trimmed and lower case; null when missing or blank. */
+export function artifactMaturity(
+  tags: Record<string, string | null>,
+): string | null {
+  const value = displayTags(tags).find(([key]) => key === MATURITY_TAG)?.[1]
+  return value?.trim().toLowerCase() || null
 }

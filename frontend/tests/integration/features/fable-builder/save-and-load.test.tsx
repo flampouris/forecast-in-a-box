@@ -15,6 +15,7 @@ import { worker } from '@tests/test-extend'
 import { mockSavedFables } from '../../../../mocks/data/fable.data'
 import { FableBuilderPage } from '@/features/fable-builder/components/FableBuilderPage'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
+import { useUiStore } from '@/stores/uiStore'
 import { API_ENDPOINTS } from '@/api/endpoints'
 
 // Mock useMedia to simulate desktop layout (three-column with sidebars)
@@ -47,19 +48,19 @@ function setupFableWithSource(): string {
       source1: {
         factory_id: {
           plugin: { store: 'ecmwf', local: 'ecmwf-base' },
-          factory: 'ekdSource',
+          factory: 'operationalForecastSource',
         },
         configuration_values: {
           source: 'mars',
-          date: '2026-01-01',
-          expver: '0001',
+          forecast: 'aifs-ens',
+          base_time: '2026-01-01T00:00:00',
         },
         input_ids: {},
       },
     },
   })
   // Mark as dirty so save button is relevant
-  store.markDirty()
+  useFableBuilderStore.setState({ isDirty: true })
   return 'source1'
 }
 
@@ -77,7 +78,7 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for catalogue to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Set up a fable with blocks and mark dirty
       setupFableWithSource()
@@ -85,8 +86,8 @@ describe('Fable Builder Save & Load', () => {
       // Verify fable is dirty
       expect(useFableBuilderStore.getState().isDirty).toBe(true)
 
-      // Click "Save Config" to open save popover
-      await screen.getByRole('button', { name: /Save Config/i }).click()
+      // Click "Save workflow" to open save popover
+      await screen.getByRole('button', { name: /Save workflow/i }).click()
 
       // Fill in a title
       const titleInput = screen.getByLabelText('Title')
@@ -121,7 +122,7 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for catalogue to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Set up a fable that is already saved (has fableId)
       setupFableWithSource()
@@ -135,8 +136,8 @@ describe('Fable Builder Save & Load', () => {
         .updateBlockConfig('source1', 'lead_time', '48')
       expect(useFableBuilderStore.getState().isDirty).toBe(true)
 
-      // Button should say "Update Config" since this is an existing config
-      await screen.getByRole('button', { name: /Update Config/i }).click()
+      // Button should say "Update workflow" since this is an existing workflow
+      await screen.getByRole('button', { name: /Update workflow/i }).click()
 
       // Click "Update" in the popover
       await screen.getByRole('button', { name: 'Update', exact: true }).click()
@@ -154,7 +155,7 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for catalogue to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Set up a fable with blocks
       setupFableWithSource()
@@ -169,8 +170,8 @@ describe('Fable Builder Save & Load', () => {
         }),
       )
 
-      // Click "Save Config" to open save popover
-      await screen.getByRole('button', { name: /Save Config/i }).click()
+      // Click "Save workflow" to open save popover
+      await screen.getByRole('button', { name: /Save workflow/i }).click()
 
       // Click "Save" in the popover
       await screen.getByRole('button', { name: 'Save', exact: true }).click()
@@ -188,10 +189,11 @@ describe('Fable Builder Save & Load', () => {
 
   describe('Load configuration from backend', () => {
     it('populates the builder when setFable is called with loaded data', async () => {
+      useUiStore.setState({ timeZone: 'UTC' })
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for catalogue to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Simulate loading a saved fable (as if retrieved from the backend)
       const savedFable = mockSavedFables['fable-001'].fable
@@ -203,8 +205,9 @@ describe('Fable Builder Save & Load', () => {
       expect(Object.keys(state.fable.blocks)).toHaveLength(3)
       expect(state.isDirty).toBe(false)
 
-      // Block count should update in the header
+      // Block count on the canvas; the header shows the blueprint's tags
       await expect.element(screen.getByText('3 blocks')).toBeVisible()
+      await expect.element(screen.getByText('temperature')).toBeVisible()
 
       // Select the source block to see its configuration
       useFableBuilderStore.getState().selectBlock('block_source_1')
@@ -212,13 +215,15 @@ describe('Fable Builder Save & Load', () => {
       // Config panel should show the source block's values
       await expect
         .element(
-          screen.getByRole('heading', { name: 'Earthkit Data Source' }).first(),
+          screen
+            .getByRole('heading', { name: 'Operational forecast source' })
+            .first(),
         )
         .toBeVisible()
 
-      // Expver field (text input) should contain the loaded value
-      const expverInput = screen.getByLabelText('Expver')
-      await expect.element(expverInput).toHaveValue('0001')
+      // Base time date control should contain the loaded date (tz UTC; midnight UTC)
+      const baseTimeInput = screen.getByLabelText('Base time')
+      await expect.element(baseTimeInput).toHaveValue('2024-01-15')
     })
 
     it('handles retrieve error by showing error message', async () => {
@@ -240,11 +245,11 @@ describe('Fable Builder Save & Load', () => {
 
       // When retrieve returns 404, the component shows a not-found message
       await expect
-        .element(screen.getByText('The requested configuration was not found.'))
+        .element(screen.getByText('The requested workflow was not found.'))
         .toBeVisible()
 
       // Should show a link back to the dashboard
-      await expect.element(screen.getByText('Back to Dashboard')).toBeVisible()
+      await expect.element(screen.getByText('Back to Overview')).toBeVisible()
 
       // Store should not have been populated
       const state = useFableBuilderStore.getState()
@@ -258,7 +263,7 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for palette to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Programmatically set a loaded fable (simulating file load via setFable)
       const fileContent = mockSavedFables['fable-002'].fable
@@ -280,7 +285,7 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for palette to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Load a saved fable
       const savedFable = mockSavedFables['fable-001'].fable
@@ -296,7 +301,7 @@ describe('Fable Builder Save & Load', () => {
       useFableBuilderStore.getState().selectBlock('block_source_1')
       useFableBuilderStore
         .getState()
-        .updateBlockConfig('block_source_1', 'expver', '0002')
+        .updateBlockConfig('block_source_1', 'forecast', 'ifs-ens')
 
       // Should now be dirty
       expect(useFableBuilderStore.getState().isDirty).toBe(true)
@@ -313,7 +318,7 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // Wait for palette to load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // Load a saved fable first
       const savedFable = mockSavedFables['fable-001'].fable
@@ -332,11 +337,11 @@ describe('Fable Builder Save & Load', () => {
       expect(Object.keys(state.fable.blocks)).toHaveLength(0)
       expect(state.fableId).toBeNull()
       expect(state.isDirty).toBe(false)
-      expect(state.fableName).toBe('Untitled Configuration')
+      expect(state.fableName).toBe('')
 
       // Should show the empty hint
       await expect
-        .element(screen.getByText('Click a source to get started'))
+        .element(screen.getByText('Click or drag a source to get started'))
         .toBeVisible()
     })
   })
@@ -346,17 +351,16 @@ describe('Fable Builder Save & Load', () => {
       const screen = await renderWithRouter(<FableBuilderPage />)
 
       // 1. Wait for initial load
-      await expect.element(screen.getByText('Block Palette')).toBeVisible()
+      await expect.element(screen.getByText('Block palette')).toBeVisible()
 
       // 2. Add and configure a source block via palette
       await screen
-        .getByRole('button', { name: /Earthkit Data Source/i })
+        .getByRole('button', { name: /Operational forecast source/i })
         .click()
-      await screen.getByLabelText('Date').fill('2026-01-15')
-      await screen.getByLabelText('Expver').fill('0001')
+      await screen.getByLabelText('Base time').fill('2026-01-15')
 
       // 3. First save
-      await screen.getByRole('button', { name: /Save Config/i }).click()
+      await screen.getByRole('button', { name: /Save workflow/i }).click()
       await screen.getByRole('button', { name: 'Save', exact: true }).click()
 
       // Wait for save to complete
@@ -368,11 +372,11 @@ describe('Fable Builder Save & Load', () => {
       expect(firstSaveId).toBeTruthy()
 
       // 4. Modify the configuration
-      await screen.getByLabelText('Expver').fill('0002')
+      await screen.getByLabelText('Base time').fill('2026-02-01')
       expect(useFableBuilderStore.getState().isDirty).toBe(true)
 
       // 5. Re-save (should update existing)
-      await screen.getByRole('button', { name: /Update Config/i }).click()
+      await screen.getByRole('button', { name: /Update workflow/i }).click()
       await screen.getByRole('button', { name: 'Update', exact: true }).click()
 
       // Wait for re-save to complete

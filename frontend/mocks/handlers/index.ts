@@ -17,23 +17,29 @@
 import { authHandlers } from './auth.handlers'
 import { configHandlers } from './config.handlers'
 import { fableHandlers } from './fable.handlers'
-import { gatewayHandlers } from './gateway.handlers'
 import { jobHandlers } from './job.handlers'
+import { lensHandlers } from './lens.handlers'
+import { newsHandlers } from './news.handlers'
+import { notificationHandlers } from './notification.handlers'
 import { pluginsHandlers } from './plugins.handlers'
 import { artifactsHandlers } from './artifacts.handlers'
 import { scheduleHandlers } from './schedule.handlers'
 import { statusHandlers } from './status.handlers'
 import { usersHandlers } from './users.handlers'
+import { wmsHandlers } from './wms.handlers'
 
 export const handlers = [
   ...authHandlers,
   ...configHandlers,
   ...fableHandlers,
-  ...gatewayHandlers,
   ...jobHandlers,
+  ...lensHandlers,
+  ...newsHandlers,
+  ...notificationHandlers,
   ...pluginsHandlers,
   ...artifactsHandlers,
   ...scheduleHandlers,
   ...statusHandlers,
   ...usersHandlers,
+  ...wmsHandlers,
 ]

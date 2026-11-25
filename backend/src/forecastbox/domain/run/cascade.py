@@ -7,28 +7,74 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-import io
 import logging
-import time
+import tempfile
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-import cloudpickle
-import earthkit.data
-import numpy as np
-import xarray as xr
-from cascade.gateway.api import JobSpec, ResultRetrievalResponse, SubmitJobRequest, SubmitJobResponse, decoded_result
+from cascade.controller.report import JobId
+from cascade.gateway import api
+from cascade.gateway.api import (
+    JobSpec,
+    LocalProcesses,
+    ResultDeletionRequest,
+    SlurmCluster,
+    SshCluster,
+    SubmitJobRequest,
+    SubmitJobResponse,
+)
 from cascade.gateway.client import request_response
-from cascade.low.core import JobInstance, JobInstanceRich, TaskId
-from fiab_core.fable import BlockInstanceId
+from cascade.low.core import DatasetId, JobInstance, JobInstanceRich, TaskId
+from cascade.low.func import assert_never
+from fiab_core.fable import BlockInstanceId, UrlDataFormat
 from pydantic import Field
 
-from forecastbox.domain.artifact.manager import ArtifactManager, submit_artifact_download
 from forecastbox.domain.blueprint.cascade import EnvironmentSpecification
-from forecastbox.utility.config import config
+from forecastbox.domain.gateway.service import get_gateway_url
+from forecastbox.domain.run.exceptions import RunOutputRetrievalFailed
+from forecastbox.utility.config import CascadeInfrastructureType, UnmanagedGateway, config
 from forecastbox.utility.pydantic import FiabBaseModel
 
 logger = logging.getLogger(__name__)
+
+
+def _select_cascade_infra(environment: EnvironmentSpecification) -> CascadeInfrastructureType:
+    if "cascade_infra" in environment.model_fields_set:
+        return environment.cascade_infra
+    return config.cascade.constraints.default_cascade_infra
+
+
+def _build_infra_spec(
+    environment: EnvironmentSpecification, workers_per_host: int, hosts: int
+) -> LocalProcesses | SlurmCluster | SshCluster:
+    requested_infra = _select_cascade_infra(environment)
+    gateway = config.cascade.gateway
+
+    if requested_infra == "localProcess":
+        return LocalProcesses(workers_per_host=workers_per_host, hosts=hosts)
+
+    elif requested_infra == "slurm":
+        if not isinstance(gateway, UnmanagedGateway):
+            if not gateway.startup_params.shared_path:
+                raise ValueError(
+                    "slurm submissions with managed gateway require setting config value of cascade.gateway.startup_params.shared_path"
+                )
+        return SlurmCluster(workers_per_host=workers_per_host, hosts=hosts)
+
+    elif requested_infra == "sshCluster":
+        if isinstance(gateway, UnmanagedGateway):
+            raise ValueError("sshCluster submission currently not supported for unmanaged gateway")
+        ssh_cluster_spec = gateway.startup_params.ssh_cluster_spec
+        if ssh_cluster_spec is None:
+            raise ValueError("sshCluster submissions require setting config value of cascade.gateway.startup_params.ssh_cluster_spec")
+        return SshCluster(
+            controller_url=ssh_cluster_spec.controller_url,
+            worker_urls=ssh_cluster_spec.worker_urls,
+            workers_per_host=workers_per_host,
+        )
+
+    else:
+        assert_never(requested_infra)
 
 
 class RawCascadeJob(FiabBaseModel):
@@ -42,52 +88,21 @@ class ExecutionSpecification(FiabBaseModel):
     shared: bool = Field(default=False)
 
 
-def encode_result(result: ResultRetrievalResponse) -> tuple[bytes, str]:
-    """Converts cascade Result response to bytes+mime"""
-    obj = decoded_result(result, job=None)  # type: ignore
-    if isinstance(obj, bytes):
-        return obj, "application/pickle"
-    if isinstance(obj, tuple):
-        if len(obj) == 2 and isinstance(obj[0], bytes):
-            return obj[0], obj[1]
-        else:
-            raise ValueError("Tuple result must contain exactly two elements: (bytes, mime_type)")
-
-    try:
-        from earthkit.plots import (  # type: ignore[unresolved-import]
-            Figure,  # NOTE plots is an optional dependency -- import inside body allowed
-        )
-
-        if isinstance(obj, Figure):
-            buf = io.BytesIO()
-            obj.save(buf)
-            return buf.getvalue(), "image/png"
-    except ImportError:
-        pass
-
-    if isinstance(obj, earthkit.data.FieldList):
-        encoder = earthkit.data.create_encoder("grib")
-        if isinstance(obj, earthkit.data.Field):
-            return encoder.encode(obj).to_bytes(), "application/grib"  # type: ignore
-        elif isinstance(obj, earthkit.data.FieldList):
-            return encoder.encode(obj[0], template=obj[0]).to_bytes(), "application/grib"  # type: ignore
-
-    elif isinstance(obj, (xr.Dataset, xr.DataArray)):
-        buf = io.BytesIO()
-        obj.to_netcdf(buf, format="NETCDF4")  # type: ignore
-        return buf.getvalue(), "application/netcdf"
-
-    elif isinstance(obj, np.ndarray):
-        buf = io.BytesIO()
-        np.save(buf, obj)
-        return buf.getvalue(), "application/numpy"
-
-    return cloudpickle.dumps(obj), "application/clpkl"
+stored_output_max_length = 10 * 1024**2
 
 
 class RunOutputCharacteristic(FiabBaseModel):
     mime_type: str = "application/octet-stream"
+    fetchable: bool = False
+    url_dataformat: UrlDataFormat | None = None
+    skinnywms_issue: str | None = None
+    display_name: str | None = None
+    dimension_kvs: list[tuple[str, str]] | None = None
     original_block: BlockInstanceId
+    value: str | None = Field(
+        default=None,
+        description=f"If the actual output value is textual (text/plain) and has already been computed, we will store it here, trimmed to {stored_output_max_length} characters",
+    )
 
 
 class RunOutputs(FiabBaseModel):
@@ -98,58 +113,54 @@ def execute_cascade(spec: ExecutionSpecification) -> SubmitJobResponse:
     """Convert spec to JobInstance and submit to cascade api.
 
     ``spec.job.job_instance.ext_outputs`` must already be set by the caller
-    (``compile_builder`` sets it as part of compilation).
+    (``compile_builder`` sets it as part of compilation) and all runtime artifacts
+    of ``spec.environment`` must already be available locally. Gateway exceptions
+    are returned as a ``SubmitJobResponse`` with ``job_id=None``.
     """
-    runtime_artifacts = spec.environment.runtime_artifacts
-    if runtime_artifacts:
-        missing_artifacts = [art for art in runtime_artifacts if art not in ArtifactManager.locally_available]
-
-        download_ids = []
-        for artifact_id in missing_artifacts:
-            result = submit_artifact_download(artifact_id)
-            if result.e:
-                error_msg = f"Failed to submit download for {artifact_id}: {result.e}"
-                logger.error(error_msg)
-                return SubmitJobResponse(job_id=None, error=error_msg)
-            download_ids.append(artifact_id)
-
-        if download_ids:
-            max_wait_seconds = 3600
-            start_time = time.time()
-
-            while True:
-                remaining = {e for e in download_ids if e not in ArtifactManager.locally_available}
-
-                if not remaining:
-                    logger.info(f"All runtime artifacts downloaded: {download_ids}")
-                    break
-
-                if time.time() - start_time > max_wait_seconds:
-                    error_msg = "Timeout waiting for runtime artifacts to download"
-                    logger.error(error_msg)
-                    return SubmitJobResponse(job_id=None, error=error_msg)
-
-                time.sleep(1)
-
     job = spec.job.job_instance
 
     environment = spec.environment
-    hosts = min(config.cascade.max_hosts, environment.hosts or config.cascade.default_hosts)
-    workers_per_host = min(config.cascade.max_workers_per_host, environment.workers_per_host or config.cascade.default_workers_per_host)
-    env_vars = {"TMPDIR": config.cascade.venv_temp_dir}
+    hosts = min(config.cascade.constraints.max_hosts, environment.hosts or config.cascade.constraints.default_hosts)
+    workers_per_host = min(
+        config.cascade.constraints.max_workers_per_host, environment.workers_per_host or config.cascade.constraints.default_workers_per_host
+    )
+
+    infra_spec = _build_infra_spec(environment, workers_per_host=workers_per_host, hosts=hosts)
 
     r = SubmitJobRequest(
         job=JobSpec(
-            workers_per_host=workers_per_host,
-            hosts=hosts,
-            envvars=env_vars,
-            use_slurm=False,
+            infra_spec=infra_spec,
+            envvars=spec.environment.environment_variables,
             job_instance=JobInstanceRich(jobInstance=job, checkpointSpec=None),
         )
     )
     try:
-        submit_job_response: SubmitJobResponse = request_response(r, f"{config.cascade.cascade_url}")  # type: ignore
+        submit_job_response: SubmitJobResponse = request_response(r, get_gateway_url())  # type: ignore
     except Exception as e:
         return SubmitJobResponse(job_id=None, error=repr(e))
 
     return submit_job_response
+
+
+def delete_cascade_datasets(cascade_job_id: str) -> None:
+    """Delete all datasets of the given job in the gateway. Errors reported by the gateway are ignored."""
+    request = ResultDeletionRequest(datasets={JobId(cascade_job_id): []})
+    request_response(request, get_gateway_url())
+
+
+def retrieve_output_bytes(cascade_job_id: str, dataset: DatasetId) -> bytes:
+    """Blocking gateway retrieval and decode of a dataset. Raises RunOutputRetrievalFailed with a user-facing message on failure."""
+    response = request_response(
+        api.ResultRetrievalRequest(job_id=JobId(cascade_job_id), dataset_id=dataset),
+        get_gateway_url(),
+    )
+    response = cast(api.ResultRetrievalResponse, response)
+    if response.error:
+        raise RunOutputRetrievalFailed(f"Result retrieval failed: {response.error}")
+    try:
+        decoded = api.decoded_result(response, job=None)  # type: ignore[attr-defined]
+    except Exception as e:
+        raise RunOutputRetrievalFailed(f"Result decoding failed: {e}")
+    if not isinstance(decoded, bytes):
+        raise RunOutputRetrievalFailed(f"Result decoding failed: expected bytes, got {type(decoded).__name__}")
+    return decoded

@@ -8,6 +8,7 @@
  * does it submit to any jurisdiction.
  */
 
+import { collidingTitles, qualifiedFactoryTitle } from './block-names'
 import type { Edge, Node } from '@xyflow/react'
 import type {
   BlockFactory,
@@ -16,7 +17,7 @@ import type {
   BlockInstanceId,
   FableBuilderV1,
 } from '@/api/types/fable.types'
-import { getFactory } from '@/api/types/fable.types'
+import { getFactory, pluginIdToDisplayKey } from '@/api/types/fable.types'
 
 export interface FableNodeData extends Record<string, unknown> {
   instanceId: BlockInstanceId
@@ -37,28 +38,58 @@ function getNodeType(kind: string): string {
   return NODE_TYPE_MAP[kind] ?? 'default'
 }
 
+/**
+ * Per-`instanceId` cache of the last emitted node `data` object. React Flow
+ * re-renders a node whenever its `data` reference changes, so reusing the
+ * previous object for blocks whose inputs are unchanged keeps memoised nodes
+ * from re-rendering when an unrelated block is edited.
+ */
+const nodeDataCache = new Map<BlockInstanceId, FableNodeData>()
+
 export function fableToNodes(
   fable: FableBuilderV1,
   catalogue: BlockFactoryCatalogue,
 ): Array<Node<FableNodeData>> {
   const nodes: Array<Node<FableNodeData>> = []
+  const liveIds = new Set<BlockInstanceId>()
+  const colliding = collidingTitles(catalogue)
 
   for (const [instanceId, instance] of Object.entries(fable.blocks)) {
     const factory = getFactory(catalogue, instance.factory_id)
     if (!factory) continue
+    liveIds.add(instanceId)
+
+    const cached = nodeDataCache.get(instanceId)
+    const data: FableNodeData =
+      cached &&
+      cached.instance === instance &&
+      cached.factory === factory &&
+      cached.catalogue === catalogue
+        ? cached
+        : {
+            instanceId,
+            instance,
+            factory,
+            label: qualifiedFactoryTitle(
+              factory.title,
+              pluginIdToDisplayKey(instance.factory_id.plugin),
+              colliding,
+            ),
+            catalogue,
+          }
+    nodeDataCache.set(instanceId, data)
 
     nodes.push({
       id: instanceId,
       type: getNodeType(factory.kind),
       position: { x: 0, y: 0 },
-      data: {
-        instanceId,
-        instance,
-        factory,
-        label: factory.title,
-        catalogue,
-      },
+      data,
     })
+  }
+
+  // Drop cache entries for removed blocks so the map can't grow unbounded.
+  for (const id of nodeDataCache.keys()) {
+    if (!liveIds.has(id)) nodeDataCache.delete(id)
   }
 
   return nodes
@@ -66,11 +97,18 @@ export function fableToNodes(
 
 export function fableToEdges(
   fable: FableBuilderV1,
-  _catalogue: BlockFactoryCatalogue,
+  // Flags edges into multi-input blocks; optional for cross-feature callers.
+  catalogue?: BlockFactoryCatalogue,
 ): Array<Edge> {
   const edges: Array<Edge> = []
 
   for (const [targetId, instance] of Object.entries(fable.blocks)) {
+    const targetFactory = catalogue
+      ? getFactory(catalogue, instance.factory_id)
+      : undefined
+    // Only multi-input blocks need a per-edge label to tell their inputs apart.
+    const showLabel = (targetFactory?.inputs.length ?? 0) > 1
+
     for (const [inputName, sourceId] of Object.entries(instance.input_ids)) {
       if (!sourceId) continue
 
@@ -81,7 +119,7 @@ export function fableToEdges(
         sourceHandle: 'output',
         targetHandle: inputName,
         type: 'fableEdge',
-        data: { inputName },
+        data: { inputName, showLabel },
       })
     }
   }

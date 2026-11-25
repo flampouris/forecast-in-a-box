@@ -30,11 +30,7 @@ import { P } from '@/components/base/typography'
 import { cn } from '@/lib/utils'
 
 export type AutocompleteSource =
-  | 'local'
-  | 'global'
-  | 'intrinsic'
-  | 'filter'
-  | 'helperGlobal'
+  'local' | 'global' | 'intrinsic' | 'filter' | 'helperGlobal'
 
 export interface AutocompleteCandidate {
   /** Identifier inserted on selection. */
@@ -227,7 +223,7 @@ function AutocompleteItem({
       }}
       onMouseEnter={onHover}
       className={cn(
-        'flex w-full items-baseline gap-2 rounded px-2 py-1.5 text-left text-sm',
+        'flex w-full items-baseline gap-2 rounded-md px-2 py-1.5 text-left text-sm',
         active && 'bg-accent text-accent-foreground',
       )}
     >
@@ -237,7 +233,7 @@ function AutocompleteItem({
       {badge && (
         <span
           className={cn(
-            'shrink-0 rounded px-1 py-0.5 text-[10px] font-medium uppercase',
+            'shrink-0 rounded-md px-1 py-0.5 text-[10px] font-medium uppercase',
             candidate.source === 'filter'
               ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400'
               : 'bg-purple-500/10 text-purple-600 dark:text-purple-400',

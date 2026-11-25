@@ -52,10 +52,20 @@ export const STORAGE_KEYS = {
   fable: {
     /** Favourite flags for blueprints (keyed by blueprint_id) */
     favourites: 'fiab.fable.favourites',
-    /** Auto-saved fable builder draft (debounced writes) */
+    /** The workbench draft — the single auto-saved work-in-progress */
     draft: 'fiab.fable.draft',
-    /** Pipeline (form-mode) sidebar open/closed flag */
-    pipelineSidebarOpen: 'fiab.fable.pipeline-sidebar-open',
+    /** Configuration set aside when an incoming one replaced it */
+    shelf: 'fiab.fable.shelf',
+    /** Legacy per-target draft map — read once for migration into `draft` */
+    drafts: 'fiab.fable.drafts',
+  },
+
+  /**
+   * Forecast-run storage keys (direct localStorage)
+   */
+  runs: {
+    /** Bookmarked run ids (keyed by run_id) */
+    bookmarks: 'fiab.runs.bookmarks',
   },
 
   /**
@@ -64,6 +74,26 @@ export const STORAGE_KEYS = {
   artifacts: {
     /** Composite IDs of downloads in progress, so polling can resume after refresh */
     pendingDownloads: 'fiab.artifacts.pending-downloads',
+  },
+
+  /**
+   * Persisted split-pane layouts (direct localStorage)
+   */
+  layout: {
+    /** Run detail: pipeline canvas vs details tabs */
+    runDetailSplit: 'fiab.layout.run-detail-split',
+    /** Geo viewer: docked sidebar widths (left/right, px) */
+    geoViewerPanels: 'fiab.layout.geo-viewer-panels',
+  },
+
+  /**
+   * Visualise page (direct localStorage)
+   */
+  visualise: {
+    /** Last-used A/B slot pair; seeds the slots on a bare /visualise visit */
+    lastPair: 'fiab.visualise.last-pair',
+    /** Run attempt each lens was started for (keyed by lens instance id) */
+    lensOwners: 'fiab.visualise.lens-owners',
   },
 
   /**
@@ -80,6 +110,18 @@ export const STORAGE_KEYS = {
     fableBuilderUi: 'fiab.store.fable-builder-ui',
     /** Notification center history (completed/failed task records) */
     activity: 'fiab.store.activity',
+    /** Geographic comparison basket (collected sources) */
+    comparison: 'fiab.store.comparison',
+    /** First-run onboarding status */
+    onboarding: 'fiab.store.onboarding',
+    /** Per-tutorial guided-tour outcomes */
+    tutorials: 'fiab.store.tutorials',
+    /** Pinned default WMS style per server and layer */
+    stylePins: 'fiab.store.style-pins',
+    /** The user's ECMWF API key for entitled ecCharts layers */
+    ecmwfKey: 'fiab.store.ecmwf-key',
+    /** Bookmarked plugin templates (shown first on the Overview) */
+    templateBookmarks: 'fiab.store.template-bookmarks',
   },
 } as const
 
@@ -100,10 +142,16 @@ export const STORAGE_KEYS = {
  * ```
  */
 export const STORE_VERSIONS = {
-  ui: 5, // v5: Default artifacts view to table
+  ui: 7, // v7: Removed layoutMode, dashboardVariant, panelShadow
   config: 1,
-  fableBuilder: 2, // v2: Removed configDisplayMode, added isMiniMapOpen
-  activity: 1,
+  fableBuilder: 3, // v3: Removed mode, edgeStyle, autoLayout
+  activity: 2, // v2: navigateTo rewritten for /executions→/execute, /dashboard→/overview
+  comparison: 1,
+  onboarding: 2, // v2: Removed pluginStepNeeded
+  tutorials: 1,
+  stylePins: 1,
+  ecmwfKey: 1,
+  templateBookmarks: 1,
 } as const
 
 /**

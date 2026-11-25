@@ -44,13 +44,6 @@ export function parsePluginKey(key: string): PluginCompositeId {
 }
 
 /**
- * Convert a PluginCompositeId to the API key format
- */
-export function toPluginKey(id: PluginCompositeId): string {
-  return `store='${id.store}' local='${id.local}'`
-}
-
-/**
  * Convert a PluginCompositeId to a display-friendly string
  */
 export function toPluginDisplayId(id: PluginCompositeId): string {
@@ -135,15 +128,114 @@ export const PluginRemoteInfoSchema = z.object({
 export type PluginRemoteInfo = z.infer<typeof PluginRemoteInfoSchema>
 
 /**
- * Plugin detail - full plugin information from backend
+ * Structured plugin diagnostic (backend PluginError).
+ * source: install | load | template_ingest; severity: warning | error | critical.
+ * Plain strings so new backend values don't fail parsing.
  */
-export const PluginDetailSchema = z.object({
-  status: z.enum(pluginStatusValues),
+export const PluginErrorSchema = z.object({
+  source: z.string(),
+  detail: z.string(),
+  severity: z.string(),
+})
+
+export type PluginError = z.infer<typeof PluginErrorSchema>
+
+export type PluginErrorSeverity = 'warning' | 'error' | 'critical'
+
+const SEVERITY_RANK: Record<PluginErrorSeverity, number> = {
+  warning: 1,
+  error: 2,
+  critical: 3,
+}
+
+/** Unknown severity strings count as 'error' */
+export function normalizePluginErrorSeverity(
+  severity: string,
+): PluginErrorSeverity {
+  return severity in SEVERITY_RANK ? (severity as PluginErrorSeverity) : 'error'
+}
+
+/** Highest severity present, null for an empty list */
+export function pluginErrorsMaxSeverity(
+  errors: Array<PluginError>,
+): PluginErrorSeverity | null {
+  let max: PluginErrorSeverity | null = null
+  for (const error of errors) {
+    const severity = normalizePluginErrorSeverity(error.severity)
+    if (!max || SEVERITY_RANK[severity] > SEVERITY_RANK[max]) {
+      max = severity
+    }
+  }
+  return max
+}
+
+/** The single visual state a plugin's status badge conveys. */
+export type PluginBadgeKind =
+  'loaded' | 'disabled' | 'warning' | 'errored' | 'update' | 'available'
+
+/**
+ * The one badge a plugin shows. Badge and status filter both derive from this,
+ * so they can't drift. Precedence: disabled → errored (severe diagnostics) →
+ * update → warning → errored (status) → available → loaded.
+ */
+export function pluginBadgeKind(plugin: {
+  status: PluginStatus
+  isEnabled?: boolean
+  hasUpdate?: boolean
+  errorSeverity?: PluginErrorSeverity | null
+}): PluginBadgeKind {
+  // Disabled dominates — blocks stay out of the catalogue until re-enabled.
+  // (Uninstalled 'available' plugins keep their own badge.)
+  if (plugin.isEnabled === false && plugin.status !== 'available') {
+    return 'disabled'
+  }
+  // Severity drives the badge, not status — error/critical diagnostics are red
+  // even when install succeeded but the module failed to load; warnings amber.
+  if (plugin.errorSeverity === 'error' || plugin.errorSeverity === 'critical') {
+    return 'errored'
+  }
+  if (plugin.hasUpdate && plugin.status === 'loaded') return 'update'
+  if (plugin.errorSeverity === 'warning') return 'warning'
+  if (plugin.status === 'errored') return 'errored'
+  if (plugin.status === 'available') return 'available'
+  return 'loaded'
+}
+
+/**
+ * Generic plugin data - always present, regardless of install status
+ */
+export const PluginGenericDataSchema = z.object({
   store_info: PluginStoreEntrySchema.nullable(),
   remote_info: PluginRemoteInfoSchema.nullable(),
-  errored_detail: z.string().nullable(),
-  loaded_version: z.string().nullable(),
-  update_date: z.string().nullable(), // "YYYY/MM/DD" format
+})
+
+/**
+ * Plugin install data - present when the plugin has a DB record (i.e. was installed)
+ */
+export const PluginInstallDataSchema = z.object({
+  local_version: z.string(),
+  update_datetime: z.string(), // UTC ISO with offset, e.g. "...+00:00"
+  install_errors: z.array(PluginErrorSchema),
+})
+
+/**
+ * Plugin install settings - present when install succeeded (no error/critical install errors)
+ */
+export const PluginInstallSettingsSchema = z.object({
+  isEnabled: z.boolean(),
+  excluded_templates: z.array(z.string()),
+  included_templates: z.array(z.string()),
+  glyph_remapping: z.record(z.string(), z.string()),
+})
+
+/**
+ * Plugin detail - full plugin information from backend (GET /plugin/list)
+ */
+export const PluginDetailSchema = z.object({
+  generic_data: PluginGenericDataSchema,
+  install_data: PluginInstallDataSchema.nullable(),
+  settings_data: PluginInstallSettingsSchema.nullable(),
+  load_errors: z.array(PluginErrorSchema),
 })
 
 export type PluginDetail = z.infer<typeof PluginDetailSchema>
@@ -158,16 +250,87 @@ export const PluginListingSchema = z.object({
 export type PluginListing = z.infer<typeof PluginListingSchema>
 
 /**
- * Plugin status response from /plugin/status endpoint
+ * Derive the logical plugin status from the new nested PluginDetail structure.
+ * - No install_data → not installed → available
+ * - install_data present, settings_data absent → install failed → errored
+ * - settings_data.isEnabled false → disabled
+ * - settings_data.isEnabled true → loaded
  */
-export const PluginsStatusSchema = z.object({
-  updater_status: z.string(),
-  plugin_errors: z.record(z.string(), z.string()),
-  plugin_versions: z.record(z.string(), z.string()),
-  plugin_updatedate: z.record(z.string(), z.string()),
+export function derivePluginStatus(detail: PluginDetail): PluginStatus {
+  if (detail.install_data === null) return 'available'
+  if (detail.settings_data === null) return 'errored'
+  return detail.settings_data.isEnabled ? 'loaded' : 'disabled'
+}
+
+/**
+ * Example input for a single parameter or glyph in a blueprint template.
+ * The `example_value` is the actual string value; the other fields are UI metadata.
+ */
+export const BlueprintTemplateExampleInputSchema = z.object({
+  example_value: z.string(),
+  display_name: z.string().nullable().optional(),
+  display_description: z.string().nullable().optional(),
+  type_hint: z.string().nullable().optional(),
 })
 
-export type PluginsStatus = z.infer<typeof PluginsStatusSchema>
+export type BlueprintTemplateExampleInput = z.infer<
+  typeof BlueprintTemplateExampleInputSchema
+>
+
+/**
+ * Example data for a blueprint template from GET /plugin/templateExampleValues.
+ * Mirrors what the backend overlays during template ingest validation.
+ */
+export const TemplateExampleValuesSchema = z.object({
+  /** Per-block example configuration values, keyed by block instance id then option id */
+  example_values: z.record(
+    z.string(),
+    z.record(z.string(), BlueprintTemplateExampleInputSchema),
+  ),
+  /** Example glyph name-to-value pairs the user is expected to override */
+  example_glyphs: z.record(z.string(), BlueprintTemplateExampleInputSchema),
+})
+
+export type TemplateExampleValues = z.infer<typeof TemplateExampleValuesSchema>
+
+/**
+ * Parse a "store:local" composite string (the blueprint `created_by` format
+ * for plugin templates). Splits on the first colon.
+ */
+export function parsePluginIdString(id: string): PluginCompositeId {
+  const separatorIndex = id.indexOf(':')
+  if (separatorIndex === -1) {
+    return { store: id, local: '' }
+  }
+  return {
+    store: id.slice(0, separatorIndex),
+    local: id.slice(separatorIndex + 1),
+  }
+}
+
+/** Inverse of parsePluginIdString. */
+export function formatPluginIdString(id: PluginCompositeId): string {
+  return `${id.store}:${id.local}`
+}
+
+/** The plugin whose blueprint templates the dashboard offers as starting points. */
+export const ECMWF_BASE_PLUGIN: PluginCompositeId = {
+  store: 'ecmwf',
+  local: 'ecmwf-base',
+}
+
+/**
+ * Payload fields for POST /plugin/settings (backend PluginSettingsUpdateRequest).
+ * Omitted fields leave the stored value unchanged; an empty list/dict clears it.
+ */
+export interface PluginSettingsUpdate {
+  /** Enable or disable the plugin */
+  isEnabled?: boolean
+  /** Blueprint-template display names to exclude from ingestion */
+  excluded_templates?: Array<string>
+  /** Glyph rename map applied at template ingestion */
+  glyph_remapping?: Record<string, string>
+}
 
 /**
  * UI-friendly plugin info (transformed from PluginDetail)
@@ -186,7 +349,7 @@ export interface PluginInfo {
   description: string
   /** Author name from store_info.display_author */
   author: string
-  /** Currently installed version (loaded_version) */
+  /** Currently installed version (install_data.local_version) */
   version: string | null
   /** Latest available version (remote_info.version) */
   latestVersion: string | null
@@ -196,16 +359,19 @@ export interface PluginInfo {
   capabilities: Array<PluginCapability>
   /** Current status from backend */
   status: PluginStatus
-  /** Whether plugin is enabled (loaded or errored) */
+  /** Enabled = its blocks appear in the catalogue. Reflects
+   *  `settings_data.isEnabled`, not merely whether it loaded. */
   isEnabled: boolean
   /** Whether plugin is installed (not available) */
   isInstalled: boolean
   /** Whether an update is available (latestVersion > version) */
   hasUpdate: boolean
-  /** ISO date when last updated (from update_date) */
+  /** Last-updated UTC ISO, tz-aware (from update_datetime) */
   updatedAt: string | null
-  /** Error details if status is errored */
-  errorDetail: string | null
+  /** Structured diagnostics when the plugin has errors or warnings */
+  errorDetail: Array<PluginError> | null
+  /** Highest severity among errorDetail entries */
+  errorSeverity: PluginErrorSeverity | null
   /** Store comment */
   comment: string | null
   /** Pip source for installation */
@@ -227,6 +393,35 @@ export interface PluginsStats {
 }
 
 /**
+ * True when `remote` is a strictly newer release than `loaded`.
+ * Compares numeric release segments only — pre-release suffixes are ignored,
+ * and unparseable versions (e.g. the backend's "unknown" sentinel) are never newer.
+ */
+export function isNewerVersion(remote: string, loaded: string): boolean {
+  const remoteSegments = parseReleaseSegments(remote)
+  const loadedSegments = parseReleaseSegments(loaded)
+  if (!remoteSegments || !loadedSegments) return false
+  const length = Math.max(remoteSegments.length, loadedSegments.length)
+  for (let i = 0; i < length; i++) {
+    const r = remoteSegments[i] ?? 0
+    const l = loadedSegments[i] ?? 0
+    if (r !== l) return r > l
+  }
+  return false
+}
+
+function parseReleaseSegments(version: string): Array<number> | null {
+  const release = version.trim().match(/^v?(\d+(?:\.\d+)*)/)?.[1]
+  return release ? release.split('.').map(Number) : null
+}
+
+/** All-zero versions come from unstamped dev installs — nothing to compare against */
+export function isUnstampedVersion(version: string): boolean {
+  const segments = parseReleaseSegments(version)
+  return segments !== null && segments.every((segment) => segment === 0)
+}
+
+/**
  * Transform a PluginDetail to UI-friendly PluginInfo
  */
 export function toPluginInfo(
@@ -234,55 +429,55 @@ export function toPluginInfo(
   detail: PluginDetail,
   capabilities: Array<PluginCapability> = [],
 ): PluginInfo {
-  const isInstalled = detail.status !== 'available'
+  const status = derivePluginStatus(detail)
+  const isInstalled = detail.install_data !== null
+  const loadedVersion = detail.install_data?.local_version ?? null
   const hasUpdate =
     isInstalled &&
-    detail.loaded_version !== null &&
-    detail.remote_info !== null &&
-    detail.loaded_version !== detail.remote_info.version
+    loadedVersion !== null &&
+    !isUnstampedVersion(loadedVersion) &&
+    detail.generic_data.remote_info !== null &&
+    isNewerVersion(detail.generic_data.remote_info.version, loadedVersion)
+  const allErrors: Array<PluginError> = [
+    ...(detail.install_data?.install_errors ?? []),
+    ...detail.load_errors,
+  ]
+  const errorDetail = allErrors.length ? allErrors : null
 
   return {
     id,
     displayId: toPluginDisplayId(id),
-    name: detail.store_info?.display_title ?? id.local,
-    description: detail.store_info?.display_description ?? '',
-    author: detail.store_info?.display_author ?? '',
-    version: detail.loaded_version === 'unknown' ? null : detail.loaded_version,
-    latestVersion: detail.remote_info?.version ?? null,
+    name: detail.generic_data.store_info?.display_title ?? id.local,
+    description: detail.generic_data.store_info?.display_description ?? '',
+    author: detail.generic_data.store_info?.display_author ?? '',
+    version: loadedVersion === 'unknown' ? null : loadedVersion,
+    latestVersion: detail.generic_data.remote_info?.version ?? null,
     capabilities,
-    status: detail.status,
-    isEnabled: detail.status === 'loaded' || detail.status === 'errored',
+    status,
+    isEnabled: detail.settings_data?.isEnabled ?? status === 'errored',
     isInstalled,
     hasUpdate,
-    updatedAt: detail.update_date
-      ? toValidDateOrNull(detail.update_date)
+    updatedAt: detail.install_data?.update_datetime
+      ? toUtcIsoOrNull(detail.install_data.update_datetime)
       : null,
-    errorDetail: detail.errored_detail,
-    comment: detail.store_info?.comment ?? null,
-    pipSource: detail.store_info?.pip_source ?? null,
-    moduleName: detail.store_info?.module_name ?? null,
+    errorDetail,
+    errorSeverity: errorDetail ? pluginErrorsMaxSeverity(errorDetail) : null,
+    comment: detail.generic_data.store_info?.comment ?? null,
+    pipSource: detail.generic_data.store_info?.pip_source ?? null,
+    moduleName: detail.generic_data.store_info?.module_name ?? null,
   }
 }
 
 /**
- * Converts and validates a date string, returning null if unparseable.
+ * Normalize a backend UTC datetime for `new Date()`. Tz-aware values (e.g. a
+ * `+00:00` offset) pass through; a bare value gets `Z` appended so it reads as
+ * UTC, not local. Null if unparseable.
  */
-function toValidDateOrNull(dateStr: string): string | null {
-  const converted = convertUpdateDate(dateStr)
-  const date = new Date(converted)
-  return isNaN(date.getTime()) ? null : converted
-}
-
-/**
- * Convert backend date format (YYYY/MM/DD) to ISO format
- */
-function convertUpdateDate(dateStr: string): string {
-  // Convert "YYYY/MM/DD" to ISO format
-  const [year, month, day] = dateStr.split('/')
-  if (year && month && day) {
-    return `${year}-${month}-${day}T00:00:00Z`
-  }
-  return dateStr
+function toUtcIsoOrNull(dateStr: string): string | null {
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(dateStr)
+    ? dateStr
+    : `${dateStr}Z`
+  return Number.isNaN(new Date(normalized).getTime()) ? null : normalized
 }
 
 /**
@@ -312,4 +507,14 @@ export function calculatePluginStats(plugins: Array<PluginInfo>): PluginsStats {
     availableCount: plugins.filter((p) => p.status === 'available').length,
     updatesAvailableCount: plugins.filter((p) => p.hasUpdate).length,
   }
+}
+
+/** The installed version, else the latest known one; null without either. */
+export function pluginDisplayVersion(
+  plugin: Pick<PluginInfo, 'version' | 'latestVersion'>,
+): string | null {
+  return (
+    plugin.version ??
+    (plugin.latestVersion !== 'unknown' ? plugin.latestVersion : null)
+  )
 }

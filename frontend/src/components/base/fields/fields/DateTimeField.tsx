@@ -8,8 +8,22 @@
  * does it submit to any jurisdiction.
  */
 
+import { useMemo } from 'react'
+import { useTranslation } from 'react-i18next'
 import { GlyphFieldWrapper } from './GlyphFieldWrapper'
-import { InputGroupInput } from '@/components/ui/input-group'
+import { InputGroupAddon, InputGroupInput } from '@/components/ui/input-group'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
+  convertNaive,
+  timeZoneOffsetLabel,
+  todayInZone,
+  useAppTimeZone,
+  zonedNaiveToInstant,
+} from '@/lib/datetime'
 
 export interface DateTimeFieldProps {
   id: string
@@ -28,20 +42,11 @@ function splitDatetime(value: string): { date: string; time: string } {
   if (!value) return { date: '', time: '' }
   const tIndex = value.indexOf('T')
   if (tIndex === -1) return { date: value, time: '' }
-  // The datetime-local wire format is `YYYY-MM-DDTHH:MM`; tolerate a seconds
-  // suffix from pasted values by slicing down to HH:MM.
+  // The wire format is `YYYY-MM-DDTHH:MM:SS`; the time input wants `HH:MM`.
   return {
     date: value.slice(0, tIndex),
     time: value.slice(tIndex + 1, tIndex + 6),
   }
-}
-
-function todayLocalISO(): string {
-  const now = new Date()
-  const y = now.getFullYear()
-  const m = String(now.getMonth() + 1).padStart(2, '0')
-  const d = String(now.getDate()).padStart(2, '0')
-  return `${y}-${m}-${d}`
 }
 
 export function DateTimeField({
@@ -66,6 +71,7 @@ export function DateTimeField({
       isDateOnly={isDateOnly}
     >
       {isDateOnly ? (
+        // A calendar date has no instant — stored and shown verbatim.
         <InputGroupInput
           id={id}
           type="date"
@@ -87,10 +93,12 @@ export function DateTimeField({
 }
 
 /**
- * Renders a date input beside a time input and recombines them on change.
- * The time defaults to `00:00` so the native time picker opens at midnight
- * instead of the current wall-clock minute — forecast base-times round to
- * the hour anyway.
+ * Renders a date input beside a time input. `value` is a UTC datetime in
+ * `YYYY-MM-DDTHH:MM:SS` form (a backend-accepted UTC format); the inputs present
+ * it in the application timezone and convert back on every edit, so the wire
+ * value stays UTC. A badge shows the active timezone, making the entered time
+ * unambiguous. The time defaults to `00:00` so the native picker opens at
+ * midnight rather than the current wall-clock minute — base-times round to the hour.
  */
 function DateAndTimeInputs({
   id,
@@ -103,24 +111,40 @@ function DateAndTimeInputs({
   onChange: (value: string) => void
   disabled?: boolean
 }) {
-  const { date, time } = splitDatetime(value)
+  const { t } = useTranslation('common')
+  const timeZone = useAppTimeZone()
+  const { date, time } = useMemo(
+    () => splitDatetime(convertNaive(value, 'UTC', timeZone)),
+    [value, timeZone],
+  )
+  // Offset at the value's instant; now while empty.
+  const offsetLabel = useMemo(() => {
+    const instant = zonedNaiveToInstant(value, 'UTC')
+    return timeZoneOffsetLabel(
+      timeZone,
+      Number.isNaN(instant.getTime()) ? new Date() : instant,
+    )
+  }, [value, timeZone])
   const displayedTime = time || DEFAULT_TIME
+
+  // Recombine the zoned date + time, then store back as canonical UTC.
+  function emit(zonedDate: string, hhmm: string) {
+    onChange(convertNaive(`${zonedDate}T${hhmm}:00`, timeZone, 'UTC'))
+  }
 
   function handleDateChange(nextDate: string) {
     if (!nextDate) {
-      // Clearing the date clears the whole value; the stored form is all-or-nothing.
+      // Clearing the date clears the value; the stored form is all-or-nothing.
       onChange('')
       return
     }
-    onChange(`${nextDate}T${time || DEFAULT_TIME}`)
+    emit(nextDate, time || DEFAULT_TIME)
   }
 
   function handleTimeChange(nextTime: string) {
-    const effective = nextTime || DEFAULT_TIME
-    // If the user picks a time before a date, default the date to today so
-    // the time they just typed doesn't silently revert on re-render.
-    const effectiveDate = date || todayLocalISO()
-    onChange(`${effectiveDate}T${effective}`)
+    // If the user picks a time before a date, default the date to today (in
+    // the app timezone) so the time they just typed doesn't silently revert.
+    emit(date || todayInZone(timeZone), nextTime || DEFAULT_TIME)
   }
 
   return (
@@ -131,6 +155,7 @@ function DateAndTimeInputs({
         value={date}
         onChange={(e) => handleDateChange(e.target.value)}
         disabled={disabled}
+        className="min-w-0"
       />
       <div className="mx-0.5 h-5 w-px bg-border" aria-hidden />
       <InputGroupInput
@@ -139,8 +164,26 @@ function DateAndTimeInputs({
         value={displayedTime}
         onChange={(e) => handleTimeChange(e.target.value)}
         disabled={disabled}
-        aria-label="Time"
+        aria-label={t('dateTimeField.timeLabel')}
+        className="w-[5.2rem] flex-none"
       />
+      <InputGroupAddon align="inline-end">
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <span
+                data-testid="datetime-tz-badge"
+                className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
+              />
+            }
+          >
+            {offsetLabel}
+          </TooltipTrigger>
+          <TooltipContent side="top">
+            {t('dateTimeField.timezoneTooltip', { timeZone })}
+          </TooltipContent>
+        </Tooltip>
+      </InputGroupAddon>
     </>
   )
 }

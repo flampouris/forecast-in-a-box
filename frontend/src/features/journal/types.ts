@@ -1,0 +1,62 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+import type { JobStatus } from '@/api/types/job.types'
+
+/**
+ * The shape both run surfaces — the dashboard journal and /execute —
+ * render. Built by the adapters from a raw run plus its blueprint.
+ */
+export interface ForecastRunViewModel {
+  runId: string
+  /** Latest attempt number; greater than 1 means the run was restarted. */
+  attemptCount: number
+  /** Blueprint name; empty until the blueprint loads. */
+  displayName: string
+  /** Optional blueprint description. */
+  displayDescription: string | null
+  status: JobStatus
+  /** 0–100, only meaningful while running. */
+  progress: number
+  /** ISO creation timestamp. */
+  createdAt: string
+  /** First source block's title. */
+  modelLabel: string | null
+  /** Outputs the run produced, or the planned sink-block count. */
+  outputCount: number
+  /** Produced outputs no longer retrievable; subset of {@link outputCount}. */
+  lostOutputCount: number
+  /** Backend error text; set only for failed runs. */
+  errorMessage: string | null
+  /** Sink-block titles — the kinds of output the configuration produces. */
+  outputKinds: Array<string>
+  /** User tags, system markers stripped. */
+  tags: Array<string>
+  blueprintId: string
+  /** The run's config was forked from a saved preset. */
+  fromPreset: boolean
+  /** Name of the schedule that produced this run, or null for one-off runs. */
+  scheduleName: string | null
+  /** Id of that schedule, for linking to its page. */
+  scheduleId: string | null
+  /** Has a retained GRIB output the map can show; null when the source cannot tell. */
+  hasComparableOutput: boolean | null
+  isBookmarked: boolean
+}
+
+/** Status quick-filter tabs — a curated subset of `JobStatus`, plus `all`/`bookmarked`. */
+export type RunFilter =
+  | 'all'
+  | 'submitted'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'stopped'
+  | 'bookmarked'

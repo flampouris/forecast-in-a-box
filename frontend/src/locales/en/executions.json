@@ -1,56 +1,92 @@
 {
   "page": {
-    "title": "Forecast Job Executions",
-    "description": "Monitor and manage your forecast job executions"
+    "title": "Runs",
+    "description": "Monitor and manage your forecast runs",
+    "scheduledRuns": "Scheduled runs"
   },
   "detail": {
-    "backLink": "Executions",
-    "untitledJob": "Untitled Job",
-    "showConfig": "Show config",
-    "hideConfig": "Hide config",
+    "backLink": "Runs",
+    "untitledJob": "Untitled run",
+    "parameters": "Parameters",
+    "maximizeCanvas": "Maximize canvas",
+    "restoreCanvas": "Exit full screen (Esc)",
     "graphUnavailable": "Graph visualisation unavailable",
-    "graphUnavailableDescription": "The pipeline graph is not available for this job.",
+    "graphUnavailableDescription": "The workflow graph is not available for this run.",
     "specUnavailable": "Specification not available",
-    "specUnavailableDescription": "The original configuration was not stored for this job."
+    "specUnavailableDescription": "The original workflow was not stored for this run.",
+    "specTitle": "Workflow specification",
+    "copySpec": "Copy specification",
+    "copied": "Copied",
+    "copyValue": "Copy value",
+    "copyTemplate": "Copy template",
+    "copyFailed": "Couldn't copy to clipboard",
+    "specCopyFailed": "Couldn't copy specification",
+    "startedAt": "Started {{date}}",
+    "stoppedNotice": "Stopped {{date}}. Outputs produced before the stop are kept."
   },
   "status": {
     "submitted": "Submitted",
     "preparing": "Preparing",
     "running": "Running",
+    "stopping": "Stopping",
+    "stopped": "Stopped",
     "completed": "Completed",
     "failed": "Failed",
     "unknown": "Unknown"
   },
+  "progress": {
+    "blocksComplete": "{{completed}}/{{total}} blocks"
+  },
   "tabs": {
     "outputs": "Outputs",
     "logs": "Logs",
+    "compilation": "Compilation",
+    "graph": "Task graph",
     "specification": "Specification"
   },
   "actions": {
     "restart": "Restart",
-    "restartJob": "Restart Job",
+    "restartJob": "Restart run",
+    "stop": "Stop",
+    "stopping": "Stopping…",
+    "stopJob": "Stop this run?",
+    "confirmStop": "The computation stops. Outputs produced so far are kept, and you can restart the run later.",
+    "keepRunning": "Keep running",
+    "stopRun": "Stop run",
+    "stopAlreadyFinished": "The run had already finished.",
+    "stopQueued": "Stop recorded. It is retried shortly.",
     "delete": "Delete",
-    "deleteJob": "Delete Job",
+    "deleteJob": "Delete run",
     "edit": "Edit",
-    "editDetails": "Edit Details",
+    "editDetails": "Edit details",
     "save": "Save",
-    "editConfiguration": "Edit Configuration",
-    "downloadLogs": "Download Full Logs",
-    "confirmRestart": "This will re-execute the job with the same specification. Continue?",
-    "confirmDelete": "This will permanently delete this job and its results. This action cannot be undone."
+    "editConfiguration": "Edit workflow",
+    "showInLogs": "Show in logs",
+    "downloadLogs": "Download full logs",
+    "downloadLogsFailed": "Failed to download logs",
+    "confirmRestart": "This will run the forecast again with the same specification. Continue?",
+    "confirmDelete": "This will permanently delete this run and its results. This action cannot be undone."
+  },
+  "activity": {
+    "jobFallbackLabel": "Run {{id}}",
+    "submitted": "Submitted",
+    "restarting": "Restarting (attempt {{attempt}})"
+  },
+  "defaultName": {
+    "run": "Run"
   },
   "submit": {
-    "title": "Submit Forecast Job",
+    "title": "Run forecast",
     "name": "Name",
-    "namePlaceholder": "Enter a name for this job",
+    "namePlaceholder": "Enter a name for this run",
     "namePlaceholderOptional": "Name this run to find it later (optional)",
     "description": "Description",
-    "descriptionPlaceholder": "Optional notes about this execution",
+    "descriptionPlaceholder": "Optional notes about this run",
     "descriptionPlaceholderOptional": "Add notes about this run (optional)",
     "tags": "Tags",
     "tagsPlaceholder": "Add a tag",
     "tagsPlaceholderOptional": "Tag this run for easy filtering (optional)",
-    "advancedTitle": "Advanced: Execution Environment",
+    "advancedTitle": "Advanced: run environment",
     "hosts": "Hosts",
     "hostsPlaceholder": "Default (auto)",
     "workersPerHost": "Workers per host",
@@ -60,22 +96,56 @@
     "envValuePlaceholder": "Value",
     "addVariable": "Add variable",
     "cancel": "Cancel",
-    "submit": "Submit Job",
+    "submit": "Start run",
     "submitting": "Submitting...",
-    "modeRunNow": "Run Once",
-    "modeSchedule": "Run on Schedule",
-    "createSchedule": "Create Schedule",
+    "modeRunNow": "Run once",
+    "modeSchedule": "Run on schedule",
+    "createSchedule": "Create schedule",
     "creatingSchedule": "Creating...",
-    "cronExpression": "Schedule Frequency",
+    "cronExpression": "Schedule frequency",
     "maxDelay": "Skip if delayed by (hours)",
     "maxDelayHelp": "If a scheduled run is delayed longer than this, it will be skipped instead of running late.",
     "scheduleCreated": "Schedule created successfully",
-    "compilingSpec": "Compiling specification...",
-    "serverTime": "(server time)",
-    "localEquivalent": "→ {{time}}"
+    "compilingSpec": "Compiling specification..."
+  },
+  "cron": {
+    "frequency": {
+      "hourly": "Every hour",
+      "daily": "Every day",
+      "weekly": "Every week",
+      "custom": "Custom"
+    },
+    "days": {
+      "sunday": "Sunday",
+      "monday": "Monday",
+      "tuesday": "Tuesday",
+      "wednesday": "Wednesday",
+      "thursday": "Thursday",
+      "friday": "Friday",
+      "saturday": "Saturday"
+    },
+    "at": "at",
+    "atMinute": "at minute",
+    "showExpression": "Show cron expression",
+    "hideExpression": "Hide cron expression",
+    "humanReadable": {
+      "everyHour": "Every hour",
+      "everyHourAtMinute": "Every hour at minute {{minute}}",
+      "everyDayAt": "Every day at {{time}} {{zone}}",
+      "everyDayOfWeekAt": "Every {{day}} at {{time}} {{zone}}"
+    },
+    "now": "Time now: {{time}} {{zone}}"
   },
   "outputs": {
     "generated": "Generated",
+    "pending": "Pending",
+    "notProduced": "Not produced",
+    "failedNoOutputs": "No outputs — the run failed",
+    "failedExpected_one": "{{count}} output was expected.",
+    "failedExpected_other": "{{count}} outputs were expected.",
+    "failedNotProduced_one": "{{count}} expected output was not produced — the run failed.",
+    "failedNotProduced_other": "{{count}} expected outputs were not produced — the run failed.",
+    "viewLogs": "View logs",
     "noOutputs": "No outputs available yet",
     "noOutputsRunning": "Outputs will appear here as they are generated.",
     "view": "View",
@@ -86,45 +156,282 @@
       "download": "Download",
       "copyImage": "Copy to clipboard"
     },
+    "copy": {
+      "svgSuccess": "SVG source copied",
+      "imageSuccess": "Image copied",
+      "error": "Could not copy image"
+    },
     "filter": {
       "allMimes": "All"
     },
+    "groupBy": {
+      "label": "Group by",
+      "none": "None",
+      "block": "Block",
+      "mime": "Content type",
+      "blockAndMime": "Block + content type"
+    },
+    "dims": {
+      "param": "Parameter",
+      "step": "Step",
+      "number": "Member",
+      "levelist": "Level",
+      "stepValue": "step {{value}}",
+      "numberValue": "member {{value}}",
+      "levelistValue": "level {{value}}",
+      "otherValue": "{{key}} {{value}}",
+      "all": "{{dim}}: All",
+      "none": "{{dim}}: None",
+      "some": "{{dim}}: {{values}}",
+      "count": "{{dim}}: {{count}} of {{total}}",
+      "search": "Search",
+      "noMatch": "No match",
+      "showAll": "Show all"
+    },
+    "steps": {
+      "day": "D{{day}}",
+      "dayAria": "Day {{day}}",
+      "hour": "+{{hour}} h",
+      "hourShort": "{{hour}}h",
+      "cell": "Step {{step}}",
+      "kept": "{{count}} of {{total}} outputs",
+      "stepCount_one": "{{count}} step",
+      "stepCount_other": "{{count}} steps",
+      "daysOf_one": "day {{days}}",
+      "daysOf_other": "days {{days}}",
+      "hoursOf": "{{hours}} h",
+      "all": "All",
+      "allAria": "All steps",
+      "pendingNote": "Faded steps are not produced yet."
+    },
+    "sections": {
+      "unknownBlock": "Unknown block",
+      "unknownMime": "Unknown content type",
+      "otherOutputs": "Other outputs"
+    },
     "noMatch": "No outputs match the current filter.",
     "viewer": {
-      "zoomHint": "Wheel to zoom · Drag to pan · Shift+drag to zoom into a region",
+      "zoomHint": "Wheel to zoom · Drag or W A S D to pan · Shift+drag to zoom into a region · 0 fit · 1 actual size",
       "zoomIn": "Zoom in",
       "zoomOut": "Zoom out",
-      "resetZoom": "Reset zoom",
+      "resetZoom": "Fit to screen",
+      "close": "Close",
+      "previousPage": "Previous page",
+      "nextPage": "Next page",
+      "previousOutput": "Previous output",
+      "nextOutput": "Next output",
       "pageOfTotal": "{{page}} / {{total}}",
       "pdfPageCount_one": "{{count}} page",
-      "pdfPageCount_other": "{{count}} pages"
+      "pdfPageCount_other": "{{count}} pages",
+      "keepView": "Keep zoom and position between outputs",
+      "filmstrip": "Outputs",
+      "toggleFilmstrip": "Show or hide the filmstrip",
+      "filmstripItem": "{{index}}: {{name}}",
+      "play": "Play through {{dim}}",
+      "pause": "Pause",
+      "previousValue": "Previous {{dim}}",
+      "nextValue": "Next {{dim}}",
+      "dimensions": "Output coordinates",
+      "spaceKey": "Space",
+      "timeline": "Forecast steps"
     },
     "adapters": {
-      "generic": { "label": "File" },
-      "image-raster": { "label": "Image" },
-      "image-vector": { "label": "SVG" },
-      "pdf": { "label": "PDF" }
+      "generic": {
+        "label": "File"
+      },
+      "image-raster": {
+        "label": "Image"
+      },
+      "image-vector": {
+        "label": "SVG"
+      },
+      "pdf": {
+        "label": "PDF"
+      },
+      "grib-stored": {
+        "label": "GRIB"
+      }
+    },
+    "lostNotice_one": "{{count}} output was not retained",
+    "lostNotice_other": "{{count}} outputs were not retained"
+  },
+  "compilation": {
+    "fullDescription": "Task-level graph compiled from this run. Click a block on the left to focus its cluster; click a task to focus its block.",
+    "forceDescription": "Drag a task to rearrange, click a block on the left to focus its cluster, hover to highlight lineage.",
+    "entryHint": "▶ marks entry points (no upstream tasks)",
+    "layoutLayered": "Layered",
+    "layoutOrganic": "Organic",
+    "unavailable": "Compilation detail unavailable",
+    "unavailableDescription": "This run was submitted before compilation detail was recorded, or its cache entry has expired.",
+    "fetchError": "Could not load compilation detail.",
+    "tooLargeTitle": "Layered view unavailable for graphs this large",
+    "tooLargeBody": "This run compiled into {{count}} tasks. The Layered view is limited to {{limit}} tasks because it can freeze the browser at larger sizes. The Graph tab uses canvas rendering and handles much larger DAGs.",
+    "openGraphTab": "Open Graph tab",
+    "taskCount_one": "{{count}} task",
+    "taskCount_other": "{{count}} tasks",
+    "close": "Close",
+    "noTasks": "No tasks compiled for this run.",
+    "taskKind": {
+      "select": "Select",
+      "inference": "Inference",
+      "payload": "Payload",
+      "plot": "Plot",
+      "transform": "Transform",
+      "unknown": "Task"
+    },
+    "fields": {
+      "taskId": "Task ID",
+      "parents": "Parents",
+      "kind": "Kind"
     }
   },
+  "storedOutputs": {
+    "title": "Stored outputs",
+    "fileCount": "{{n}} files",
+    "fileCountWriting": "{{written}} of {{n}} files written",
+    "copyPath": "Copy directory path",
+    "pathCopied": "Path copied to clipboard",
+    "pathCopyFailed": "Could not copy path",
+    "startWms": "Start WMS server",
+    "startingWms": "Starting WMS server…",
+    "stopWms": "Stop WMS server",
+    "visualise": "Visualise",
+    "copy": "Copy",
+    "copyWmsUrl": "Copy WMS URL",
+    "wmsUrlCopied": "WMS URL copied to clipboard",
+    "wmsUrlCopyFailed": "Could not copy WMS URL",
+    "lensFailed": "Could not start SkinnyWMS",
+    "fileMissing": "File not yet written by the run",
+    "sharedFolder": "Folder shared with other runs",
+    "sharedFolderHint": "Other runs write here too, so the map viewer can show their fields, and a later run can overwrite these files.",
+    "externalTitle": "Use this WMS in another tool",
+    "externalHint": "Copies a standard WMS GetCapabilities URL — paste it into QGIS, ArcGIS, or any other WMS-aware client to inspect the data there. The server keeps running until you stop it.",
+    "wmsUnavailable": "The WMS viewer is not available on this server (SkinnyWMS not installed)"
+  },
+  "zipDownload": {
+    "download": "Download .zip",
+    "moreOptions": "More download options",
+    "preparing": "Preparing the zip",
+    "preparingHint": "The download starts once the server has packed the files.",
+    "notReady": "Available when the run finishes",
+    "sharedFolder": "The zip includes files from other runs in this folder.",
+    "copyCommand": "Copy download command",
+    "copyCommandHint": "A curl command for a terminal or script",
+    "copyLink": "Copy download link",
+    "copyLinkHint": "Works in a browser where you're signed in",
+    "commandCopied": "Download command copied",
+    "linkCopied": "Download link copied",
+    "copyFailed": "Could not copy to the clipboard"
+  },
+  "lens": {
+    "layers": "Layers",
+    "loadingLayers": "Loading layers…",
+    "prevStep": "Previous time step",
+    "nextStep": "Next time step",
+    "play": "Play time animation",
+    "pause": "Pause time animation",
+    "fitView": "Fit view",
+    "pinLegend": "Pin legend open",
+    "unpinLegend": "Unpin legend",
+    "dragHandle": "Drag to reorder",
+    "copyMap": "Copy map to clipboard",
+    "mapCopied": "Map copied to clipboard",
+    "mapCopyFailed": "Could not copy map",
+    "preloadTimeSteps": "Preload time steps",
+    "preloadHelp": "About time-step preloading",
+    "preloadTimeStepsHelp": "Fetch every time step of every active layer in the background, so the time slider scrubs without stutter. Triggers when toggled on and after layer changes — pan or zoom and re-toggle if you want fresh prefetch for a new view. Bandwidth-heavy: skip on metered connections.",
+    "retry": "Retry",
+    "basemap": "Basemap",
+    "collapseSidebar": "Collapse sidebar",
+    "expandSidebar": "Expand sidebar",
+    "basemapOpacity": "Basemap opacity",
+    "legendUnavailable": "Legend unavailable",
+    "legendAlt": "{{title}} legend"
+  },
   "logs": {
-    "title": "Gateway Log",
-    "searchPlaceholder": "Filter logs...",
-    "jumpToBottom": "Jump to bottom",
-    "connected": "Connected",
-    "connecting": "Connecting...",
-    "disconnected": "Disconnected",
-    "executionEnded": "Job execution ended"
+    "file": "Log file",
+    "allFiles": "All files",
+    "group": {
+      "run": "This run",
+      "server": "Server-wide",
+      "details": "Run details"
+    },
+    "level": "Log level",
+    "levelAll": "All levels",
+    "levelInfo": "Info and above",
+    "levelWarning": "Warnings and errors",
+    "levelError": "Errors only",
+    "duringRun": "During run",
+    "duringRunHint": "Server-wide logs show only lines from {{from}} to {{to}}, while this run went on. Other runs in that time show too.",
+    "duringRunOpen": "Server-wide logs show only lines from {{from}} on, since this run started. Other runs in that time show too.",
+    "duringRunRunFile": "Applies to server-wide logs; this run's own files hold only its lines.",
+    "duringRunNoTimes": "The server-wide logs carry no times to match against this run.",
+    "searchPlaceholder": "Filter lines...",
+    "refresh": "Refresh",
+    "loading": "Collecting the run's logs...",
+    "loadFailed": "Couldn't load the logs",
+    "retry": "Retry",
+    "noFiles": "The log archive is empty.",
+    "noRunFiles": "This run's own log files are no longer on this server. Each server start keeps its logs in a new folder, so after a restart only the server-wide logs remain.",
+    "collectError": "The server couldn't collect this run's logs: {{detail}}",
+    "skippedLarge": "Too large to show here: {{files}}. Download the full logs to read them.",
+    "noMatches": "No lines match the filter.",
+    "noRunTimeLines": "No lines from while this run went on. Turn off \"During run\" to see the whole file.",
+    "errorCount_one": "{{count}} error",
+    "errorCount_other": "{{count}} errors",
+    "warningCount_one": "{{count}} warning",
+    "warningCount_other": "{{count}} warnings",
+    "matchCount_one": "{{count}} match",
+    "matchCount_other": "{{count}} matches",
+    "fileMeta_one": "{{size}}, {{lines}} line",
+    "fileMeta_other": "{{size}}, {{lines}} lines",
+    "fileMetaScoped": "{{size}}, {{shown}} of {{lines}} lines",
+    "allMeta_one": "{{lines}} line in {{files}}",
+    "allMeta_other": "{{lines}} lines in {{files}}",
+    "fileCount_one": "{{count}} file",
+    "fileCount_other": "{{count}} files",
+    "lineCount_one": "{{lines}} line",
+    "lineCount_other": "{{lines}} lines",
+    "sectionCapped": "last {{shown}} of {{total}} lines",
+    "open": "Open",
+    "openFile": "Open {{file}}",
+    "allHint": "Click a line to see it in its file, with the filters cleared.",
+    "firstError": "First error",
+    "wrapLines": "Wrap lines",
+    "downloadFile": "Download this file",
+    "copyLines": "Copy shown lines",
+    "copied": "Copied",
+    "copyFailed": "Couldn't copy the lines",
+    "landingTitle": "Run logs",
+    "landingText": "A snapshot of this run's log files and the server's shared logs. It's the same files as the download, unpacked here; they don't update by themselves.",
+    "viewHere": "View here",
+    "downloadZip": "Download .zip",
+    "downloadFailed": "Couldn't download the logs",
+    "snapshotFrom": "Snapshot from {{ago}}.",
+    "stillRunning": "The run is still going: new lines appear when you refresh.",
+    "refreshFailed": "Couldn't refresh the logs: {{detail}}",
+    "newSince": "New since {{time}}",
+    "olderLines_one": "{{lines}} older line is only in the download",
+    "olderLines_other": "{{lines}} older lines are only in the download",
+    "sizeTail": "{{size}}, last {{read}} read here"
   },
   "errors": {
-    "executionFailed": "Execution Failed",
-    "jobNotFound": "Job not found",
-    "jobNotFoundDescription": "The requested job could not be found.",
-    "backToExecutions": "Back to Executions"
+    "executionFailed": "Run failed",
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyFailed": "Couldn't copy the error message",
+    "showFull": "Show full error",
+    "showLess": "Show less",
+    "jobNotFound": "Run not found",
+    "jobNotFoundDescription": "The requested run could not be found.",
+    "backToExecutions": "Back to runs"
   },
   "empty": {
-    "title": "No executions",
-    "description": "You haven't run any forecast jobs yet. Start by creating a new forecast configuration.",
-    "action": "Create Forecast"
+    "title": "No runs",
+    "description": "You haven't run a forecast yet. Start by building a workflow.",
+    "action": "Configure a forecast",
+    "filtered": "No runs match your filters.",
+    "clearFilters": "Clear filters"
   },
   "filter": {
     "allStatuses": "All statuses",
@@ -134,15 +441,31 @@
     "running": "Running",
     "completed": "Completed",
     "failed": "Failed",
-    "searchPlaceholder": "Search executions..."
+    "stopped": "Stopped",
+    "searchPlaceholder": "Search runs..."
   },
   "list": {
-    "loading": "Loading executions...",
-    "error": "Failed to load executions"
+    "loading": "Loading runs...",
+    "error": "Failed to load runs",
+    "windowCapped": "Showing the {{shown}} most recent of {{total}} runs. Older runs are not listed."
   },
   "pagination": {
     "previous": "Previous",
     "next": "Next",
     "page": "Page {{current}} of {{total}}"
+  },
+  "attempts": {
+    "title": "Attempts",
+    "attempt": "Attempt {{number}}",
+    "count_one": "{{count}} attempt",
+    "count_other": "{{count}} attempts",
+    "failedCount_one": "· {{count}} failed",
+    "failedCount_other": "· {{count}} failed",
+    "duration": {
+      "days": "{{a}} d {{b}} h",
+      "hours": "{{a}} h {{b}} m",
+      "minutes": "{{a}} m {{b}} s",
+      "seconds": "{{a}} s"
+    }
   }
 }

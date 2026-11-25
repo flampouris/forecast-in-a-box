@@ -14,34 +14,39 @@
  * A single glyph row in the global glyphs list.
  */
 
-import { Braces, Pencil } from 'lucide-react'
+import { Braces, Pencil, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import type { GlyphDetail } from '@/api/types/fable.types'
+import type { GlobalGlyphItem } from '@/api/types/fable.types'
 import { Button } from '@/components/ui/button'
 import { P } from '@/components/base/typography'
 import { useUser } from '@/hooks/useUser'
 
 interface GlyphListItemProps {
-  glyph: GlyphDetail
-  onEdit: (glyph: GlyphDetail) => void
+  glyph: GlobalGlyphItem
+  onEdit: (glyph: GlobalGlyphItem) => void
+  onDelete: (glyph: GlobalGlyphItem) => void
 }
 
 const PASSTHROUGH_USER_ID = 'user'
 
-export function GlyphListItem({ glyph, onEdit }: GlyphListItemProps) {
+export function GlyphListItem({ glyph, onEdit, onDelete }: GlyphListItemProps) {
   const { t } = useTranslation('glyphs')
   const { data: user } = useUser()
 
   let creatorLabel: string
-  if (glyph.created_by === 'intrinsic') {
-    creatorLabel = t('creator.intrinsic')
-  } else if (glyph.created_by === PASSTHROUGH_USER_ID) {
+  if (glyph.created_by === PASSTHROUGH_USER_ID) {
     creatorLabel = t('creator.passthrough')
   } else if (user?.id && glyph.created_by === user.id) {
     creatorLabel = t('creator.you')
   } else {
     creatorLabel = glyph.created_by
   }
+  // Only hide Delete when the glyph is known to belong to someone else.
+  const canDelete =
+    glyph.created_by === PASSTHROUGH_USER_ID ||
+    user === undefined ||
+    user.id === glyph.created_by ||
+    user.is_superuser
 
   return (
     <div className="p-6 transition-colors hover:bg-muted/50">
@@ -52,19 +57,17 @@ export function GlyphListItem({ glyph, onEdit }: GlyphListItemProps) {
 
         <div className="grow">
           <div className="mb-1 flex items-center gap-2">
-            <code className="rounded bg-muted px-2 py-0.5 font-mono text-sm font-medium">
-              {'${' + glyph.name + '}'}
+            <code className="rounded-md bg-muted px-2 py-0.5 font-mono text-sm font-medium">
+              {'${' + glyph.key + '}'}
             </code>
             <span className="truncate text-xs text-muted-foreground italic">
               {t('creator.label')} {creatorLabel}
             </span>
           </div>
-          <P className="line-clamp-1 text-muted-foreground">
-            {glyph.valueExample}
-          </P>
+          <P className="line-clamp-1 text-muted-foreground">{glyph.value}</P>
         </div>
 
-        <div className="mt-2 flex w-full items-center justify-end sm:mt-0 sm:w-auto">
+        <div className="mt-2 flex w-full items-center justify-end gap-2 sm:mt-0 sm:w-auto">
           <Button
             variant="outline"
             size="sm"
@@ -74,6 +77,18 @@ export function GlyphListItem({ glyph, onEdit }: GlyphListItemProps) {
             <Pencil className="h-4 w-4" />
             {t('actions.edit')}
           </Button>
+          {canDelete && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="gap-1.5 text-danger hover:text-danger"
+              aria-label={t('actions.deleteLabel', { key: glyph.key })}
+              onClick={() => onDelete(glyph)}
+            >
+              <Trash2 className="h-4 w-4" />
+              {t('actions.delete')}
+            </Button>
+          )}
         </div>
       </div>
     </div>

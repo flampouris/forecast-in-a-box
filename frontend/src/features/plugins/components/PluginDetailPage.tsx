@@ -11,10 +11,10 @@
 /**
  * PluginDetailPage Component
  *
- * Full-page view of plugin details with block factories grid,
- * replacing the previous PluginDetailsSheet sidebar.
+ * Full-page view of plugin details with block factories grid.
  */
 
+import { formatDistanceToNow } from 'date-fns'
 import { ArrowLeft, Search } from 'lucide-react'
 import { useCallback, useMemo, useState } from 'react'
 import { Link, useNavigate } from '@tanstack/react-router'
@@ -22,15 +22,24 @@ import { useTranslation } from 'react-i18next'
 import { createSingleBlockFable } from '../utils/pipeline-generator'
 import { BlockFactoryCard } from './BlockFactoryCard'
 import { CapabilityBadges } from './CapabilityBadges'
+import { PluginDiagnostics } from './PluginDiagnostics'
 import { PluginIcon } from './PluginIcon'
-import { PluginStatusBadge } from './PluginStatusBadge'
+import { PluginStatusText } from './PluginStatusText'
+import { PluginVersionText } from './PluginVersionText'
 import type {
   BlockFactoryCatalogue,
   PluginBlockFactoryId,
 } from '@/api/types/fable.types'
 import type { PluginCapability, PluginInfo } from '@/api/types/plugins.types'
 import { BLOCK_KIND_ORDER, getFactory } from '@/api/types/fable.types'
-import { toPluginDisplayId } from '@/api/types/plugins.types'
+import {
+  pluginDisplayVersion,
+  toPluginDisplayId,
+} from '@/api/types/plugins.types'
+import {
+  CatalogueFact,
+  CatalogueFacts,
+} from '@/components/common/catalogue/CatalogueFacts'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Separator } from '@/components/ui/separator'
@@ -50,6 +59,11 @@ export function PluginDetailPage({ plugin, catalogue }: PluginDetailPageProps) {
     Set<PluginCapability>
   >(new Set())
   const [searchQuery, setSearchQuery] = useState('')
+  const version = pluginDisplayVersion(plugin)
+  // plugin.updatedAt is Z-suffixed UTC; don't route through serverTimeToLocal.
+  const updatedTimeAgo = plugin.updatedAt
+    ? formatDistanceToNow(new Date(plugin.updatedAt), { addSuffix: true })
+    : null
 
   const handleCapabilityToggle = useCallback((capability: PluginCapability) => {
     setSelectedCapabilities((prev) => {
@@ -137,17 +151,25 @@ export function PluginDetailPage({ plugin, catalogue }: PluginDetailPageProps) {
       <div className="flex items-start gap-4">
         <PluginIcon plugin={plugin} size="lg" />
         <div className="min-w-0 flex-1">
-          <H1 className="text-2xl font-bold">{plugin.name}</H1>
-          <P className="mt-1 text-muted-foreground">
-            {plugin.author}
-            {plugin.version && ` · v${plugin.version}`}
-          </P>
-          <div className="mt-2">
-            <PluginStatusBadge
-              status={plugin.status}
-              hasUpdate={plugin.hasUpdate}
-            />
-          </div>
+          <H1 className="text-2xl">{plugin.name}</H1>
+          <P className="mt-1 text-muted-foreground">{plugin.author}</P>
+          {/* The catalogue's columns as labelled values. */}
+          <CatalogueFacts className="mt-4">
+            {version && (
+              <CatalogueFact label={t('card.version')}>
+                <PluginVersionText version={version} plugin={plugin} />
+              </CatalogueFact>
+            )}
+            {updatedTimeAgo && (
+              <CatalogueFact label={t('table.headers.updated')}>
+                {updatedTimeAgo}
+              </CatalogueFact>
+            )}
+            <CatalogueFact label={t('table.headers.status')}>
+              {/* The diagnostics show in full below. */}
+              <PluginStatusText plugin={plugin} hoverDiagnostics={false} />
+            </CatalogueFact>
+          </CatalogueFacts>
         </div>
       </div>
 
@@ -155,6 +177,9 @@ export function PluginDetailPage({ plugin, catalogue }: PluginDetailPageProps) {
       {plugin.description && (
         <P className="text-muted-foreground">{plugin.description}</P>
       )}
+
+      {/* Diagnostics */}
+      {plugin.errorDetail && <PluginDiagnostics errors={plugin.errorDetail} />}
 
       {/* Capabilities */}
       {plugin.capabilities.length > 0 && (
@@ -218,13 +243,13 @@ export function PluginDetailPage({ plugin, catalogue }: PluginDetailPageProps) {
           )
         ) : plugin.isInstalled && plugin.isEnabled ? (
           <div className="py-8 text-center text-muted-foreground">
-            Loading block factories...
+            {t('detail.loadingBlockFactories')}
           </div>
         ) : (
           <div className="py-8 text-center text-muted-foreground">
             {plugin.isInstalled
-              ? 'Enable this plugin to view block factories.'
-              : 'Install this plugin to view block factories.'}
+              ? t('detail.enableToViewBlockFactories')
+              : t('detail.installToViewBlockFactories')}
           </div>
         )}
       </div>

@@ -13,19 +13,25 @@
  */
 
 import { z } from 'zod'
+import i18n from 'i18next'
 
 // ---------------------------------------------------------------------------
 // Schemas — must match backend models in routes/run.py
 // ---------------------------------------------------------------------------
 
-export const JobStatusSchema = z.enum([
-  'submitted',
-  'preparing',
-  'running',
-  'completed',
-  'failed',
-  'unknown',
-])
+// A status added later degrades to 'unknown' instead of failing whole lists.
+export const JobStatusSchema = z
+  .enum([
+    'submitted',
+    'preparing',
+    'running',
+    'stopping',
+    'stopped',
+    'completed',
+    'failed',
+    'unknown',
+  ])
+  .catch('unknown')
 
 /** routes/run.py: JobExecuteResponse */
 export const JobExecuteResponseSchema = z.object({
@@ -33,12 +39,29 @@ export const JobExecuteResponseSchema = z.object({
   attempt_count: z.number(),
 })
 
-/** routes/run.py: RunOutputMetadata */
-export const RunOutputMetadataSchema = z.object({
-  mime_type: z.string(),
-  original_block: z.string(),
-  is_available: z.boolean(),
-})
+/** routes/run.py: RunOutputDetail; the #798 labels are absent on older runs. */
+export const RunOutputMetadataSchema = z
+  .object({
+    mime_type: z.string(),
+    fetchable: z.boolean().default(false),
+    url_dataformat: z.enum(['gribdir', 'zarr']).nullish().catch(null),
+    display_name: z.string().nullish().catch(null),
+    dimension_kvs: z
+      .array(z.tuple([z.string(), z.string()]))
+      .nullish()
+      .catch(null),
+    original_block: z.string(),
+    is_available: z.boolean(),
+  })
+  // Interim: fold the structured fields back into the legacy long mime
+  // (`text/plain; fiab-format=...; fiab-fetchable=1`) the output adapters key on.
+  .transform(({ fetchable, url_dataformat, ...rest }) => ({
+    ...rest,
+    mime_type:
+      rest.mime_type +
+      (url_dataformat ? `; fiab-format=${url_dataformat}` : '') +
+      (fetchable ? '; fiab-fetchable=1' : ''),
+  }))
 
 /** routes/run.py: RunOutputsResponse — backend wraps the dict in `{ outputs: ... }`;
  * we flatten on parse so consumers can access `details.outputs[taskId]` directly. */
@@ -48,7 +71,10 @@ export const RunOutputsSchema = z
   })
   .transform((wrapper) => wrapper.outputs)
 
-/** routes/run.py: JobExecutionDetail (status narrowed from str to known values) */
+/** routes/run.py: JobExecutionDetail. `*_block_ids` are only set on
+ * /run/get and clear to `null` on terminal status, so both `null` and
+ * `undefined` are valid wire shapes. `lost_task_ids` was added after older
+ * backend versions, so an omitted field is treated as an empty map. */
 export const JobExecutionDetailSchema = z.object({
   run_id: z.string(),
   attempt_count: z.number(),
@@ -60,7 +86,29 @@ export const JobExecutionDetailSchema = z.object({
   error: z.string().nullable(),
   progress: z.string().nullable(),
   cascade_job_id: z.string().nullable(),
+  lost_task_ids: z.record(z.string(), z.string()).default({}),
   outputs: RunOutputsSchema.nullable(),
+  completed_block_ids: z.array(z.string()).nullable().optional(),
+  planned_block_ids: z.array(z.string()).nullable().optional(),
+  /** As-run values of glyphed options, by block then option; absent pre-#640.
+   * A value is null only for an explicitly null option (#691). */
+  resolution: z
+    .record(z.string(), z.record(z.string(), z.string().nullable()))
+    .nullable()
+    .optional(),
+})
+
+/** routes/run.py: CompilationDetailTask */
+export const CompilationDetailTaskSchema = z.object({
+  task_id: z.string(),
+  block: z.string(),
+  display_name: z.string(),
+  parents: z.array(z.string()),
+})
+
+/** routes/run.py: CompilationDetailResponse */
+export const CompilationDetailResponseSchema = z.object({
+  tasks: z.array(CompilationDetailTaskSchema),
 })
 
 /** routes/run.py: JobExecutionList */
@@ -75,7 +123,7 @@ export const JobExecutionListSchema = z.object({
 /** fiab_core/artifacts.py: CompositeArtifactId */
 export const CompositeArtifactIdSchema = z.object({
   artifact_store_id: z.string(),
-  ml_model_checkpoint_id: z.string(),
+  artifact_local_id: z.string(),
 })
 
 /** domain/blueprint/cascade.py: EnvironmentSpecification */
@@ -84,19 +132,6 @@ export const EnvironmentSpecificationSchema = z.object({
   workers_per_host: z.number().nullable(),
   environment_variables: z.record(z.string(), z.string()),
   runtime_artifacts: z.array(CompositeArtifactIdSchema).default([]),
-})
-
-/** routes/run.py: RawCascadeJob */
-const RawCascadeJobSchema = z.object({
-  job_type: z.literal('raw_cascade_job'),
-  job_instance: z.unknown(),
-})
-
-/** routes/run.py: ExecutionSpecification */
-export const ExecutionSpecificationSchema = z.object({
-  job: RawCascadeJobSchema,
-  environment: EnvironmentSpecificationSchema,
-  shared: z.boolean(),
 })
 
 // ---------------------------------------------------------------------------
@@ -108,10 +143,18 @@ export type JobStatus = z.infer<typeof JobStatusSchema>
 export const TERMINAL_STATUSES: ReadonlySet<JobStatus> = new Set([
   'completed',
   'failed',
+  'stopped',
 ])
 
 export function isTerminalStatus(status: JobStatus): boolean {
   return TERMINAL_STATUSES.has(status)
+}
+
+/** Statuses `/run/stop` accepts; finished runs are deleted instead. */
+export function isStoppableStatus(status: JobStatus): boolean {
+  return (
+    status === 'submitted' || status === 'preparing' || status === 'running'
+  )
 }
 
 export type JobExecuteResponse = z.infer<typeof JobExecuteResponseSchema>
@@ -119,11 +162,12 @@ export type RunOutputMetadata = z.infer<typeof RunOutputMetadataSchema>
 export type RunOutputs = z.infer<typeof RunOutputsSchema>
 export type JobExecutionDetail = z.infer<typeof JobExecutionDetailSchema>
 export type JobExecutionList = z.infer<typeof JobExecutionListSchema>
+export type CompilationDetailTask = z.infer<typeof CompilationDetailTaskSchema>
+export type CompilationDetailResponse = z.infer<
+  typeof CompilationDetailResponseSchema
+>
 export type EnvironmentSpecification = z.infer<
   typeof EnvironmentSpecificationSchema
->
-export type ExecutionSpecification = z.infer<
-  typeof ExecutionSpecificationSchema
 >
 
 /** POST /run/create request (not validated — outbound only) */
@@ -141,14 +185,58 @@ export function createDefaultEnvironment(): EnvironmentSpecification {
   }
 }
 
+// `label` is a getter so it resolves through i18next on access (at render),
+// keeping this module free of the i18n initialisation side-effect.
 export const JOB_STATUS_META: Record<
   JobStatus,
   { label: string; color: string }
 > = {
-  submitted: { label: 'Submitted', color: 'blue' },
-  preparing: { label: 'Preparing', color: 'blue' },
-  running: { label: 'Running', color: 'amber' },
-  completed: { label: 'Completed', color: 'green' },
-  failed: { label: 'Failed', color: 'red' },
-  unknown: { label: 'Unknown', color: 'gray' },
-} as const
+  submitted: {
+    get label() {
+      return i18n.t('executions:status.submitted')
+    },
+    color: 'blue',
+  },
+  preparing: {
+    get label() {
+      return i18n.t('executions:status.preparing')
+    },
+    color: 'blue',
+  },
+  running: {
+    get label() {
+      return i18n.t('executions:status.running')
+    },
+    color: 'amber',
+  },
+  stopping: {
+    get label() {
+      return i18n.t('executions:status.stopping')
+    },
+    color: 'gray',
+  },
+  stopped: {
+    get label() {
+      return i18n.t('executions:status.stopped')
+    },
+    color: 'gray',
+  },
+  completed: {
+    get label() {
+      return i18n.t('executions:status.completed')
+    },
+    color: 'green',
+  },
+  failed: {
+    get label() {
+      return i18n.t('executions:status.failed')
+    },
+    color: 'red',
+  },
+  unknown: {
+    get label() {
+      return i18n.t('executions:status.unknown')
+    },
+    color: 'gray',
+  },
+}

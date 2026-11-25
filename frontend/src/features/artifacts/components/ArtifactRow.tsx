@@ -8,104 +8,99 @@
  * does it submit to any jurisdiction.
  */
 
-/**
- * ArtifactRow Component
- *
- * Table row for a downloaded ML model artifact.
- * Follows the PluginRow pattern for consistent table layout.
- */
-
-import { Eye, HardDrive, Trash2 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { ArtifactStatusBadge } from './ArtifactStatusBadge'
-import type {
-  ArtifactInfo,
-  CompositeArtifactId,
-} from '@/api/types/artifacts.types'
-import { Button } from '@/components/ui/button'
-import { Spinner } from '@/components/ui/spinner'
-import { H4, P } from '@/components/base/typography'
+import { Link } from '@tanstack/react-router'
+import { ArtifactActions } from './ArtifactActions'
+import { ArtifactIdLine } from './ArtifactIdLine'
+import { ArtifactStatusText } from './ArtifactStatusText'
+import { ArtifactTagChips } from './ArtifactTagChips'
+import type { ArtifactItemHandlers } from './ArtifactActions'
+import type { ArtifactInfo } from '@/api/types/artifacts.types'
+import { artifactMaturity, nonMaturityTags } from '@/api/types/artifacts.types'
+import { useDownloadProgress } from '@/api/hooks/useArtifacts'
+import { H4 } from '@/components/base/typography'
+import { CatalogueRow } from '@/components/common/catalogue/CatalogueView'
 
-interface ArtifactRowProps {
+interface ArtifactRowProps extends ArtifactItemHandlers {
   artifact: ArtifactInfo
-  onDelete: (compositeId: CompositeArtifactId) => void
-  onViewDetails?: (artifact: ArtifactInfo) => void
-  isDeleting?: boolean
+  isDeleting: boolean
+  /** Prefix ids with their store. */
+  showStore: boolean
 }
 
 export function ArtifactRow({
   artifact,
-  onDelete,
-  onViewDetails,
   isDeleting,
+  showStore,
+  ...handlers
 }: ArtifactRowProps) {
   const { t } = useTranslation('artifacts')
+  const { isDownloading, progress, error } = useDownloadProgress(artifact.id)
+  const busyLabel = isDownloading
+    ? t('actions.downloading')
+    : isDeleting
+      ? t('actions.deleting')
+      : undefined
+  // Maturity has its own column.
+  const otherTags = nonMaturityTags(artifact.tags)
 
   return (
-    <div className="group grid grid-cols-1 items-center gap-4 px-6 py-5 transition-colors hover:bg-muted/50 sm:grid-cols-12">
-      {/* Model Details */}
-      <div className="flex items-start gap-4 sm:col-span-5">
-        <div>
-          <H4 className="text-sm font-semibold">{artifact.displayName}</H4>
-          <P className="mt-0.5 line-clamp-1 text-muted-foreground">
+    <CatalogueRow>
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-baseline gap-2">
+          <H4 className="truncate text-sm font-semibold">
+            <Link
+              to="/admin/artifacts/$artifactId"
+              params={{ artifactId: artifact.encodedId }}
+              className="hover:underline"
+            >
+              {artifact.displayName}
+            </Link>
+          </H4>
+          <span className="shrink-0 text-sm text-muted-foreground">
             {artifact.author}
-          </P>
-          <div className="mt-1 flex flex-wrap items-center gap-2">
-            {artifact.platforms.map((platform) => (
-              <span
-                key={platform}
-                className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground"
-              >
-                {platform}
-              </span>
-            ))}
-          </div>
+          </span>
         </div>
-      </div>
-
-      {/* Disk Size */}
-      <div className="hidden items-center gap-2 text-sm text-muted-foreground sm:col-span-2 sm:flex">
-        {artifact.diskSize !== '-' && (
-          <>
-            <HardDrive className="h-3.5 w-3.5" />
-            {artifact.diskSize}
-          </>
+        <ArtifactIdLine
+          id={artifact.id}
+          showStore={showStore}
+          className="mt-0.5"
+        />
+        {Object.keys(otherTags).length > 0 && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+            <ArtifactTagChips
+              tags={otherTags}
+              max={2}
+              className="px-1.5 text-xs"
+            />
+          </div>
         )}
       </div>
 
-      {/* Status */}
-      <div className="flex items-center sm:col-span-3">
-        <ArtifactStatusBadge isAvailable={artifact.isAvailable} />
+      <div className="hidden text-sm text-muted-foreground capitalize md:block">
+        {artifactMaturity(artifact.tags)}
       </div>
 
-      {/* Actions */}
-      <div className="flex items-center justify-end gap-3 sm:col-span-2">
-        {onViewDetails && (
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-1.5"
-            onClick={() => onViewDetails(artifact)}
-          >
-            <Eye className="h-4 w-4" />
-            <span className="hidden lg:inline">{t('actions.viewDetails')}</span>
-          </Button>
-        )}
-        <Button
-          variant="outline"
-          size="icon"
-          className="text-destructive hover:text-destructive"
-          onClick={() => onDelete(artifact.id)}
-          disabled={isDeleting}
-          aria-label={t('actions.delete')}
-        >
-          {isDeleting ? (
-            <Spinner className="h-4 w-4" />
-          ) : (
-            <Trash2 className="h-4 w-4" />
-          )}
-        </Button>
+      <div className="hidden text-sm text-muted-foreground tabular-nums lg:block">
+        {artifact.diskSize !== '-' && artifact.diskSize}
       </div>
-    </div>
+
+      <div>
+        <ArtifactStatusText
+          artifact={artifact}
+          busyLabel={busyLabel}
+          downloadError={error}
+        />
+      </div>
+
+      <ArtifactActions
+        artifact={artifact}
+        downloadProgress={isDownloading ? (progress ?? 0) : undefined}
+        downloadError={error}
+        isDeleting={isDeleting}
+        layout="row"
+        {...handlers}
+      />
+    </CatalogueRow>
   )
 }

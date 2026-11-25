@@ -9,7 +9,8 @@
  */
 
 import { memo, useMemo, useState } from 'react'
-import { Plus } from 'lucide-react'
+import { GitBranch, Scissors } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 
 import type {
   BlockFactory,
@@ -23,31 +24,29 @@ import {
   factoryIdToKey,
   getBlockKindIcon,
   getFactory,
+  pluginIdToDisplayKey,
 } from '@/api/types/fable.types'
-import { Button } from '@/components/ui/button'
 import {
   Popover,
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
 import { Input } from '@/components/ui/input'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
+import { TOUR, tourActionAttr, tourAttr } from '@/features/tutorials/anchors'
 import { cn } from '@/lib/utils'
+import { BlockName } from '@/features/fable-builder/components/shared/BlockName'
+import {
+  collidingTitles,
+  qualifiedFactoryTitle,
+} from '@/features/fable-builder/utils/block-names'
 
 interface AddNodeButtonProps {
   sourceBlockId: BlockInstanceId
   possibleExpansions: Array<PluginBlockFactoryId>
   catalogue: BlockFactoryCatalogue
-  /** When true, the button adopts the destructive color to signal errors on the parent node */
-  hasErrors?: boolean
-  /** When true, this block already has a downstream connection — hide the button */
-  hasDownstream?: boolean
-}
-
-const POSITION_CLASSES: Record<string, string> = {
-  TB: 'absolute -bottom-4 left-1/2 -translate-x-1/2',
-  LR: 'absolute -right-4 top-1/2 -translate-y-1/2',
-  BT: 'absolute -top-4 left-1/2 -translate-x-1/2',
-  RL: 'absolute -left-4 top-1/2 -translate-y-1/2',
+  /** The block's output `<Handle>` — it doubles as the add-menu trigger. */
+  children: React.ReactElement
 }
 
 const POPOVER_SIDE: Record<string, 'top' | 'bottom' | 'left' | 'right'> = {
@@ -57,19 +56,40 @@ const POPOVER_SIDE: Record<string, 'top' | 'bottom' | 'left' | 'right'> = {
   RL: 'left',
 }
 
+const EMPTY_EXPANSION_RESTRICTIONS: Record<string, Record<string, string>> = {}
+const EMPTY_CONFIG_RESTRICTIONS: Record<string, string> = {}
+
+/** Wraps a block's output `<Handle>` with an add-downstream-block popover:
+ *  clicking the handle opens the menu, dragging it still draws a connection. */
 export const AddNodeButton = memo(function ({
   sourceBlockId,
   possibleExpansions,
   catalogue,
-  hasErrors = false,
-  hasDownstream = false,
+  children,
 }: AddNodeButtonProps) {
+  const { t } = useTranslation('configure')
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
+  const [addMode, setAddMode] = useState<'branch' | 'insert'>('branch')
 
   const addBlock = useFableBuilderStore((state) => state.addBlock)
   const connectBlocks = useFableBuilderStore((state) => state.connectBlocks)
+  const setBlockConfigurationRestrictions = useFableBuilderStore(
+    (state) => state.setBlockConfigurationRestrictions,
+  )
+  const blocks = useFableBuilderStore((state) => state.fable.blocks)
   const layoutDirection = useFableBuilderStore((state) => state.layoutDirection)
+  const expansionRestrictions = useFableBuilderStore(
+    (state) =>
+      state.validationState?.blockStates[sourceBlockId]
+        ?.possibleExpansionRestrictions ?? EMPTY_EXPANSION_RESTRICTIONS,
+  )
+  const beginHistoryTransaction = useFableBuilderStore(
+    (state) => state.beginHistoryTransaction,
+  )
+  const endHistoryTransaction = useFableBuilderStore(
+    (state) => state.endHistoryTransaction,
+  )
 
   // When the backend provides validated expansions, use them. Otherwise build
   // a fallback from the full catalogue (all factories that accept inputs) so
@@ -80,10 +100,18 @@ export const AddNodeButton = memo(function ({
         .map((id) => ({
           id,
           factory: getFactory(catalogue, id),
+          restrictions:
+            expansionRestrictions[factoryIdToKey(id)] ??
+            EMPTY_CONFIG_RESTRICTIONS,
         }))
         .filter(
-          (item): item is { id: PluginBlockFactoryId; factory: BlockFactory } =>
-            item.factory !== undefined,
+          (
+            item,
+          ): item is {
+            id: PluginBlockFactoryId
+            factory: BlockFactory
+            restrictions: Record<string, string>
+          } => item.factory !== undefined,
         )
     }
 
@@ -91,6 +119,7 @@ export const AddNodeButton = memo(function ({
     const fallback: Array<{
       id: PluginBlockFactoryId
       factory: BlockFactory
+      restrictions: Record<string, string>
     }> = []
     for (const [pluginKey, plugin] of Object.entries(catalogue)) {
       for (const [factoryKey, factory] of Object.entries(plugin.factories)) {
@@ -100,28 +129,59 @@ export const AddNodeButton = memo(function ({
           fallback.push({
             id: { plugin: { store, local }, factory: factoryKey },
             factory,
+            restrictions: {},
           })
         }
       }
     }
     return fallback
-  }, [possibleExpansions, catalogue])
+  }, [possibleExpansions, catalogue, expansionRestrictions])
+
+  // Existing consumers of this source — inserting is only meaningful when ≥1.
+  const downstreamConsumers = useMemo(
+    () =>
+      Object.entries(blocks).flatMap(([id, block]) =>
+        Object.entries(block.input_ids)
+          .filter(([, parentId]) => parentId === sourceBlockId)
+          .map(([inputName]) => ({ id, inputName })),
+      ),
+    [blocks, sourceBlockId],
+  )
+  const canOfferInsert = downstreamConsumers.length > 0
+  // Insert needs an output to continue the chain, so sinks are branch-only.
+  const insertMode = addMode === 'insert' && canOfferInsert
+
+  const colliding = useMemo(() => collidingTitles(catalogue), [catalogue])
+  const titleOf = (id: PluginBlockFactoryId, factory: BlockFactory) =>
+    qualifiedFactoryTitle(
+      factory.title,
+      pluginIdToDisplayKey(id.plugin),
+      colliding,
+    )
 
   const filteredFactories = useMemo(() => {
-    if (!search.trim()) return availableFactories
+    const byMode = insertMode
+      ? availableFactories.filter(({ factory }) => factory.kind !== 'sink')
+      : availableFactories
+    if (!search.trim()) return byMode
 
     const searchLower = search.toLowerCase()
-    return availableFactories.filter(
-      ({ factory }) =>
+    return byMode.filter(
+      ({ id, factory }) =>
         factory.title.toLowerCase().includes(searchLower) ||
-        factory.description.toLowerCase().includes(searchLower),
+        factory.description.toLowerCase().includes(searchLower) ||
+        pluginIdToDisplayKey(id.plugin).toLowerCase().includes(searchLower),
     )
-  }, [availableFactories, search])
+  }, [availableFactories, search, insertMode])
 
   const groupedFactories = useMemo(() => {
     const groups: Record<
       string,
-      Array<{ id: PluginBlockFactoryId; factory: BlockFactory }>
+      Array<{
+        id: PluginBlockFactoryId
+        factory: BlockFactory
+        restrictions: Record<string, string>
+      }>
     > = {}
 
     for (const item of filteredFactories) {
@@ -136,55 +196,89 @@ export const AddNodeButton = memo(function ({
   const handleAddBlock = (
     factoryId: PluginBlockFactoryId,
     factory: BlockFactory,
+    restrictions: Record<string, string>,
   ) => {
-    const newBlockId = addBlock(factoryId, factory)
+    // Insert needs a non-sink with inputs; otherwise add as a branch.
+    const doInsert =
+      insertMode && factory.kind !== 'sink' && factory.inputs.length > 0
 
-    if (factory.inputs.length > 0) {
-      connectBlocks(newBlockId, factory.inputs[0], sourceBlockId)
+    // Group add + connect + splice rewires into a single undo step.
+    beginHistoryTransaction()
+    try {
+      const newBlockId = addBlock(factoryId, factory)
+
+      if (factory.inputs.length > 0) {
+        connectBlocks(newBlockId, factory.inputs[0], sourceBlockId)
+      }
+      setBlockConfigurationRestrictions(newBlockId, restrictions)
+
+      if (doInsert) {
+        // Slice: redirect the source's existing consumers through the new block.
+        for (const { id, inputName } of downstreamConsumers) {
+          connectBlocks(id, inputName, newBlockId)
+        }
+      }
+    } finally {
+      endHistoryTransaction()
     }
 
     setOpen(false)
     setSearch('')
   }
 
-  // Once a downstream block is connected, the output Handle is enough —
-  // the plus button is only for adding the first downstream block.
-  if (hasDownstream) {
-    return null
-  }
-
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger
-        render={
-          <Button
-            size="icon"
-            variant="outline"
-            className={cn(
-              POSITION_CLASSES[layoutDirection],
-              'h-7 w-7 rounded-full',
-              'border-2 bg-background shadow-md hover:bg-background',
-              hasErrors
-                ? 'border-destructive text-destructive hover:border-destructive/70'
-                : 'hover:border-primary hover:text-primary',
-              'nodrag nopan transition-all duration-200',
-            )}
-            onClick={(e) => e.stopPropagation()}
-          />
-        }
-      >
-        <Plus className="h-4 w-4" />
-      </PopoverTrigger>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next)
+        if (next) setAddMode('branch')
+      }}
+    >
+      {/* The trigger is the output `<Handle>` (a div), not a native button. */}
+      <PopoverTrigger nativeButton={false} render={children} />
       <PopoverContent
         className="w-72 p-0"
         side={POPOVER_SIDE[layoutDirection]}
         align="center"
         sideOffset={8}
         onClick={(e) => e.stopPropagation()}
+        {...tourAttr(TOUR.configure.addMenu)}
       >
+        {canOfferInsert && (
+          <div className="border-b p-2">
+            {/* Branch off the source, or slice into its edges. */}
+            <ToggleGroup
+              value={[addMode]}
+              onValueChange={(values) => {
+                // Base UI single-select is still string[]; ignore empty (re-click).
+                const next = values[0]
+                if (next === 'branch' || next === 'insert') setAddMode(next)
+              }}
+              variant="outline"
+              className="w-full"
+            >
+              <ToggleGroupItem
+                value="branch"
+                variant="outline"
+                className="flex-1 gap-1.5 text-xs"
+              >
+                <GitBranch className="size-3.5" />
+                {t('addNode.modeBranch')}
+              </ToggleGroupItem>
+              <ToggleGroupItem
+                value="insert"
+                variant="outline"
+                className="flex-1 gap-1.5 text-xs"
+              >
+                <Scissors className="size-3.5" />
+                {t('addNode.modeInsert')}
+              </ToggleGroupItem>
+            </ToggleGroup>
+          </div>
+        )}
         <div className="border-b p-2">
           <Input
-            placeholder="Search blocks..."
+            placeholder={t('addNode.searchPlaceholder')}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="h-8"
@@ -194,7 +288,7 @@ export const AddNodeButton = memo(function ({
         <div className="max-h-64 overflow-y-auto p-1">
           {Object.keys(groupedFactories).length === 0 ? (
             <div className="py-4 text-center text-sm text-muted-foreground">
-              No blocks found
+              {t('addNode.noBlocksFound')}
             </div>
           ) : (
             Object.entries(groupedFactories).map(([kind, factories]) => {
@@ -207,19 +301,23 @@ export const AddNodeButton = memo(function ({
                     {metadata.label}
                   </div>
 
-                  {factories.map(({ id, factory }) => {
+                  {factories.map(({ id, factory, restrictions }) => {
                     const IconComponent = getBlockKindIcon(factory.kind)
                     const itemMetadata = BLOCK_KIND_METADATA[factory.kind]
 
                     return (
                       <button
                         key={factoryIdToKey(id)}
+                        data-factory-key={factoryIdToKey(id)}
+                        {...tourActionAttr('add-block')}
                         className={cn(
                           'flex w-full items-start gap-2 rounded-md p-2',
                           'text-left hover:bg-accent',
                           'transition-colors',
                         )}
-                        onClick={() => handleAddBlock(id, factory)}
+                        onClick={() =>
+                          handleAddBlock(id, factory, restrictions)
+                        }
                       >
                         <IconComponent
                           className={cn(
@@ -229,7 +327,7 @@ export const AddNodeButton = memo(function ({
                         />
                         <div className="min-w-0">
                           <div className="truncate text-sm font-medium">
-                            {factory.title}
+                            <BlockName name={titleOf(id, factory)} />
                           </div>
                           <div className="line-clamp-1 text-sm text-muted-foreground">
                             {factory.description}

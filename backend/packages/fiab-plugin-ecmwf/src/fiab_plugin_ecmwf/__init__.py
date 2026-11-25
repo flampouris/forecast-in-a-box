@@ -7,21 +7,57 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import dataclasses
+
 from fiab_core.fable import BlockFactoryId
+from fiab_core.plugin import Plugin
 from fiab_core.tools.blocks import QubedBlockBuilder
 from fiab_core.tools.plugins import QubedPluginBuilder
 
-from fiab_plugin_ecmwf.anemoi.blocks import AnemoiSource, AnemoiTransform
-from fiab_plugin_ecmwf.blocks import EkdSource, EnsembleStatistics, MapPlotSink, TemporalStatistics, ZarrSink
+from fiab_plugin_ecmwf.anemoi.blocks import AnemoiInputSource, AnemoiSource, AnemoiTransform
+from fiab_plugin_ecmwf.blocks import (
+    OperationalForecastSource,
+    Select,
+)
+from fiab_plugin_ecmwf.geography.blocks import GeographicalTransform
+from fiab_plugin_ecmwf.output.blocks import GribSink, ZarrSink
+from fiab_plugin_ecmwf.plotting.blocks import MapPlotSink
+from fiab_plugin_ecmwf.products.blocks import (
+    CustomThresholdProbability,
+    EnsembleStatistics,
+    PredefinedThresholdProbability,
+    Quantiles,
+    ThermalIndices,
+    WindSpeed,
+)
+from fiab_plugin_ecmwf.templates.aifs_forecast import template as _aifs_forecast_template
+from fiab_plugin_ecmwf.templates.ifs_ensemble_statistics import template as _ensemble_statistics_template
+from fiab_plugin_ecmwf.templates.prototype import template as _snapshot_template
 
 blocks: dict[BlockFactoryId, QubedBlockBuilder] = {
-    BlockFactoryId("ekdSource"): EkdSource(),
+    BlockFactoryId("operationalForecastSource"): OperationalForecastSource(),
     BlockFactoryId("ensembleStatistics"): EnsembleStatistics(),
-    BlockFactoryId("temporalStatistics"): TemporalStatistics(),
+    BlockFactoryId("predefinedThresholdProbability"): PredefinedThresholdProbability(),
+    BlockFactoryId("customThresholdProbability"): CustomThresholdProbability(),
+    BlockFactoryId("thermalIndices"): ThermalIndices(),
+    BlockFactoryId("windSpeed"): WindSpeed(),
+    BlockFactoryId("quantiles"): Quantiles(),
+    BlockFactoryId("select"): Select(),
     BlockFactoryId("zarrSink"): ZarrSink(),
+    BlockFactoryId("gribSink"): GribSink(),
     BlockFactoryId("anemoiSource"): AnemoiSource(),
+    BlockFactoryId("anemoiInputSource"): AnemoiInputSource(),
     BlockFactoryId("anemoiTransform"): AnemoiTransform(),
     BlockFactoryId("mapPlotSink"): MapPlotSink(),
+    BlockFactoryId("geographicalTransform"): GeographicalTransform(),
 }
 
-plugin = QubedPluginBuilder(block_builders=blocks, base_environment=["fiab-plugin-ecmwf"]).as_plugin()
+_base_plugin = QubedPluginBuilder(block_builders=blocks, base_environment=["fiab-plugin-ecmwf"]).as_plugin()
+
+
+def plugin() -> Plugin:
+    # Declaration order is presentation order.
+    return dataclasses.replace(
+        _base_plugin(),
+        blueprint_templates=(_snapshot_template, _aifs_forecast_template, _ensemble_statistics_template),
+    )

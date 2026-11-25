@@ -1,0 +1,489 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * Lists sink outputs written to disk, derived from the run's own outputs:
+ * GribSink streams its (run-private, glyph-resolved) output directory as a
+ * `GRIB_DIR_MIME` payload. "Visualise" opens the output on /visualise (a
+ * lens is started there as needed); the copy action copies the
+ * GetCapabilities URL for external WMS clients (QGIS, ArcGIS, …). The lens
+ * lifecycle is explicit on the row: a running server shows a Stop control.
+ */
+
+import { useEffect, useMemo, useState } from 'react'
+import {
+  AlertCircle,
+  Copy,
+  Earth,
+  FolderOpen,
+  Loader2,
+  Play,
+  Square,
+} from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { useNavigate } from '@tanstack/react-router'
+import type {
+  BlockFactoryCatalogue,
+  FableBuilderV1,
+} from '@/api/types/fable.types'
+import type { JobStatus, RunOutputs } from '@/api/types/job.types'
+import type { LostTaskIds } from '@/features/executions/outputs/availability'
+import { classifyOutput } from '@/features/executions/outputs/availability'
+import { blockDisplayNames } from '@/features/fable-builder/utils/block-names'
+import {
+  useLensList,
+  useLensStatus,
+  useSkinnyWmsAvailable,
+  useStartSkinnyWms,
+  useStopLens,
+} from '@/api/hooks/useLens'
+import { buildAbsoluteWmsCapabilitiesUrl } from '@/api/endpoints/lens'
+import {
+  isSinkComplete,
+  useStoredDirPath,
+} from '@/features/executions/outputs/stored-dir'
+import { isGribDirMime } from '@/features/executions/outputs/adapters/grib'
+import { isFetchableMime } from '@/features/executions/outputs/mime'
+import { OutputZipButton } from '@/features/executions/outputs/OutputZipButton'
+import { useExecutionHoverStore } from '@/features/executions/stores/executionHoverStore'
+import { SLOT_B_OFF, entryRef } from '@/features/visualise/entry-ref'
+import {
+  lensOwnerKey,
+  pickMatchedLens,
+  setLensOwner,
+} from '@/features/visualise/lens-owners'
+import { showToast } from '@/lib/toast'
+import { cn, copyToClipboard } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import { P } from '@/components/base/typography'
+
+const GRIB_CHIP_CLASS =
+  'bg-emerald-100 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
+
+/** Split "/a/b/dirname" into the dimmed parent and emphasized last segment. */
+function splitPath(path: string): { dir: string; name: string } {
+  const trimmed = path.replace(/\/$/, '')
+  const idx = trimmed.lastIndexOf('/')
+  if (idx < 0) return { dir: '', name: trimmed }
+  return { dir: trimmed.slice(0, idx + 1), name: trimmed.slice(idx + 1) }
+}
+
+interface StoredOutputsCardProps {
+  jobId: string
+  /** Run status and attempt: lens actions wait until a sink is complete. */
+  status: JobStatus
+  attempt: number
+  outputs: RunOutputs | null
+  /** Reasons for outputs that are no longer retrievable. */
+  lostTaskIds?: LostTaskIds
+  /** Optional: resolve human-readable sink titles from the run's fable. */
+  fable?: FableBuilderV1
+  catalogue?: BlockFactoryCatalogue
+  /** Blueprint display name — snapshotted into comparison entries. */
+  runName?: string
+}
+
+interface StoredOutputRow {
+  blockId: string
+  /** Representative marker task for this sink block (payload source). */
+  taskId: string
+  title: string
+  isAvailable: boolean
+  /** Reason the sink's data is no longer retrievable. */
+  lostReason?: string
+  /** Number of GRIB marker tasks the sink fanned out to. */
+  count: number
+  /** Marker tasks already written. */
+  written: number
+  /** Backend can zip the folder. */
+  fetchable: boolean
+}
+
+export function StoredOutputsCard({
+  jobId,
+  status,
+  attempt,
+  outputs,
+  lostTaskIds = {},
+  fable,
+  catalogue,
+  runName,
+}: StoredOutputsCardProps) {
+  const { t } = useTranslation('executions')
+
+  // One row per sink block — a sink fans out to one marker task per cascade
+  // branch (e.g. per ensemble member), all pointing at the same directory.
+  const rows = useMemo<Array<StoredOutputRow>>(() => {
+    const names = fable ? blockDisplayNames(fable, catalogue) : {}
+    if (!outputs) return []
+    const byBlock = new Map<string, StoredOutputRow>()
+    for (const [taskId, meta] of Object.entries(outputs)) {
+      if (!isGribDirMime(meta.mime_type)) continue
+      const availability = classifyOutput(
+        meta.is_available,
+        taskId,
+        lostTaskIds,
+      )
+      const existing = byBlock.get(meta.original_block)
+      if (existing) {
+        existing.count += 1
+        if (meta.is_available) existing.written += 1
+        // Prefer an available marker as the representative payload source.
+        if (!existing.isAvailable && meta.is_available) {
+          existing.taskId = taskId
+          existing.isAvailable = true
+          existing.lostReason = undefined
+        } else if (
+          !existing.isAvailable &&
+          existing.lostReason === undefined &&
+          availability.state === 'lost'
+        ) {
+          existing.lostReason = availability.reason
+        }
+        continue
+      }
+      byBlock.set(meta.original_block, {
+        blockId: meta.original_block,
+        taskId,
+        title: names[meta.original_block] ?? meta.original_block,
+        isAvailable: meta.is_available,
+        lostReason:
+          availability.state === 'lost' ? availability.reason : undefined,
+        count: 1,
+        written: meta.is_available ? 1 : 0,
+        fetchable: isFetchableMime(meta.mime_type),
+      })
+    }
+    return Array.from(byBlock.values())
+  }, [outputs, lostTaskIds, fable, catalogue])
+
+  if (rows.length === 0) return null
+
+  return (
+    <Card className="gap-3 p-4">
+      <div className="flex items-center gap-2">
+        <FolderOpen className="h-4 w-4 text-muted-foreground" />
+        <P className="font-medium">{t('storedOutputs.title')}</P>
+      </div>
+      <ul className="divide-y divide-border">
+        {rows.map((row) => (
+          <StoredOutputRowItem
+            key={row.blockId}
+            jobId={jobId}
+            row={row}
+            complete={isSinkComplete(
+              { written: row.written, total: row.count },
+              status,
+            )}
+            owner={lensOwnerKey(jobId, attempt)}
+            runName={runName}
+          />
+        ))}
+      </ul>
+    </Card>
+  )
+}
+
+function StoredOutputRowItem({
+  jobId,
+  row,
+  complete,
+  owner,
+  runName,
+}: {
+  jobId: string
+  row: StoredOutputRow
+  /** Sink finished writing; a lens scans its folder once. */
+  complete: boolean
+  /** Run attempt a started lens belongs to. */
+  owner: string
+  runName?: string
+}) {
+  const { t } = useTranslation('executions')
+  // Graph selection, shown like the output cards: ring on this sink, fade on others.
+  const selection = useExecutionHoverStore((state) =>
+    state.selectedBlockId === null
+      ? null
+      : state.selectedBlockId === row.blockId
+        ? 'this'
+        : 'other',
+  )
+  // false only when the backend reports SkinnyWMS as not installed.
+  const wmsUnavailable = useSkinnyWmsAvailable() === false
+  const startMutation = useStartSkinnyWms()
+  const stopMutation = useStopLens()
+  const dirQuery = useStoredDirPath(jobId, row.taskId, row.isAvailable)
+  const dirPath = dirQuery.data
+  // A lens this row just started, else any live lens on its folder.
+  const [startedId, setStartedId] = useState<string | null>(null)
+  // Stopped here: ignored until the list drops it.
+  const [stoppedId, setStoppedId] = useState<string | null>(null)
+  const matched = pickMatchedLens(useLensList().data, dirPath ?? null, owner)
+  const adopted = matched?.lens_instance_id === stoppedId ? undefined : matched
+  const lensId = startedId ?? adopted?.lens_instance_id ?? null
+  const statusQuery = useLensStatus(lensId ?? undefined)
+
+  const status = startedId ? statusQuery.data?.status : adopted?.status
+  const running = status === 'running'
+  // Only a launch from this row reports failure; adopted lenses just drop.
+  const failed =
+    !!startedId &&
+    (statusQuery.isError || status === 'failed' || status === 'terminated')
+
+  const copyUrl = (lensInstanceId: string) => {
+    void navigator.clipboard
+      .writeText(buildAbsoluteWmsCapabilitiesUrl(lensInstanceId))
+      .then(
+        () => showToast.success(t('storedOutputs.wmsUrlCopied')),
+        () => showToast.error(t('storedOutputs.wmsUrlCopyFailed')),
+      )
+  }
+
+  const copyPath = (path: string) => {
+    void copyToClipboard(path).then((ok) =>
+      ok
+        ? showToast.success(t('storedOutputs.pathCopied'))
+        : showToast.error(t('storedOutputs.pathCopyFailed')),
+    )
+  }
+
+  // Surface a failed launch once, then reset so the user can retry.
+  useEffect(() => {
+    if (!failed) return
+    showToast.error(statusQuery.error?.message ?? t('storedOutputs.lensFailed'))
+    setStartedId(null)
+  }, [failed])
+
+  /** Start the SkinnyWMS lens on the resolved directory. */
+  const startServer = () => {
+    if (lensId || !dirPath || !complete) return
+    startMutation.mutate(
+      { localPath: dirPath },
+      {
+        onSuccess: (id) => {
+          setLensOwner(id, owner)
+          setStartedId(id)
+        },
+        onError: (err) => showToast.error(err.message),
+      },
+    )
+  }
+
+  const navigate = useNavigate()
+  const visualise = () => {
+    void navigate({
+      to: '/visualise',
+      search: {
+        a: entryRef({
+          kind: 'output',
+          jobId,
+          taskId: row.taskId,
+          blockId: row.blockId,
+          runName: runName ?? '',
+          blockTitle: row.title,
+          runCreatedAt: null,
+        }),
+        // Deliberate single view of THIS output — no basket auto-pair.
+        b: SLOT_B_OFF,
+      },
+    })
+  }
+
+  const copy = () => {
+    if (lensId) copyUrl(lensId)
+  }
+
+  const stop = () => {
+    if (!lensId) return
+    stopMutation.mutate(
+      { lensInstanceId: lensId },
+      { onError: (err) => showToast.error(err.message) },
+    )
+    setStoppedId(lensId)
+    setStartedId(null)
+  }
+
+  const isStarting = startMutation.isPending || (!!lensId && !running)
+  const startDisabled = wmsUnavailable || !dirPath || !complete || isStarting
+  const startTitle = wmsUnavailable
+    ? t('storedOutputs.wmsUnavailable')
+    : t('storedOutputs.startWms')
+  const { dir, name } = dirPath ? splitPath(dirPath) : { dir: '', name: '' }
+  // A per-run folder carries the run ID.
+  const sharedFolder = !!dirPath && !dirPath.includes(jobId)
+
+  return (
+    <li
+      className={cn(
+        // Side padding on every row keeps the ring off the text without a shift.
+        '-mx-2 flex flex-wrap items-start gap-3 rounded-md px-2 py-2.5 transition-opacity',
+        selection === 'this' && 'ring-2 ring-primary ring-inset',
+        selection === 'other' && 'opacity-40',
+      )}
+    >
+      <span
+        className={cn(
+          'mt-0.5 shrink-0 rounded-md px-1.5 py-0.5 font-mono text-sm font-semibold',
+          GRIB_CHIP_CLASS,
+        )}
+      >
+        GRIB
+      </span>
+      {/* Actions wrap below 12rem of text. */}
+      <div className="min-w-0 flex-1 basis-48">
+        <div className="flex items-baseline gap-2">
+          <P className="truncate text-sm font-medium">{row.title}</P>
+          {row.count > 1 && (
+            <span className="shrink-0 text-sm text-muted-foreground">
+              {complete
+                ? t('storedOutputs.fileCount', { n: row.count })
+                : t('storedOutputs.fileCountWriting', {
+                    written: row.written,
+                    n: row.count,
+                  })}
+            </span>
+          )}
+        </div>
+        {dirPath ? (
+          <button
+            type="button"
+            onClick={() => copyPath(dirPath)}
+            className="group/path flex w-full min-w-0 items-center gap-1 text-left font-mono text-sm text-muted-foreground transition-colors hover:text-foreground"
+            title={t('storedOutputs.copyPath')}
+          >
+            <span className="truncate">
+              {dir}
+              <span className="text-foreground/80">{name}</span>
+            </span>
+            <Copy className="h-3 w-3 shrink-0 opacity-0 transition-opacity group-hover/path:opacity-70" />
+          </button>
+        ) : row.isAvailable ? (
+          <P className="font-mono text-sm text-muted-foreground">…</P>
+        ) : (
+          <P
+            className="text-sm text-muted-foreground italic"
+            title={row.lostReason}
+          >
+            {row.lostReason ?? t('storedOutputs.fileMissing')}
+          </P>
+        )}
+        {sharedFolder && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <div className="flex w-fit items-center gap-1.5 text-sm text-muted-foreground" />
+              }
+            >
+              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+              {t('storedOutputs.sharedFolder')}
+            </TooltipTrigger>
+            <TooltipContent>
+              <P className="max-w-xs text-sm text-inherit">
+                {t('storedOutputs.sharedFolderHint')}
+              </P>
+            </TooltipContent>
+          </Tooltip>
+        )}
+        {/* Inline note: disabled buttons can't surface a title/tooltip. */}
+        {wmsUnavailable && (
+          <P className="text-sm text-muted-foreground italic">
+            {t('storedOutputs.wmsUnavailable')}
+          </P>
+        )}
+      </div>
+      <div className="ml-auto flex flex-wrap items-center justify-end gap-1.5">
+        {row.isAvailable && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={visualise}
+            disabled={!complete}
+            className="gap-1.5"
+          >
+            <Earth className="h-3.5 w-3.5" />
+            {t('storedOutputs.visualise')}
+          </Button>
+        )}
+        {!row.isAvailable ? null : running ? (
+          <>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={stop}
+              disabled={stopMutation.isPending}
+              className="gap-1.5"
+            >
+              <Square className="h-3.5 w-3.5" />
+              {t('storedOutputs.stopWms')}
+            </Button>
+            <Tooltip>
+              <TooltipTrigger
+                render={
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={copy}
+                    className="gap-1.5"
+                    aria-label={t('storedOutputs.copyWmsUrl')}
+                  />
+                }
+              >
+                <Copy className="h-3.5 w-3.5" />
+                {t('storedOutputs.copy')}
+              </TooltipTrigger>
+              <TooltipContent>
+                <P className="max-w-xs text-sm text-inherit">
+                  <span className="font-medium">
+                    {t('storedOutputs.externalTitle')}
+                  </span>
+                  <br />
+                  {t('storedOutputs.externalHint')}
+                </P>
+              </TooltipContent>
+            </Tooltip>
+          </>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={startServer}
+            disabled={startDisabled}
+            className="gap-1.5"
+            title={startTitle}
+          >
+            {isStarting ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Play className="h-3.5 w-3.5" />
+            )}
+            {isStarting
+              ? t('storedOutputs.startingWms')
+              : t('storedOutputs.startWms')}
+          </Button>
+        )}
+        {/* Last: stays put when WMS controls change. */}
+        {row.isAvailable && row.fetchable && (
+          <OutputZipButton
+            jobId={jobId}
+            taskId={row.taskId}
+            ready={complete}
+            sharedFolder={sharedFolder}
+          />
+        )}
+      </div>
+    </li>
+  )
+}

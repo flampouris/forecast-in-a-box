@@ -9,7 +9,7 @@
  */
 
 /**
- * ExecutionDetailPage Integration Tests
+ * RunDetailPage Integration Tests
  *
  * Tests the execution detail page with MSW-mocked API:
  * - Renders job status header with name, status badge, progress bar
@@ -17,9 +17,12 @@
  * - Error state for nonexistent jobs
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render } from 'vitest-browser-react'
+import { userEvent } from 'vitest/browser'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { HttpResponse, http } from 'msw'
+import { strToU8, zipSync } from 'fflate'
 import { I18nextProvider } from 'react-i18next'
 import {
   Outlet,
@@ -30,14 +33,21 @@ import {
   createRouter,
 } from '@tanstack/react-router'
 import {
+  getExecution,
   injectMockExecution,
   mixedAvailabilityExecution,
+  opaqueMimeExecution,
   resetJobsState,
+  resolvedConfigExecution,
+  splitPlotExecution,
 } from '@tests/../mocks/data/job.data'
+import { worker } from '@tests/test-extend'
 import type { AuthContextValue } from '@/features/auth/AuthContext'
+import { API_ENDPOINTS } from '@/api/endpoints'
 import { AuthContext } from '@/features/auth/AuthContext'
-import { ExecutionDetailPage } from '@/features/executions/components/ExecutionDetailPage'
+import { RunDetailPage } from '@/features/executions/components/RunDetailPage'
 import i18n from '@/lib/i18n'
+import { showToast } from '@/lib/toast'
 
 vi.mock('@/hooks/useMedia', () => ({
   useMedia: () => true,
@@ -51,7 +61,7 @@ const anonymousAuth: AuthContextValue = {
   signOut: () => Promise.resolve(),
 }
 
-function renderDetailPage(jobId: string) {
+async function renderDetailPage(jobId: string, search = '') {
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: { retry: false, gcTime: 0, staleTime: 0 },
@@ -70,10 +80,10 @@ function renderDetailPage(jobId: string) {
 
   const detailRoute = createRoute({
     getParentRoute: () => authenticatedRoute,
-    path: '/executions/$jobId',
+    path: '/execute/$jobId',
     component: () => (
       <AuthContext.Provider value={anonymousAuth}>
-        <ExecutionDetailPage />
+        <RunDetailPage />
       </AuthContext.Provider>
     ),
   })
@@ -84,30 +94,26 @@ function renderDetailPage(jobId: string) {
   const router = createRouter({
     routeTree,
     history: createMemoryHistory({
-      initialEntries: [`/executions/${jobId}`],
+      initialEntries: [`/execute/${jobId}${search}`],
     }),
   })
 
-  return render(
+  const screen = await render(
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
         <RouterProvider router={router} />
       </I18nextProvider>
     </QueryClientProvider>,
   )
+  return Object.assign(screen, { router })
 }
 
-describe('ExecutionDetailPage Integration', () => {
+describe('RunDetailPage Integration', () => {
   beforeEach(() => {
     resetJobsState()
   })
 
   describe('rendering', () => {
-    it('renders the back link', async () => {
-      const screen = await renderDetailPage('job-completed-001')
-      await expect.element(screen.getByText('Executions')).toBeVisible()
-    })
-
     it('renders the job ID in the header', async () => {
       const screen = await renderDetailPage('job-completed-001')
       await expect.element(screen.getByText('job-completed-001')).toBeVisible()
@@ -127,9 +133,9 @@ describe('ExecutionDetailPage Integration', () => {
         .toBeVisible()
     })
 
-    it('renders Untitled Job when fable lookup fails', async () => {
+    it('renders Untitled run when fable lookup fails', async () => {
       const screen = await renderDetailPage('job-completed-001')
-      await expect.element(screen.getByText('Untitled Job')).toBeVisible()
+      await expect.element(screen.getByText('Untitled run')).toBeVisible()
     })
   })
 
@@ -137,21 +143,27 @@ describe('ExecutionDetailPage Integration', () => {
     it('renders tab buttons', async () => {
       const screen = await renderDetailPage('job-completed-001')
 
-      await expect.element(screen.getByText('Outputs')).toBeVisible()
+      await expect
+        .element(screen.getByRole('tab', { name: 'Outputs' }))
+        .toBeVisible()
       await expect.element(screen.getByText('Logs')).toBeVisible()
       await expect.element(screen.getByText('Specification')).toBeVisible()
     })
 
     it('defaults to outputs tab', async () => {
       const screen = await renderDetailPage('job-completed-001')
-      await expect.element(screen.getByText('Outputs')).toBeVisible()
+      await expect
+        .element(screen.getByRole('tab', { name: 'Outputs' }))
+        .toBeVisible()
     })
   })
 
   describe('actions', () => {
     it('renders restart button', async () => {
       const screen = await renderDetailPage('job-completed-001')
-      await expect.element(screen.getByText('Restart')).toBeVisible()
+      await expect
+        .element(screen.getByRole('button', { name: 'Restart' }))
+        .toBeVisible()
     })
 
     it('renders three-dots menu', async () => {
@@ -162,17 +174,143 @@ describe('ExecutionDetailPage Integration', () => {
     })
   })
 
+  describe('stop (ecmwf#770)', () => {
+    // Unstyled browser tests: keep the dialog above Base UI's fixed backdrop.
+    beforeAll(() => {
+      const style = document.createElement('style')
+      style.textContent =
+        '[data-slot="alert-dialog-content"]{position:fixed;z-index:50}'
+      document.head.appendChild(style)
+    })
+
+    async function confirmStop(
+      screen: Awaited<ReturnType<typeof renderDetailPage>>,
+    ) {
+      await screen.getByRole('button', { name: 'Stop', exact: true }).click()
+      await expect
+        .element(
+          screen
+            .getByRole('alertdialog')
+            .getByText(/Outputs produced so far are kept/),
+        )
+        .toBeVisible()
+      await screen.getByRole('button', { name: 'Stop run' }).click()
+    }
+
+    it('stops a running run and settles on Stopped', async () => {
+      const screen = await renderDetailPage('job-running-002')
+      await confirmStop(screen)
+
+      // Transparent at once: the status and the button say it is stopping.
+      await expect
+        .element(screen.getByText('Stopping', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByRole('button', { name: 'Stopping…' }))
+        .toBeDisabled()
+
+      // Settled: neutral notice, and the run can be restarted.
+      await expect
+        .element(screen.getByText('Stopped', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText(/Outputs produced before the stop are kept/))
+        .toBeVisible()
+      await expect
+        .element(screen.getByRole('button', { name: 'Restart' }))
+        .toBeVisible()
+    })
+
+    it('keeps Stopping while the busy gateway reads it as unknown', async () => {
+      const screen = await renderDetailPage('job-running-002')
+      await confirmStop(screen)
+      await expect
+        .element(screen.getByText('Stopping', { exact: true }))
+        .toBeVisible()
+
+      // The backend answers `unknown` while the gateway executes the stop.
+      const run = getExecution('job-running-002')!
+      injectMockExecution({ ...run, status: 'unknown' })
+      await new Promise((resolve) => setTimeout(resolve, 3500))
+      await expect
+        .element(screen.getByText('Stopping', { exact: true }))
+        .toBeVisible()
+      expect(
+        screen.getByText('Unknown', { exact: true }).elements(),
+      ).toHaveLength(0)
+
+      injectMockExecution({ ...run, status: 'stopped' })
+      await expect
+        .element(screen.getByText('Stopped', { exact: true }))
+        .toBeVisible()
+    })
+
+    it('offers no Stop on a finished run', async () => {
+      const screen = await renderDetailPage('job-completed-001')
+      await expect
+        .element(screen.getByRole('button', { name: 'Restart' }))
+        .toBeVisible()
+      expect(
+        screen.getByRole('button', { name: 'Stop', exact: true }).elements(),
+      ).toHaveLength(0)
+    })
+
+    it('offers no Delete on an active run', async () => {
+      const screen = await renderDetailPage('job-running-002')
+      await screen.getByRole('button', { name: 'More options' }).click()
+      await expect
+        .element(screen.getByRole('menuitem', { name: 'Edit workflow' }))
+        .toBeInTheDocument()
+      expect(
+        screen.getByRole('menuitem', { name: 'Delete' }).elements(),
+      ).toHaveLength(0)
+      await userEvent.keyboard('{Escape}')
+    })
+
+    it('keeps Delete on a finished run', async () => {
+      const screen = await renderDetailPage('job-completed-001')
+      await screen.getByRole('button', { name: 'More options' }).click()
+      await expect
+        .element(screen.getByRole('menuitem', { name: 'Delete' }))
+        .toBeInTheDocument()
+      await userEvent.keyboard('{Escape}')
+    })
+
+    it('reports calmly when the run finished before the stop', async () => {
+      const info = vi.spyOn(showToast, 'info')
+      const error = vi.spyOn(showToast, 'error')
+      const screen = await renderDetailPage('job-running-002')
+      await screen.getByRole('button', { name: 'Stop', exact: true }).click()
+      // It completes while the dialog is open: the backend answers 409.
+      injectMockExecution({
+        ...getExecution('job-running-002')!,
+        status: 'completed',
+      })
+      await screen.getByRole('button', { name: 'Stop run' }).click()
+
+      await expect
+        .poll(() => info.mock.calls.flat())
+        .toContain('The run had already finished.')
+      expect(error).not.toHaveBeenCalled()
+      await expect
+        .element(screen.getByText('Completed', { exact: true }))
+        .toBeVisible()
+      info.mockRestore()
+      error.mockRestore()
+    })
+  })
+
   describe('error state', () => {
     it('shows error message for nonexistent job', async () => {
       const screen = await renderDetailPage('nonexistent-job-id')
       await expect
-        .element(screen.getByText('The requested job could not be found.'))
+        .element(screen.getByText('The requested run could not be found.'))
         .toBeVisible()
     })
 
     it('shows back to executions button on error', async () => {
       const screen = await renderDetailPage('nonexistent-job-id')
-      await expect.element(screen.getByText('Back to Executions')).toBeVisible()
+      await expect.element(screen.getByText('Back to runs')).toBeVisible()
     })
   })
 
@@ -188,15 +326,39 @@ describe('ExecutionDetailPage Integration', () => {
   describe('outputs panel', () => {
     it('shows available output count for completed job with outputs', async () => {
       const screen = await renderDetailPage('job-completed-001')
-      // job-completed-001 has 3 available outputs (task-out-1, task-out-2, task-out-3)
-      await expect.element(screen.getByText(/Generated: 3/)).toBeVisible()
+      // 4 outputs total: 3 previewable (grid) + 1 GRIB sink marker (shown in
+      // the "Stored outputs" card). The header tally counts the whole run.
+      await expect.element(screen.getByText(/Generated: 4/)).toBeVisible()
     })
 
-    it('shows no outputs message for running job with no available outputs', async () => {
+    it('shows pending count for running job with unavailable outputs', async () => {
       const screen = await renderDetailPage('job-running-002')
+      // job-running-002 has 1 unavailable output → skeleton card + pending counter.
+      await expect.element(screen.getByText(/Pending: 1/)).toBeVisible()
+      await expect.element(screen.getByText(/Generated: 0/)).toBeVisible()
+    })
+
+    it('adds no placeholder card when every output is a stored GRIB file', async () => {
+      const running = getExecution('job-running-002')
+      if (!running) throw new Error('missing seed')
+      const marker = {
+        mime_type: 'text/plain; fiab-format=gribdir; fiab-fetchable=1',
+        original_block: 'block_sink_1',
+        is_available: false,
+      }
+      injectMockExecution({
+        ...running,
+        run_id: 'job-grib-only-011',
+        outputs: { 'task-grib-1': marker, 'task-grib-2': marker },
+        completed_block_ids: [],
+        planned_block_ids: ['block_source_1'],
+      })
+      const screen = await renderDetailPage('job-grib-only-011')
+
       await expect
-        .element(screen.getByText('No outputs available yet'))
+        .element(screen.getByText('0 of 2 files written'))
         .toBeVisible()
+      expect(document.querySelector('[aria-busy="true"]')).toBeNull()
     })
 
     it('shows no outputs message for submitted job with null outputs', async () => {
@@ -216,6 +378,877 @@ describe('ExecutionDetailPage Integration', () => {
       await expect
         .element(screen.getByText('sink_available').first())
         .toBeVisible()
+    })
+
+    it('shows a sniff-promoted output through a URL mime filter', async () => {
+      // Regression: an output whose wire mime is opaque (resolvable only by
+      // sniffing its bytes) must still appear when the page loads with a
+      // matching `?mimes=` filter already set. The sniff has to run
+      // independently of the filter — otherwise the matching card is filtered
+      // out of the grid before it can ever be sniffed, leaving it empty.
+      injectMockExecution(opaqueMimeExecution)
+      const screen = await renderDetailPage(
+        'job-opaque-006',
+        '?mimes=image/png',
+      )
+      // The mock content endpoint serves PNG bytes → sniffed to image/png →
+      // matches the filter → the card renders as `<block>.<extension>`.
+      await expect.element(screen.getByText('sink_opaque.png')).toBeVisible()
+    })
+  })
+
+  describe('group-by control', () => {
+    it('shows the control when the run spans multiple blocks', async () => {
+      // job-completed-001 spans sink_temperature_map + sink_wind_map.
+      const screen = await renderDetailPage('job-completed-001')
+      await expect.element(screen.getByText('Group by')).toBeVisible()
+    })
+
+    it('hides the control for a single-block run', async () => {
+      // job-running-002 has one output in one block — nothing to group by.
+      const screen = await renderDetailPage('job-running-002')
+      await expect.element(screen.getByText(/Pending: 1/)).toBeVisible()
+      await expect.element(screen.getByText('Group by')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('split outputs (#798)', () => {
+    const subtitles = (screen: Awaited<ReturnType<typeof renderDetailPage>>) =>
+      screen
+        .getByText(/step \d+$/)
+        .elements()
+        .map((el) => el.textContent)
+
+    it('orders outputs by coordinates, keeping pending slots in place', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage('job-split-007')
+      await expect.element(screen.getByText('2t · step 36')).toBeVisible()
+      expect(subtitles(screen)).toEqual([
+        'msl · step 0',
+        'msl · step 12',
+        'msl · step 24',
+        'map_plot · msl · step 36',
+        '2t · step 0',
+        '2t · step 12',
+        '2t · step 24',
+        '2t · step 36',
+      ])
+    })
+
+    it('groups by a coordinate with full parameter names', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage(
+        'job-split-007',
+        '?groupBy=dim:param',
+      )
+      await expect
+        .element(screen.getByText('Mean sea level pressure [Pa] (msl)'))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText('2 metre temperature [K] (2t)'))
+        .toBeVisible()
+    })
+
+    it('filters by a coordinate from its menu', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage('job-split-007')
+      await expect.element(screen.getByText('msl · step 0')).toBeVisible()
+      await screen.getByText('Parameter: All').click()
+      await screen
+        .getByRole('option', { name: '2 metre temperature [K] (2t)' })
+        .click()
+      await expect
+        .element(screen.getByText('msl · step 0'))
+        .not.toBeInTheDocument()
+      await expect.element(screen.getByText('2t · step 12')).toBeVisible()
+    })
+
+    it('filters steps with the day by hour checkboxes', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage('job-split-007')
+      await expect.element(screen.getByText('2t · step 12')).toBeVisible()
+      await screen.getByText('Step: All').click()
+
+      await screen.getByRole('checkbox', { name: '+12 h' }).click()
+      // Steps 0 and 24 share the 0h row and remain.
+      await expect.element(screen.getByText('Step: 0 h')).toBeVisible()
+      expect(subtitles(screen)).toEqual([
+        'msl · step 0',
+        'msl · step 24',
+        '2t · step 0',
+        '2t · step 24',
+      ])
+
+      await screen.getByRole('checkbox', { name: 'All steps' }).click()
+      await expect.element(screen.getByText('Step: All')).toBeVisible()
+      await screen.getByRole('checkbox', { name: 'All steps' }).click()
+      await expect.element(screen.getByText('Step: None')).toBeVisible()
+      await expect
+        .element(screen.getByText('No outputs match the current filter.'))
+        .toBeVisible()
+
+      // Unstyled, an unchecked box has no size.
+      ;(
+        screen.getByRole('checkbox', { name: 'Day 1' }).element() as HTMLElement
+      ).click()
+      await expect
+        .element(screen.getByText('Step: day 1', { exact: true }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByRole('checkbox', { name: 'All steps' }))
+        .toHaveAttribute('aria-checked', 'mixed')
+    })
+
+    it('restores a step filter from the URL', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage('job-split-007', '?dims=step=24')
+      await expect.element(screen.getByText('2t · step 24')).toBeVisible()
+      expect(subtitles(screen)).toEqual(['msl · step 24', '2t · step 24'])
+      await expect
+        .element(screen.getByText('Step: day 1 · 0 h', { exact: true }))
+        .toBeVisible()
+    })
+
+    it('steps across parameters and through time in the viewer', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage('job-split-007')
+      await expect.element(screen.getByText('msl · step 0')).toBeVisible()
+      await screen.getByRole('button', { name: 'View' }).first().click()
+      const header = (label: string) =>
+        screen.getByText(`map_plot · ${label}`, { exact: true })
+      await expect.element(header('msl · step 0')).toBeVisible()
+
+      await userEvent.keyboard('{ArrowDown}')
+      await expect.element(header('2t · step 0')).toBeVisible()
+      await userEvent.keyboard('{Shift>}{ArrowRight}{/Shift}')
+      await expect.element(header('2t · step 24')).toBeVisible()
+      await userEvent.keyboard('{End}')
+      await expect.element(header('2t · step 36')).toBeVisible()
+      await userEvent.keyboard('{Home}')
+      await expect.element(header('2t · step 0')).toBeVisible()
+
+      await userEvent.keyboard(' ')
+      await expect
+        .element(header('2t · step 12'), { timeout: 3000 })
+        .toBeVisible()
+    })
+
+    it('keeps viewer keys working on its focused buttons and timeline', async () => {
+      injectMockExecution(splitPlotExecution)
+      const screen = await renderDetailPage('job-split-007')
+      await expect.element(screen.getByText('msl · step 0')).toBeVisible()
+      await screen.getByRole('button', { name: 'View' }).first().click()
+      const header = (label: string) =>
+        screen.getByText(`map_plot · ${label}`, { exact: true })
+      await expect.element(header('msl · step 0')).toBeVisible()
+
+      await screen.getByRole('button', { name: /^Play through/ }).click()
+      const pause = screen.getByRole('button', { name: 'Pause' })
+      await expect.element(pause).toHaveFocus()
+      await userEvent.keyboard(' ')
+      await expect
+        .element(screen.getByRole('button', { name: /^Play through/ }))
+        .toHaveAttribute('aria-pressed', 'false')
+
+      await userEvent.keyboard('{Home}')
+      await expect.element(header('msl · step 0')).toBeVisible()
+      await userEvent.keyboard('{ArrowRight}')
+      await expect.element(header('msl · step 12')).toBeVisible()
+
+      // Space plays and pauses over another button, without clicking it.
+      const nextParam = screen.getByRole('button', { name: 'Next Parameter' })
+      ;(nextParam.element() as HTMLElement).focus()
+      await userEvent.keyboard(' ')
+      await expect
+        .element(screen.getByRole('button', { name: 'Pause' }))
+        .toBeVisible()
+      await userEvent.keyboard(' ')
+      await expect
+        .element(screen.getByRole('button', { name: /^Play through/ }))
+        .toHaveAttribute('aria-pressed', 'false')
+      await userEvent.keyboard('{Home}')
+      await expect.element(header('msl · step 0')).toBeVisible()
+
+      const timeline = screen.getByRole('slider', { name: 'Forecast steps' })
+      ;(timeline.element() as HTMLElement).focus()
+      await userEvent.keyboard('{ArrowRight}')
+      await expect.element(header('msl · step 12')).toBeVisible()
+      await userEvent.keyboard('{ArrowLeft}')
+      await expect.element(header('msl · step 0')).toBeVisible()
+      await userEvent.keyboard('{ArrowDown}')
+      await expect.element(header('2t · step 0')).toBeVisible()
+      await userEvent.keyboard('{Shift>}{ArrowRight}{/Shift}')
+      await expect.element(header('2t · step 24')).toBeVisible()
+      await userEvent.keyboard('{End}')
+      await expect.element(header('2t · step 36')).toBeVisible()
+      // The timeline handled these keys itself.
+      await expect.element(timeline).toHaveFocus()
+    })
+  })
+
+  describe('validated option types on the canvas', () => {
+    const block = (
+      id: string,
+      factory: string,
+      values: Record<string, string>,
+      inputs: Record<string, string> = {},
+    ) => ({
+      instance_id: id,
+      plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+      factory,
+      instance: { configuration_values: values, input_ids: inputs },
+    })
+
+    it('labels params a Select narrows to params, and leaves steps raw', async () => {
+      worker.use(
+        http.get(API_ENDPOINTS.fable.get, () =>
+          HttpResponse.json({
+            blueprint_id: 'select-labels',
+            version: 1,
+            builder: {
+              blocks: [
+                block('src', 'operationalForecastSource', {}),
+                block(
+                  'selParam',
+                  'select',
+                  { dimension: 'param', values: '167,151' },
+                  { dataset: 'src' },
+                ),
+                block(
+                  'selStep',
+                  'select',
+                  { dimension: 'step', values: '24,0,3,6' },
+                  { dataset: 'selParam' },
+                ),
+              ],
+            },
+            display_name: 'Select labels',
+            display_description: '',
+            tags: [],
+            parent_id: null,
+            created_at: '2026-10-17T00:00:00+00:00',
+            updated_at: '2026-10-17T00:00:00+00:00',
+          }),
+        ),
+        http.put(API_ENDPOINTS.fable.expand, () =>
+          HttpResponse.json({
+            global_errors: [],
+            block_errors: {},
+            possible_sources: [],
+            possible_expansions: {},
+            configuration_restrictions: {
+              selParam: { values: "list[enumClosed[param]('151','167')]" },
+              selStep: { values: "list[enumClosed[str]('0','24','3','6')]" },
+            },
+          }),
+        ),
+        // Resolves any id, so a wrong lookup would show.
+        http.post(API_ENDPOINTS.fable.resolveDisplay, async ({ request }) => {
+          const { elements } = (await request.json()) as {
+            elements: Array<{ typeName: string; value: string }>
+          }
+          return HttpResponse.json({
+            elements: elements.map((e) => ({
+              ...e,
+              display: `Param ${e.value} [K] (p${e.value})`,
+            })),
+          })
+        }),
+      )
+      injectMockExecution({
+        ...resolvedConfigExecution,
+        run_id: 'job-select-011',
+        blueprint_id: 'select-labels',
+        resolution: null,
+      })
+      const screen = await renderDetailPage('job-select-011')
+
+      await expect.element(screen.getByText('p167, p151')).toBeVisible()
+      await expect.element(screen.getByText('24,0,3,6')).toBeVisible()
+      await expect.element(screen.getByText(/p24/)).not.toBeInTheDocument()
+    })
+  })
+
+  describe('same-type output blocks', () => {
+    const plot = (id: string, domain: string) => ({
+      instance_id: id,
+      plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+      factory: 'mapPlotSink',
+      instance: {
+        configuration_values: { param: '167', domain, format: 'png' },
+        input_ids: { dataset: 'src' },
+      },
+    })
+    const output = (block: string, step: string) => ({
+      mime_type: 'image/png',
+      display_name: `Map Plot (step=${step})`,
+      dimension_kvs: [['step', step]] as Array<[string, string]>,
+      original_block: block,
+      is_available: true,
+    })
+    const twoPlotsRun = {
+      ...resolvedConfigExecution,
+      run_id: 'job-two-plots-012',
+      blueprint_id: 'two-plots',
+      outputs: {
+        'plotA:0': output('plotA', '0'),
+        'plotA:6': output('plotA', '6'),
+        'plotB:0': output('plotB', '0'),
+        'plotB:6': output('plotB', '6'),
+      },
+      resolution: {
+        plotA: { domain: 'Malawi' },
+        plotB: { domain: 'Europe' },
+      },
+    }
+
+    beforeEach(() => {
+      // Domains via two local glyphs.
+      worker.use(
+        http.get(API_ENDPOINTS.fable.get, () =>
+          HttpResponse.json({
+            blueprint_id: 'two-plots',
+            version: 1,
+            builder: {
+              blocks: [
+                {
+                  instance_id: 'src',
+                  plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+                  factory: 'operationalForecastSource',
+                  instance: { configuration_values: {}, input_ids: {} },
+                },
+                plot('plotA', '${regionA}'),
+                plot('plotB', '${regionB}'),
+              ],
+              local_glyphs: { regionA: 'Malawi', regionB: 'Europe' },
+            },
+            display_name: 'Two plots',
+            display_description: '',
+            tags: [],
+            parent_id: null,
+            created_at: '2026-10-25T00:00:00+00:00',
+            updated_at: '2026-10-25T00:00:00+00:00',
+          }),
+        ),
+      )
+    })
+
+    it('shows as-run settings in the subtitle and filters by them', async () => {
+      injectMockExecution(twoPlotsRun)
+      const screen = await renderDetailPage('job-two-plots-012')
+
+      await expect
+        .element(screen.getByText('domain Malawi · step 0'))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText('domain Europe · step 6'))
+        .toBeVisible()
+
+      await screen.getByText('Domain: All').click()
+      await screen.getByRole('option', { name: 'domain Malawi' }).click()
+      await expect
+        .element(screen.getByText('domain Europe · step 0'))
+        .not.toBeInTheDocument()
+      await expect
+        .element(screen.getByText('domain Malawi · step 6'))
+        .toBeVisible()
+    })
+
+    it('groups by a setting from the URL', async () => {
+      injectMockExecution(twoPlotsRun)
+      const screen = await renderDetailPage(
+        'job-two-plots-012',
+        '?groupBy=dim:setting:domain',
+      )
+      await expect
+        .element(screen.getByRole('heading', { name: 'domain Europe' }))
+        .toBeVisible()
+      await expect
+        .element(screen.getByRole('heading', { name: 'domain Malawi' }))
+        .toBeVisible()
+    })
+
+    it('adds the settings to block section headers', async () => {
+      injectMockExecution(twoPlotsRun)
+      const screen = await renderDetailPage(
+        'job-two-plots-012',
+        '?groupBy=block',
+      )
+      // Two mock Map Plots, hence the plugin.
+      await expect
+        .element(
+          screen.getByRole('heading', {
+            name: 'Map Plot · ecmwf-base · domain Malawi',
+          }),
+        )
+        .toBeVisible()
+    })
+
+    it('shows glyph templates on runs without a resolution', async () => {
+      injectMockExecution({
+        ...twoPlotsRun,
+        run_id: 'job-two-plots-013',
+        resolution: null,
+      })
+      const screen = await renderDetailPage('job-two-plots-013')
+      await expect
+        .element(screen.getByText('domain ${regionA} · step 0'))
+        .toBeVisible()
+    })
+  })
+
+  describe('workflow version', () => {
+    const blueprint = (version: number, domain: string, name: string) => ({
+      blueprint_id: 'edited-later',
+      version,
+      builder: {
+        blocks: [
+          {
+            instance_id: 'src',
+            plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+            factory: 'operationalForecastSource',
+            instance: { configuration_values: {}, input_ids: {} },
+          },
+          {
+            instance_id: 'plot',
+            plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+            factory: 'mapPlotSink',
+            instance: {
+              configuration_values: { param: '167', domain, format: 'png' },
+              input_ids: { dataset: 'src' },
+            },
+          },
+        ],
+      },
+      display_name: name,
+      display_description: '',
+      tags: [],
+      parent_id: null,
+      created_at: '2026-10-25T00:00:00+00:00',
+      updated_at: '2026-10-25T00:00:00+00:00',
+    })
+
+    it('shows the workflow as run, under its latest name', async () => {
+      worker.use(
+        http.get(API_ENDPOINTS.fable.get, ({ request }) =>
+          HttpResponse.json(
+            new URL(request.url).searchParams.get('version') === '1'
+              ? blueprint(1, 'Malawi', 'Plots')
+              : blueprint(2, 'Kenya', 'Plots renamed'),
+          ),
+        ),
+      )
+      injectMockExecution({
+        ...resolvedConfigExecution,
+        run_id: 'job-edited-014',
+        blueprint_id: 'edited-later',
+        blueprint_version: 1,
+        resolution: null,
+      })
+      const screen = await renderDetailPage('job-edited-014')
+
+      await expect
+        .element(screen.getByRole('heading', { name: 'Plots renamed' }))
+        .toBeVisible()
+      await expect.element(screen.getByText('Malawi')).toBeVisible()
+      await expect.element(screen.getByText('Kenya')).not.toBeInTheDocument()
+    })
+  })
+
+  describe('as-run configuration (ecmwf#640 resolution)', () => {
+    it('shows resolved values instead of glyph templates on the canvas', async () => {
+      injectMockExecution(resolvedConfigExecution)
+      const screen = await renderDetailPage('job-resolved-009')
+
+      // Params show by default; glyphed options show as-run values.
+      await expect.element(screen.getByText('grib')).toBeVisible()
+      await expect.element(screen.getByText('72 Europe')).toBeVisible()
+      await expect.element(screen.getByText('mars')).toBeVisible()
+      await expect
+        .element(screen.getByText('${format}'))
+        .not.toBeInTheDocument()
+    })
+
+    it('hides and shows block parameters with a checkbox', async () => {
+      injectMockExecution(resolvedConfigExecution)
+      const screen = await renderDetailPage('job-resolved-009')
+
+      const toggle = screen.getByRole('checkbox', { name: 'Parameters' })
+      await expect.element(toggle).toBeChecked()
+      await expect.element(screen.getByText('grib')).toBeVisible()
+
+      // DOM clicks: unstyled, the box is too small to hit.
+      ;(toggle.element() as HTMLElement).click()
+      await expect.element(toggle).not.toBeChecked()
+      await expect.element(screen.getByText('grib')).not.toBeInTheDocument()
+
+      // The whole pill toggles, not just the box.
+      const pill = screen.getByText('Parameters', { exact: true })
+      ;(pill.element() as HTMLElement).click()
+      await expect.element(toggle).toBeChecked()
+      await expect.element(screen.getByText('grib')).toBeVisible()
+    })
+
+    it('falls back to stored templates on runs without a recorded resolution', async () => {
+      // Same glyphed fable, but a pre-#640 run: no resolution recorded.
+      injectMockExecution({
+        ...resolvedConfigExecution,
+        run_id: 'job-unresolved-010',
+        resolution: null,
+      })
+      const screen = await renderDetailPage('job-unresolved-010')
+
+      await expect.element(screen.getByText('${format}')).toBeVisible()
+    })
+  })
+
+  describe('specification tab', () => {
+    it('shows the workflow JSON with line numbers and a copy button', async () => {
+      injectMockExecution(resolvedConfigExecution)
+      const screen = await renderDetailPage('job-resolved-009')
+      await screen.getByRole('tab', { name: 'Specification' }).click()
+
+      await expect
+        .element(screen.getByText('Workflow specification'))
+        .toBeVisible()
+      await expect
+        .element(screen.getByRole('button', { name: 'Copy specification' }))
+        .toBeVisible()
+      await expect
+        .poll(
+          () =>
+            document.querySelectorAll('[data-slot="code-block-line"]').length,
+        )
+        .toBeGreaterThan(3)
+      expect(
+        document.querySelector(
+          '[data-slot="code-block-content"][data-numbered]',
+        ),
+      ).not.toBeNull()
+      // Keys and string values are coloured.
+      const key = document.querySelector(
+        '[data-slot="code-block-line"] span span',
+      )
+      expect(key?.textContent).toBe('"blocks"')
+      expect(key?.className).toContain('text-blue-600')
+    })
+  })
+
+  describe('logs tab', () => {
+    const openLogs = async (runId: string) => {
+      const screen = await renderDetailPage(runId)
+      await screen.getByRole('tab', { name: 'Logs' }).click()
+      await screen.getByRole('button', { name: 'View here' }).click()
+      return screen
+    }
+
+    /** Counts `/run/logs` requests until `stop` is called. */
+    const countLogFetches = () => {
+      let fetches = 0
+      const count = ({ request }: { request: Request }) => {
+        if (request.url.includes('/run/logs')) fetches++
+      }
+      worker.events.on('request:start', count)
+      return {
+        get fetches() {
+          return fetches
+        },
+        stop: () => worker.events.removeListener('request:start', count),
+      }
+    }
+
+    it('offers View here and Download before fetching anything', async () => {
+      const counter = countLogFetches()
+      try {
+        const screen = await renderDetailPage('job-completed-001')
+        await screen.getByRole('tab', { name: 'Logs' }).click()
+        await expect.element(screen.getByText('Run logs')).toBeVisible()
+        await expect
+          .element(screen.getByRole('button', { name: 'Download .zip' }))
+          .toBeVisible()
+        expect(counter.fetches).toBe(0)
+
+        await screen.getByRole('button', { name: 'View here' }).click()
+        await expect
+          .element(screen.getByText(/^Snapshot from .+ ago\.$/))
+          .toBeVisible()
+        await expect
+          .element(screen.getByRole('button', { name: 'Refresh' }))
+          .toBeVisible()
+        expect(counter.fetches).toBe(1)
+      } finally {
+        counter.stop()
+      }
+    })
+
+    it('marks the lines new since the last snapshot after a refresh', async () => {
+      const at = '2026-11-08 08:10:00,000:INFO:a:1'
+      const controller = (n: number) =>
+        Array.from({ length: n }, (_, i) => `${at}:step ${i + 1}`).join('\n')
+      let served = 0
+      worker.use(
+        http.get(API_ENDPOINTS.job.logs, () => {
+          served++
+          const zip = zipSync({
+            'job_abc.controller.logs.txt': strToU8(controller(served + 1)),
+          })
+          return HttpResponse.arrayBuffer(zip.slice().buffer, {
+            headers: { 'Content-Type': 'application/zip' },
+          })
+        }),
+      )
+      const screen = await openLogs('job-completed-001')
+      await expect.element(screen.getByText(/step 2/)).toBeVisible()
+      expect(document.querySelector('[data-slot="log-note"]')).toBeNull()
+
+      await screen.getByRole('button', { name: 'Refresh' }).click()
+      await expect.element(screen.getByText(/step 3/)).toBeVisible()
+      const note = document.querySelector('[data-slot="log-note"]')
+      expect(note?.textContent).toMatch(/^New since /)
+      // The note sits right above the new line.
+      expect(
+        note?.parentElement?.nextElementSibling
+          ?.querySelector('[data-line]')
+          ?.getAttribute('data-line'),
+      ).toBe('3')
+    })
+
+    it('opens a failure from the error banner without the landing step', async () => {
+      const counter = countLogFetches()
+      try {
+        const screen = await renderDetailPage('job-errored-003')
+        await screen.getByRole('button', { name: 'Show in logs' }).click()
+        await expect
+          .element(screen.getByLabelText('Log file'))
+          .toMatchTextContent('host_0.worker_w0')
+        await expect
+          .poll(() =>
+            document
+              .querySelector('[data-line="2"]')
+              ?.getAttribute('data-variant'),
+          )
+          .toBe('highlighted')
+        expect(counter.fetches).toBe(1)
+      } finally {
+        counter.stop()
+      }
+    })
+
+    it('keeps a Show in logs request to its own run', async () => {
+      const counter = countLogFetches()
+      try {
+        const screen = await renderDetailPage('job-errored-003')
+        await screen.getByRole('button', { name: 'Show in logs' }).click()
+        await expect
+          .element(screen.getByLabelText('Log file'))
+          .toMatchTextContent('host_0.worker_w0')
+
+        // Same page, another run: its Logs tab waits for View here.
+        await screen.router.navigate({
+          to: '/execute/$jobId',
+          params: { jobId: 'job-completed-001' },
+        })
+        await expect
+          .element(screen.getByText('job-completed-001'))
+          .toBeVisible()
+        await expect
+          .element(screen.getByRole('button', { name: 'View here' }))
+          .toBeVisible()
+        expect(counter.fetches).toBe(1)
+      } finally {
+        counter.stop()
+      }
+    })
+
+    it('starts a new log worker on Retry after one failed to start', async () => {
+      const RealWorker = Worker
+      let created = 0
+      // The first worker fails to load, as after an upgrade.
+      function FlakyWorker(url: URL, options?: WorkerOptions) {
+        created++
+        if (created > 1) return new RealWorker(url, options)
+        const broken = {
+          onmessage: null,
+          onerror: null as ((event: ErrorEvent) => void) | null,
+          postMessage: () =>
+            setTimeout(() =>
+              broken.onerror?.(
+                new ErrorEvent('error', { message: 'Worker script missing' }),
+              ),
+            ),
+          terminate: () => {},
+        }
+        return broken
+      }
+      vi.stubGlobal('Worker', FlakyWorker)
+      try {
+        const screen = await renderDetailPage('job-completed-001')
+        await screen.getByRole('tab', { name: 'Logs' }).click()
+        await screen.getByRole('button', { name: 'View here' }).click()
+        await expect
+          .element(screen.getByText('Worker script missing'))
+          .toBeVisible()
+
+        await screen.getByRole('button', { name: 'Retry' }).click()
+        await expect
+          .element(screen.getByText(/^Snapshot from .+ ago\.$/))
+          .toBeVisible()
+        expect(created).toBe(2)
+      } finally {
+        vi.unstubAllGlobals()
+      }
+    })
+
+    it('opens the run file with the most errors', async () => {
+      const screen = await openLogs('job-completed-001')
+
+      await expect
+        .element(screen.getByText(/command failed with 1/))
+        .toBeVisible()
+      await expect
+        .element(screen.getByLabelText('Log file'))
+        .toMatchTextContent('host_0.worker_w0')
+      // The file's own line numbers, kept through filters.
+      const error = document.querySelector('[data-line="2"]')
+      expect(error?.textContent).toContain(':ERROR:')
+    })
+
+    it('filters by level, keeping a traceback with its error', async () => {
+      const screen = await openLogs('job-completed-001')
+      await expect.element(screen.getByText(/running task plot/)).toBeVisible()
+
+      await screen.getByLabelText('Log level').click()
+      await screen.getByRole('option', { name: 'Errors only' }).click()
+      await expect
+        .element(screen.getByText(/RuntimeError: plot failed/))
+        .toBeVisible()
+      await expect
+        .element(screen.getByText(/running task plot/))
+        .not.toBeInTheDocument()
+      expect(document.querySelector('[data-line="5"]')).not.toBeNull()
+    })
+
+    it('lists server-wide files and switches to one', async () => {
+      const screen = await openLogs('job-completed-001')
+      await screen.getByLabelText('Log file').click()
+      await expect.element(screen.getByText('This run')).toBeVisible()
+      await expect.element(screen.getByText('Server-wide')).toBeVisible()
+      // Empty files are left out.
+      expect(screen.getByText(/lens\.65e780a2/).elements()).toHaveLength(0)
+
+      await screen.getByRole('option', { name: /^backend/ }).click()
+      await expect
+        .element(screen.getByText(/starting background compilation/))
+        .toBeVisible()
+    })
+
+    it("keeps server-wide lines to the run's time until turned off", async () => {
+      const screen = await openLogs('job-completed-001')
+      await screen.getByLabelText('Log file').click()
+      await screen.getByRole('option', { name: /^backend/ }).click()
+
+      await expect
+        .element(screen.getByText(/starting background compilation/))
+        .toBeVisible()
+      await expect.element(screen.getByText(/1 of 3 lines/)).toBeVisible()
+      expect(
+        screen.getByText(/Started server process/).elements(),
+      ).toHaveLength(0)
+      expect(screen.getByText(/will fetch logs/).elements()).toHaveLength(0)
+
+      // DOM click: the unstyled checkbox is too small.
+      ;(
+        screen
+          .getByRole('checkbox', { name: 'During run' })
+          .element() as HTMLElement
+      ).click()
+      await expect
+        .element(screen.getByText(/Started server process/))
+        .toBeVisible()
+      await expect.element(screen.getByText(/will fetch logs/)).toBeVisible()
+    })
+
+    it('searches all files and opens a match in its file', async () => {
+      const screen = await openLogs('job-completed-001')
+      await expect.element(screen.getByText(/running task plot/)).toBeVisible()
+      await screen.getByPlaceholder('Filter lines...').fill('503')
+
+      await screen.getByLabelText('Log file').click()
+      await expect
+        .element(screen.getByRole('option', { name: /host_0\.worker_w1/ }))
+        .toMatchTextContent(/1 match/)
+      await screen.getByRole('option', { name: /^All files/ }).click()
+
+      const match = screen.getByText(/attempt 1 of 500/)
+      await expect.element(match).toBeVisible()
+      const marks = () =>
+        [...document.querySelectorAll('mark')].map((m) => m.textContent)
+      expect(marks()).toEqual(['503'])
+      expect(
+        document.querySelectorAll('[data-slot="log-section"]'),
+      ).toHaveLength(1)
+
+      await match.click()
+      await expect
+        .element(screen.getByLabelText('Log file'))
+        .toMatchTextContent('host_0.worker_w1')
+      await expect
+        .element(screen.getByPlaceholder('Filter lines...'))
+        .toHaveValue('')
+      await expect.poll(marks).toEqual([])
+      await expect
+        .element(screen.getByText(/starting _get_initial_conditions/))
+        .toBeVisible()
+      expect(
+        document.querySelector('[data-line="2"]')?.getAttribute('data-variant'),
+      ).toBe('highlighted')
+    })
+
+    it('opens the failure from the error banner on fresh logs', async () => {
+      let fetches = 0
+      const count = ({ request }: { request: Request }) => {
+        if (request.url.includes('/run/logs')) fetches++
+      }
+      worker.events.on('request:start', count)
+      try {
+        const screen = await openLogs('job-errored-003')
+        await expect
+          .element(screen.getByText(/running task plot/))
+          .toBeVisible()
+        await screen.getByLabelText('Log file').click()
+        await screen.getByRole('option', { name: /^backend/ }).click()
+        await screen.getByRole('tab', { name: 'Outputs' }).click()
+
+        await screen.getByRole('button', { name: 'Show in logs' }).click()
+        await expect
+          .element(screen.getByRole('tab', { name: 'Logs' }))
+          .toHaveAttribute('aria-selected', 'true')
+        await expect
+          .element(screen.getByLabelText('Log file'))
+          .toMatchTextContent('host_0.worker_w0')
+        await expect
+          .poll(() =>
+            document
+              .querySelector('[data-line="2"]')
+              ?.getAttribute('data-variant'),
+          )
+          .toBe('highlighted')
+        expect(fetches).toBe(2)
+      } finally {
+        worker.events.removeListener('request:start', count)
+      }
+    })
+
+    it('says so when the run files are gone after a restart', async () => {
+      // No cascade job id: only server-wide files.
+      const screen = await openLogs('job-submitted-004')
+
+      await expect
+        .element(screen.getByText(/no longer on this server/))
+        .toBeVisible()
+      await expect
+        .element(screen.getByLabelText('Log file'))
+        .toMatchTextContent('backend')
     })
   })
 })

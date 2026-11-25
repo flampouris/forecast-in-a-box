@@ -26,18 +26,26 @@ from pydantic import PositiveInt
 
 from forecastbox.domain.auth.users import get_auth_context
 from forecastbox.domain.blueprint.types import BlueprintId
+from forecastbox.domain.experiment import db as experiment_db
 from forecastbox.domain.experiment import service
-from forecastbox.domain.experiment.exceptions import ExperimentAccessDenied, ExperimentNotFound, ExperimentVersionConflict, SchedulerBusy
-from forecastbox.domain.experiment.scheduling.background import start_scheduler, stop_scheduler
-from forecastbox.domain.experiment.types import ExperimentDefinitionId
-from forecastbox.domain.run.types import RunId
-from forecastbox.schemata.jobs import ExperimentDefinition
+from forecastbox.domain.experiment.exceptions import (
+    ExperimentAccessDenied,
+    ExperimentNotFound,
+    ExperimentVersionConflict,
+    SchedulerBusy,
+    SchedulerDisabled,
+    SchedulerRestartRefused,
+)
+from forecastbox.domain.experiment.scheduling.runtime import restart_scheduler as restart_scheduler_sync
+from forecastbox.domain.run.types import ExperimentDefinitionId, RunId
 from forecastbox.utility.auth import AuthContext
+from forecastbox.utility.concurrency.manager import TaskName, execution_manager
+from forecastbox.utility.config import ROUTE_PREFIX, ConcurrentPools
 from forecastbox.utility.pagination import PaginationSpec
 from forecastbox.utility.pydantic import FiabBaseModel
-from forecastbox.utility.time import current_time
+from forecastbox.utility.time import current_time, value_dt2str
 
-PREFIX = "/api/v1/experiment"
+PREFIX = f"{ROUTE_PREFIX}/experiment"
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +95,8 @@ class ExperimentDetail(FiabBaseModel):
     max_acceptable_delay_hours: int
     enabled: bool
     created_at: str
-    created_by: str
+    updated_at: str
+    user: str
     display_name: str | None
     display_description: str | None
     tags: list[str] | None = None
@@ -141,21 +150,22 @@ class ExperimentRunsResponse(FiabBaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _experiment_to_detail(exp: ExperimentDefinition) -> ExperimentDetail:
+def _experiment_to_detail(exp: experiment_db.ExperimentDefinitionRecord, entity_created_at: dt.datetime) -> ExperimentDetail:
     exp_def = cast(dict, exp.experiment_definition) or {}
     return ExperimentDetail(
         experiment_id=ExperimentDefinitionId(str(exp.experiment_definition_id)),  # ty:ignore[invalid-argument-type]
-        experiment_version=cast(int, exp.version),
+        experiment_version=exp.version,
         blueprint_id=BlueprintId(str(exp.blueprint_id)),  # ty:ignore[invalid-argument-type]
-        blueprint_version=cast(int, exp.blueprint_version),
+        blueprint_version=exp.blueprint_version,
         cron_expr=str(exp_def.get("cron_expr", "")),
         max_acceptable_delay_hours=int(exp_def.get("max_acceptable_delay_hours", 24)),
         enabled=bool(exp_def.get("enabled", True)),
-        created_at=str(exp.created_at),
-        created_by=cast(str, exp.created_by),
-        display_name=cast(str | None, exp.display_name),
-        display_description=cast(str | None, exp.display_description),
-        tags=cast(list[str] | None, exp.tags),
+        created_at=value_dt2str(entity_created_at),
+        updated_at=value_dt2str(exp.created_at),
+        user=exp.created_by,
+        display_name=exp.display_name,
+        display_description=exp.display_description,
+        tags=exp.tags,
     )
 
 
@@ -198,10 +208,10 @@ async def get_experiment(
 ) -> ExperimentDetail:
     """Retrieve a single experiment by id."""
     try:
-        exp = await service.get_schedule(auth_context, spec.experiment_id)
+        latest = await service.get_schedule(auth_context, spec.experiment_id, spec.version)
     except ExperimentNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
-    return _experiment_to_detail(exp)
+    return _experiment_to_detail(latest.experiment, latest.created_at)
 
 
 @router.get("/list")
@@ -214,7 +224,7 @@ async def list_experiments(
         experiments, total, total_pages = await service.list_schedules(auth_context, pagination)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    items = [_experiment_to_detail(exp) for exp in experiments]
+    items = [_experiment_to_detail(row.experiment, row.created_at) for row in experiments]
     return ExperimentListResponse(
         experiments=items, total=total, page=pagination.page, page_size=pagination.page_size, total_pages=total_pages
     )
@@ -233,12 +243,12 @@ async def update_experiment(
         current = await service.get_schedule(auth_context, update.experiment_id)
     except ExperimentNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
-    if cast(int, current.version) != update.version:
+    if current.experiment.version != update.version:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Version conflict for experiment {update.experiment_id!r}: "
-                f"expected version {update.version}, current is {current.version}."
+                f"expected version {update.version}, current is {current.experiment.version}."
             ),
         )
     try:
@@ -260,7 +270,7 @@ async def update_experiment(
         raise HTTPException(status_code=400, detail=str(e))
     except ExperimentVersionConflict as e:
         raise HTTPException(status_code=409, detail=str(e))
-    return _experiment_to_detail(updated)
+    return _experiment_to_detail(updated.experiment, updated.created_at)
 
 
 @router.post("/delete")
@@ -276,12 +286,12 @@ async def delete_experiment(
         current = await service.get_schedule(auth_context, request.experiment_id)
     except ExperimentNotFound as e:
         raise HTTPException(status_code=404, detail=str(e))
-    if cast(int, current.version) != request.version:
+    if current.experiment.version != request.version:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Version conflict for experiment {request.experiment_id!r}: "
-                f"expected version {request.version}, current is {current.version}."
+                f"expected version {request.version}, current is {current.experiment.version}."
             ),
         )
     try:
@@ -315,11 +325,11 @@ async def list_experiment_runs(
     runs = [
         ExperimentRunDetail(
             run_id=RunId(str(ex.run_id)),  # ty:ignore[invalid-argument-type]
-            attempt_count=cast(int, ex.attempt_count),
+            attempt_count=ex.attempt_count,
             status=cast(str, ex.status),
             created_at=str(ex.created_at),
             updated_at=str(ex.updated_at),
-            experiment_context=cast(str | None, ex.experiment_context),
+            experiment_context=ex.experiment_context,
         )
         for ex in executions
     ]
@@ -346,7 +356,7 @@ async def get_next_experiment_run(
 @router.get("/operational/scheduler/current_time")
 async def get_scheduler_current_time() -> str:
     """Return the current time used for scheduling decisions (ISO 8601)."""
-    return current_time().isoformat()
+    return value_dt2str(current_time("scheduling"))
 
 
 @router.post("/operational/scheduler/restart")
@@ -354,5 +364,9 @@ async def restart_scheduler(auth_context: AuthContext = Depends(get_auth_context
     """Restart the scheduler thread. Requires admin access."""
     if not auth_context.has_admin():
         raise HTTPException(status_code=403, detail="Only admins may restart the scheduler.")
-    stop_scheduler()
-    start_scheduler()
+    try:
+        await execution_manager.awaitable_submit(ConcurrentPools.General, TaskName("scheduler.restart"), restart_scheduler_sync)
+    except SchedulerDisabled as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SchedulerRestartRefused as e:
+        raise HTTPException(status_code=409, detail=str(e))

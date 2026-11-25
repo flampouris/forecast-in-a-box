@@ -9,13 +9,13 @@
 
 import logging
 import os
-import threading
 import urllib.parse
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, Self
 
 import toml
-from cascade.low.func import pydantic_recursive_collect
+from cascade.low.func import assert_never, pydantic_recursive_collect
 from fiab_core.artifacts import ArtifactStoreId
 from fiab_core.fable import PluginCompositeId, PluginId, PluginStoreId
 from pydantic import BeforeValidator, Field, PlainSerializer, SecretStr, model_validator
@@ -26,6 +26,10 @@ from forecastbox.utility.pydantic import FiabBaseModel
 fiab_home = Path(os.environ["FIAB_ROOT"]) if "FIAB_ROOT" in os.environ else (Path.home() / ".fiab")
 logger = logging.getLogger(__name__)
 
+# NOTE not the best place for this to be, but better than spread adhoc all over. It is actually needed
+# inside various domains as well due to eg proxies and responses, its not just for routes
+ROUTE_PREFIX = "/api/v1"
+
 
 def _validate_url(url: str) -> bool:
     # TODO add DNS resolution attempt or something
@@ -33,11 +37,71 @@ def _validate_url(url: str) -> bool:
     return (parse.scheme is not None) and (parse.netloc is not None)
 
 
-class StatusMessage:
-    """Namespace class for status message sharing"""
+class ConcurrentPools(StrEnum):
+    General = "general"
+    Io = "io"
+    RunSubmission = "run-submission"
+    ArtifactIo = "artifact-io"
+    PluginManagement = "plugin-management"
+    JobsDb = "jobs-db"
 
-    # NOTE this class is here as this is a low place in hierarchy, and we dont want circular imports
-    gateway_running = "running"
+
+class ConcurrentThreads(StrEnum):
+    EventDispatcher = "event-dispatcher"
+    Scheduler = "scheduler"
+    DatabaseGarbageCollector = "database-garbage-collector"
+
+
+class PoolSettings(FiabBaseModel):
+    max_workers: int = Field(gt=0)
+    max_pending: int = Field(gt=0)
+
+
+def _default_concurrency_pools() -> dict[ConcurrentPools, PoolSettings]:
+    return {
+        ConcurrentPools.General: PoolSettings(max_workers=4, max_pending=32),
+        ConcurrentPools.Io: PoolSettings(max_workers=4, max_pending=64),
+        ConcurrentPools.RunSubmission: PoolSettings(max_workers=2, max_pending=32),
+        ConcurrentPools.ArtifactIo: PoolSettings(max_workers=1, max_pending=64),
+        ConcurrentPools.PluginManagement: PoolSettings(max_workers=1, max_pending=16),
+        ConcurrentPools.JobsDb: PoolSettings(max_workers=1, max_pending=128),
+    }
+
+
+class ConcurrencySettings(FiabBaseModel):
+    pools: dict[ConcurrentPools, PoolSettings] = Field(default_factory=_default_concurrency_pools)
+    failure_history_size: int = Field(default=100, gt=0)
+    startup_timeout_seconds: float = Field(default=10, gt=0)
+    shutdown_timeout_seconds: float = Field(default=10, gt=0)
+
+    # NOTE dont migrate this to a pydantic validator -- config = FIABConfig() is constructed at import
+    # of this module, so a validation failure would crash every importer (backend, cli, warmup, tests)
+    # at import time, before logging is set up and without the aggregated error report that
+    # validate_runtime provides.
+    def validate_runtime(self) -> list[str]:
+        errors: list[str] = []
+        required_pools = set(ConcurrentPools)
+        configured_pools = set(self.pools)
+        if configured_pools != required_pools:
+            missing = sorted(pool.value for pool in required_pools - configured_pools)
+            unexpected = sorted(pool.value for pool in configured_pools - required_pools)
+            errors.append(f"pools must contain exactly the six required identifiers: missing={missing}, unexpected={unexpected}")
+        for pool_name in (ConcurrentPools.JobsDb, ConcurrentPools.ArtifactIo, ConcurrentPools.PluginManagement):
+            pool = self.pools.get(pool_name)
+            if pool is not None and pool.max_workers != 1:
+                errors.append(f"{pool_name.value} must have exactly one worker")
+        return errors
+
+
+class DispatcherSettings(FiabBaseModel):
+    queue_capacity: int = Field(default=1024, gt=0)
+
+
+class LensSettings(FiabBaseModel):
+    worker_max_requests: int = Field(default=10, ge=0)
+    """Requests a lens worker serves before gunicorn replaces it; 0 never replaces it."""
+    worker_max_requests_jitter: int = Field(default=3, ge=0)
+    """Upper bound of the random extra requests gunicorn adds to worker_max_requests per worker."""
 
 
 class DatabaseSettings(FiabBaseModel):
@@ -102,32 +166,12 @@ class AuthSettings(FiabBaseModel):
         return errors
 
 
-class GeneralSettings(FiabBaseModel):
-    launch_browser: bool = True
-    """Whether a browser window should be opened after start. Used only when
-    entrypoint.main.launch_all module is used"""
-
-
-PluginRefreshStrategy = Literal["automatic", "manual"]
-
-
-class PluginSettings(FiabBaseModel):
-    """A pip-installable plugin with an importible module"""
-
-    pip_source: str
-    """Name of the package if assuming PyPI, or a local path, git repo, ... Anything that pip accepts"""
-    module_name: str
-    """A string such that `importlib.import_module(module_name)` gives a module that has a `plugin` attribute of type fiab_core.plugin.Plugin`"""
-    update_strategy: PluginRefreshStrategy = "manual"
-    """Whether we should invoke `pip install --update <plugin>` on every launch, or let user handle that manually or via API"""
-    enabled: bool = True
-    """Whether the plugin should be considered when loading"""
-
-
 PluginCompositeIdReadable = Annotated[
     PluginCompositeId, BeforeValidator(PluginCompositeId.from_str), PlainSerializer(PluginCompositeId.to_str, return_type=str)
 ]
-PluginsSettings = dict[PluginCompositeIdReadable, PluginSettings]
+DefaultPluginIds = list[PluginCompositeIdReadable]
+"""Ids of plugins to be installed automatically on first run. Not a record of currently
+installed plugins -- that lives in the plugin_state database table."""
 
 
 class PluginStoreConfig(FiabBaseModel):
@@ -141,13 +185,29 @@ class PluginStoreConfig(FiabBaseModel):
 PluginStoresConfig = dict[PluginStoreId, PluginStoreConfig]
 
 
-def _default_plugins() -> PluginsSettings:
-    return {
-        PluginCompositeIdReadable.from_str("ecmwf:ecmwf-base"): PluginSettings(
-            pip_source="fiab-plugin-ecmwf",
-            module_name="fiab_plugin_ecmwf",
-        ),
-    }
+PluginRefreshStrategy = Literal["automatic", "manual"]
+"""Whether a plugin should be pip-updated automatically on every launch (``automatic``)
+or left to manual/API updates (``manual``)."""
+
+
+class DefaultPluginSettings(FiabBaseModel):
+    """Optional settings overrides applied to a default plugin right after its install.
+
+    Every field defaults to ``None``, meaning "leave the value the install produced" --
+    only the fields a user wants to override need to be specified.
+    """
+
+    is_enabled: bool | None = None
+    excluded_templates: list[str] | None = None
+    glyph_remapping: dict[str, str] | None = None
+    update_strategy: PluginRefreshStrategy | None = None
+
+
+DefaultPluginsSettingsConfig = dict[PluginCompositeIdReadable, DefaultPluginSettings]
+
+
+def _default_plugins() -> DefaultPluginIds:
+    return [PluginCompositeIdReadable.from_str("ecmwf:ecmwf-base")]
 
 
 def _default_plugin_stores() -> PluginStoresConfig:
@@ -161,7 +221,13 @@ def _default_plugin_stores() -> PluginStoresConfig:
 
 class ArtifactStoreConfig(FiabBaseModel):
     url: str
-    method: Literal["file"]
+    method: Literal["file", "gittag"]
+
+    @model_validator(mode="after")
+    def validate_method_url(self) -> Self:
+        if self.method == "gittag" and "${TAG}" not in self.url:
+            raise ValueError("for method='gittag', url must contain ${TAG}")
+        return self
 
 
 ArtifactStoresConfig = dict[ArtifactStoreId, ArtifactStoreConfig]
@@ -170,8 +236,8 @@ ArtifactStoresConfig = dict[ArtifactStoreId, ArtifactStoreConfig]
 def _default_artifact_stores() -> ArtifactStoresConfig:
     return {
         ArtifactStoreId("ecmwf"): ArtifactStoreConfig(
-            url="https://raw.githubusercontent.com/ecmwf/forecast-in-a-box/refs/heads/main/install/artifacts.json",
-            method="file",
+            url="https://raw.githubusercontent.com/ecmwf/forecast-in-a-box/refs/tags/${TAG}/install/artifacts.json",
+            method="gittag",
         ),
     }
 
@@ -194,10 +260,6 @@ class ProductSettings(FiabBaseModel):
     default_input_source: str = "opendata"
     """Default input source for models, if not specified otherwise"""
 
-    plugins: PluginsSettings = Field(default_factory=_default_plugins)
-    plugin_stores: PluginStoresConfig = Field(default_factory=_default_plugin_stores)
-    artifact_stores: ArtifactStoresConfig = Field(default_factory=_default_artifact_stores)
-
     def validate_runtime(self) -> list[str]:
         if self.pproc_schema_dir and not os.path.isdir(self.pproc_schema_dir):
             return ["not a directory: pproc_schema_dir={self.pproc_schema_dir}"]
@@ -205,11 +267,36 @@ class ProductSettings(FiabBaseModel):
             return []
 
 
-class BackendAPISettings(FiabBaseModel):
-    data_path: str = str(fiab_home / "data_dir")
-    """Path to the data directory."""
+class ExternalServicesSettings(FiabBaseModel):
+    default_plugins: DefaultPluginIds = Field(default_factory=_default_plugins)
+    """Ids of plugins installed automatically on first run. Does not reflect currently
+    installed plugins -- see the plugin_state database table for that."""
+    default_plugins_settings: DefaultPluginsSettingsConfig = Field(default_factory=dict)
+    """Optional settings overrides applied to a subset of default_plugins right after
+    their install. Keys not present in default_plugins are rejected."""
+    plugin_stores: PluginStoresConfig = Field(default_factory=_default_plugin_stores)
+    artifact_stores: ArtifactStoresConfig = Field(default_factory=_default_artifact_stores)
     model_repository: str = "https://sites.ecmwf.int/repository/fiab"
     """URL to the model repository."""
+
+    @model_validator(mode="after")
+    def validate_default_plugins_settings_subset(self) -> Self:
+        unknown = set(self.default_plugins_settings) - set(self.default_plugins)
+        if unknown:
+            unknown_str = sorted(PluginCompositeId.to_str(k) for k in unknown)
+            raise ValueError(f"default_plugins_settings contains ids not present in default_plugins: {unknown_str}")
+        return self
+
+    def validate_runtime(self) -> list[str]:
+        errors = []
+        if not _validate_url(self.model_repository):
+            errors.append(f"not an url: model_repository={self.model_repository}")
+        return errors
+
+
+class BackendSettings(FiabBaseModel):
+    data_path: str = f"file://{fiab_home.absolute() / 'data_dir'}"
+    """Data directory URL. Supports file:// (local) and ssh://[user@]host/path (remote) schemes."""
     uvicorn_host: str = "0.0.0.0"
     """Listening host of the whole server."""
     uvicorn_port: int = 8000
@@ -218,23 +305,81 @@ class BackendAPISettings(FiabBaseModel):
     """Whether we assume that a system-level service has been registered. Affects entrypoint.main behaviour"""
     allow_scheduler: bool = False
     """Whether scheduler thread should be started. Best combine with allow_service=True"""
+    launch_browser: bool = True
+    """Whether a browser window should be opened after start. Used only when
+    entrypoint.main.launch_all module is used"""
+    concurrency: ConcurrencySettings = Field(default_factory=ConcurrencySettings)
+    dispatcher: DispatcherSettings = Field(default_factory=DispatcherSettings)
+    lens: LensSettings = Field(default_factory=LensSettings)
 
     def local_url(self) -> str:
         return f"http://localhost:{self.uvicorn_port}"
 
     def validate_runtime(self) -> list[str]:
         errors = []
-        if not os.path.isdir(self.data_path):
-            errors.append(f"not a directory: data_path={self.data_path}")
-        if not _validate_url(self.model_repository):
-            errors.append(f"not an url: model_repository={self.model_repository}")
+        parsed = urllib.parse.urlparse(self.data_path)
+        if parsed.scheme == "file":
+            if not os.path.isdir(parsed.path):
+                errors.append(f"not a directory: data_path={self.data_path}")
+        elif parsed.scheme == "ssh":
+            if not parsed.netloc:
+                errors.append(f"missing host in ssh:// data_path: {self.data_path}")
+            if not parsed.path.startswith("/"):
+                errors.append(f"ssh:// data_path must have an absolute path: {self.data_path}")
+        else:
+            errors.append(f"unsupported scheme in data_path (use file:// or ssh://): {self.data_path}")
         pseudo_url = f"http://{self.uvicorn_host}:{self.uvicorn_port}"
         if not _validate_url(pseudo_url) or (self.uvicorn_port < 0) or (self.uvicorn_port > 2**16):
             errors.append(f"not a valid uvicorn config: {pseudo_url}")
         return errors
 
 
-class CascadeSettings(FiabBaseModel):
+class SshClusterSpec(FiabBaseModel):
+    controller_url: str
+    worker_urls: list[str]
+
+
+class GatewayStartupParams(FiabBaseModel):
+    max_concurrent_jobs: int | None = 1
+    """If more jobs submitted at a given time, all but this many wait in a queue"""
+    cascade_logging_base: str | None = None
+    """Parent directory for the temporary log directory. When set, the directory is created there with a YYYY-MM-DDTHH prefix; otherwise it is created in the system temporary directory with a fiabLogs-YYYY-MM-DDTHH prefix. Use eg /home/<user>/fiabLogs or /tmp/fiabLogs"""
+    shared_path: str | None = None
+    """Shared filesystem path visible to all workers, required for Slurm submissions."""
+    ssh_cluster_spec: SshClusterSpec | None = None
+    """SSH cluster description for sshCluster submissions."""
+
+
+class LocalGateway(FiabBaseModel):
+    gateway_type: Literal["local"]
+    startup_params: GatewayStartupParams = Field(default_factory=GatewayStartupParams)
+
+
+class RemoteGateway(FiabBaseModel):
+    gateway_type: Literal["remote"]
+    startup_params: GatewayStartupParams = Field(default_factory=GatewayStartupParams)
+    cascade_url: str
+    """Sshable url like 'ssh://[<user>@]<hostname>:<port>'"""
+
+    def validate_runtime(self) -> list[str]:
+        parsed = urllib.parse.urlparse(self.cascade_url)
+        if parsed.scheme != "ssh":
+            return [f"unsupported protocol for RemoteGateway cascade_url: {parsed.scheme!r}. Use ssh://"]
+        return []
+
+
+class UnmanagedGateway(FiabBaseModel):
+    gateway_type: Literal["unmanaged"]
+    cascade_url: str
+    """Base URL for the Cascade API, eg tcp://<hostname>:<port>"""
+
+
+CascadeInfrastructureType = Literal["localProcess", "slurm", "sshCluster"]
+
+
+class CascadeConstraints(FiabBaseModel):
+    default_cascade_infra: CascadeInfrastructureType = "localProcess"
+    """Default execution infrastructure for jobs if unspecified in a job."""
     default_hosts: int = 1
     """Default number of hosts for Cascade if unspecified in a job."""
     max_hosts: int = 1
@@ -243,39 +388,42 @@ class CascadeSettings(FiabBaseModel):
     """Default number of workers per hosts for Cascade if unspecified in a job."""
     max_workers_per_host: int = 8
     """Max number of workers per host for Cascade."""
-    cascade_url: str = "tcp://localhost:8067"
-    """Base URL for the Cascade API."""
-    spawn_gateway: bool = True
-    """Whether the backend should spawn a gateway or assume it is provided externally"""
-    # TODO remove the spawn_gateway setting -- instead, base it on whether cascade_url is provided.
-    # But that needs refactoring of the code to provide the cascade_url dynamically in case of a local spawn,
-    # and utilization of the FreePortsManager etc
-    log_collection_max_size: int = 1000
-    """Maximum size of the log collection for Cascade."""
-    venv_temp_dir: str = "/tmp"
-    """Temporary directory for virtual environments."""
-    max_concurrent_jobs: int | None = 1
-    """If more jobs submitted at a given time, all but this many wait in a queue"""
+
+
+class CascadeSettings(FiabBaseModel):
+    gateway: UnmanagedGateway | LocalGateway | RemoteGateway = Field(
+        discriminator="gateway_type", default_factory=lambda: LocalGateway(gateway_type="local")
+    )
+    constraints: CascadeConstraints = Field(default_factory=CascadeConstraints)
 
     def validate_runtime(self) -> list[str]:
         errors = []
-        if not os.path.isdir(self.venv_temp_dir):
-            errors.append(f"not a directory: venv_temp_dir={self.venv_temp_dir}")
-        if not _validate_url(self.cascade_url):
-            errors.append(f"not an url: cascade_url={self.cascade_url}")
+        cascade_url = self._get_cascade_url()
+        if not _validate_url(cascade_url):
+            errors.append(f"not an url: cascade_url={cascade_url}")
         return errors
+
+    def _get_cascade_url(self) -> str:
+        if isinstance(self.gateway, LocalGateway):
+            return "tcp://localhost"
+        elif isinstance(self.gateway, RemoteGateway):
+            return self.gateway.cascade_url
+        elif isinstance(self.gateway, UnmanagedGateway):
+            return self.gateway.cascade_url
+        else:
+            assert_never(self.gateway)
 
 
 class FIABConfig(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_nested_delimiter="__", env_prefix="fiab__", case_sensitive=True)
 
-    general: GeneralSettings = Field(default_factory=GeneralSettings)
     product: ProductSettings = Field(default_factory=ProductSettings, description="Product specific settings")
 
     auth: AuthSettings = Field(default_factory=AuthSettings)
 
     db: DatabaseSettings = Field(default_factory=DatabaseSettings)
-    api: BackendAPISettings = Field(default_factory=BackendAPISettings)
+    external: ExternalServicesSettings = Field(default_factory=ExternalServicesSettings)
+    backend: BackendSettings = Field(default_factory=BackendSettings)
     cascade: CascadeSettings = Field(default_factory=CascadeSettings)
 
     @classmethod
@@ -287,13 +435,20 @@ class FIABConfig(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        return (
-            env_settings,
-            file_secret_settings,
-            dotenv_settings,
-            TomlConfigSettingsSource(settings_cls, fiab_home / "config.toml"),
-            init_settings,
-        )
+        # for tests in particular, we dont want user's ~/.fiab or .env to mess up
+        if os.environ.get("FIAB_IGNORE_CONFIG_SOURCES", "0") == "1":
+            return (
+                env_settings,
+                init_settings,
+            )
+        else:
+            return (
+                env_settings,
+                file_secret_settings,
+                dotenv_settings,
+                TomlConfigSettingsSource(settings_cls, fiab_home / "config.toml"),
+                init_settings,
+            )
 
     def _get_toml(self, **k: Any) -> str:
         json_config = self.model_dump(mode="json", **k)
@@ -307,6 +462,22 @@ class FIABConfig(BaseSettings):
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_path, "w") as f:
             f.write(self._get_toml(exclude_defaults=True, exclude_none=True))
+
+    def validate_runtime(self) -> list[str]:
+        cascade_url = self.cascade._get_cascade_url()
+        cascade = urllib.parse.urlparse(cascade_url)
+        data_path = urllib.parse.urlparse(self.backend.data_path)
+        errors = []
+        compatible_scheme_pairs = {
+            ("tcp", "file"),
+            ("ssh", "ssh"),
+        }
+        if (cascade.scheme, data_path.scheme) not in compatible_scheme_pairs:
+            errors.append(f"cascade and data path must use a compatible scheme: {cascade=} != {data_path=}")
+        if cascade.scheme == "ssh":
+            if cascade.netloc != data_path.netloc:
+                errors.append(f"under ssh://, cascade and data path must use the same netloc: {cascade=} != {data_path=}")
+        return errors
 
 
 def validate_runtime(config: FIABConfig) -> None:
@@ -322,4 +493,11 @@ def validate_runtime(config: FIABConfig) -> None:
 
 
 config = FIABConfig()
-config_edit_lock = threading.Lock()
+
+
+BACKEND_LOG_DIRECTORY_ENV = "FIAB_BACKEND_LOG_DIRECTORY"
+
+
+def get_backend_log_directory() -> str:
+    """Returns the log directory exported by the entrypoint at process start. Raises KeyError if not set."""
+    return os.environ[BACKEND_LOG_DIRECTORY_ENV]

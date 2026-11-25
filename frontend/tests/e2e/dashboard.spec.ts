@@ -15,7 +15,7 @@
  * Run with: npm run test:e2e:stack
  */
 
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import type { Page } from '@playwright/test'
 
 /**
@@ -24,9 +24,9 @@ import type { Page } from '@playwright/test'
  */
 async function navigateTo(page: Page, path: string) {
   await page.goto('/')
-  await page.waitForURL(/dashboard/, { timeout: 15000 })
+  await page.waitForURL(/overview/, { timeout: 15000 })
   await page.waitForLoadState('networkidle')
-  if (path !== '/dashboard') {
+  if (path !== '/overview') {
     await page.goto(path)
     await page.waitForLoadState('networkidle')
   }
@@ -35,7 +35,7 @@ async function navigateTo(page: Page, path: string) {
 
 test.describe('Dashboard Content', () => {
   test.beforeEach(async ({ page }) => {
-    await navigateTo(page, '/dashboard')
+    await navigateTo(page, '/overview')
   })
 
   test('dashboard loads with welcome card', async ({ page }) => {
@@ -43,62 +43,47 @@ test.describe('Dashboard Content', () => {
     await expect(welcomeHeading.first()).toBeVisible({ timeout: 10000 })
   })
 
-  test('getting started section visible with preset cards', async ({
+  test('workflow templates section visible with the scratch card', async ({
     page,
   }) => {
-    const gettingStartedHeading = page.getByText(/getting started/i)
-    if (
-      await gettingStartedHeading
-        .first()
-        .isVisible({ timeout: 5000 })
-        .catch(() => false)
-    ) {
-      await expect(gettingStartedHeading.first()).toBeVisible()
-
-      // Should show preset cards
-      const quickStart = page.getByText('Quick Start')
-      const standardForecast = page.getByText('Standard Forecast')
-
-      if (
-        await quickStart
-          .first()
-          .isVisible({ timeout: 3000 })
-          .catch(() => false)
-      ) {
-        await expect(quickStart.first()).toBeVisible()
-      }
-
-      if (
-        await standardForecast
-          .first()
-          .isVisible({ timeout: 3000 })
-          .catch(() => false)
-      ) {
-        await expect(standardForecast.first()).toBeVisible()
-      }
-    }
+    // Both are hardcoded in the frontend, so they exist in every environment.
+    await expect(page.getByText(/workflow templates/i).first()).toBeVisible({
+      timeout: 10000,
+    })
+    await expect(
+      page.getByRole('button', { name: 'Start from scratch' }),
+    ).toBeVisible()
   })
 
-  test('clicking a preset card navigates to configure', async ({ page }) => {
-    const quickStartCard = page.getByText('Quick Start')
-    if (
-      await quickStartCard
-        .first()
-        .isVisible({ timeout: 5000 })
-        .catch(() => false)
-    ) {
-      await quickStartCard.first().click()
-      await page.waitForLoadState('networkidle')
+  test('clicking the scratch card navigates to a blank configure', async ({
+    page,
+  }) => {
+    await page.getByRole('button', { name: 'Start from scratch' }).click()
 
-      // Should navigate to configure with preset param
-      await expect(page).toHaveURL(/configure/)
+    // Scratch routes through the guarded fresh intent (workbench model).
+    await expect(page).toHaveURL(/\/configure\?fresh=true$/)
+  })
+
+  test('clicking a template card forks it into configure', async ({ page }) => {
+    // Guarded: the real-stack backend may ship no ECMWF plugin.
+    const templateCard = page.getByTestId('starter-template-card').first()
+
+    if (
+      !(await templateCard.isVisible({ timeout: 10000 }).catch(() => false))
+    ) {
+      test.skip(true, 'no plugin templates in this environment')
     }
+
+    await templateCard.click()
+
+    await expect(page).toHaveURL(/configure\?.*template=true/)
+    await expect(page).toHaveURL(/templatePlugin=ecmwf%3Aecmwf-base/)
   })
 
   test('stat cards display system information', async ({ page }) => {
     // Look for stat card labels
-    const systemStatus = page.getByText('System Status')
-    const availableModels = page.getByText('Available Models')
+    const systemStatus = page.getByText('System status')
+    const availableModels = page.getByText('Available models')
 
     if (
       await systemStatus
@@ -120,7 +105,7 @@ test.describe('Dashboard Content', () => {
   })
 
   test('quick action buttons are visible', async ({ page }) => {
-    const managePlugins = page.getByText('Manage Plugins')
+    const managePlugins = page.getByText('Manage plugins')
     const manageSources = page.getByText('Manage Sources')
 
     if (
@@ -143,9 +128,9 @@ test.describe('Dashboard Content', () => {
   })
 })
 
-test.describe('System Status', () => {
+test.describe('System status', () => {
   test.beforeEach(async ({ page }) => {
-    await navigateTo(page, '/dashboard')
+    await navigateTo(page, '/overview')
   })
 
   test('status indicator visible in footer', async ({ page }) => {
@@ -172,7 +157,7 @@ test.describe('System Status', () => {
         await page.waitForTimeout(500)
 
         // Popover should show service statuses
-        const apiServer = page.getByText('API Server')
+        const apiServer = page.getByText('API server')
         if (await apiServer.isVisible({ timeout: 3000 }).catch(() => false)) {
           await expect(apiServer).toBeVisible()
         }
@@ -185,9 +170,9 @@ test.describe('Cross-Page Navigation', () => {
   test('navigates from dashboard to plugins via quick action', async ({
     page,
   }) => {
-    await navigateTo(page, '/dashboard')
+    await navigateTo(page, '/overview')
 
-    const managePlugins = page.getByText('Manage Plugins')
+    const managePlugins = page.getByText('Manage plugins')
     if (
       await managePlugins
         .first()
@@ -204,7 +189,7 @@ test.describe('Cross-Page Navigation', () => {
   test('navigates from dashboard to sources via quick action', async ({
     page,
   }) => {
-    await navigateTo(page, '/dashboard')
+    await navigateTo(page, '/overview')
 
     const manageSources = page.getByText('Manage Sources')
     if (
@@ -222,7 +207,7 @@ test.describe('Cross-Page Navigation', () => {
 
   test('full navigation cycle across pages', async ({ page }) => {
     // Dashboard → Plugins → Sources → Configure → Dashboard
-    await navigateTo(page, '/dashboard')
+    await navigateTo(page, '/overview')
 
     // Go to plugins
     await page.goto('/admin/plugins')
@@ -256,7 +241,7 @@ test.describe('Cross-Page Navigation', () => {
     await expect(page).toHaveURL(/configure/)
 
     // Back to dashboard
-    await page.goto('/dashboard')
+    await page.goto('/overview')
     await page.waitForLoadState('networkidle')
     const welcomeHeading = page.getByText(/welcome back/i)
     if (

@@ -1,0 +1,531 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * Side-by-side comparison: two OpenLayers maps sharing ONE View instance,
+ * which is all OL needs to sync pan/zoom/rotation natively. Layers and
+ * basemaps cannot be shared across maps, so each panel owns its own. A
+ * DOM crosshair mirrors the cursor position across both panels.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useOlMapBase } from '../hooks/useOlMapBase'
+import { useBasemap } from '../hooks/useBasemap'
+import { useWmsLayerStack } from '../hooks/useWmsLayerStack'
+import { useMeasure } from '../hooks/useMeasure'
+import { usePointerReadout } from '../hooks/usePointerReadout'
+import { useTimeStepPrefetch } from '../hooks/useTimeStepPrefetch'
+import { PointerReadoutBadge } from '../components/PointerReadoutBadge'
+import { viewerProjectionOf } from '../projections'
+import { compositeMapToCanvas } from '../map-export'
+import { MapLoadingBar } from '../components/MapLoadingBar'
+import { PinnedLegendsBar } from '../components/PinnedLegendsBar'
+import { useContextOverlays, useOverlayHover } from './overlays'
+import { OverlayHoverCard } from './OverlayHoverCard'
+import { annotationVisibleOn, useAnnotationLayer } from './annotations'
+import { CompareSlotTag } from './CompareSlotTag'
+import { LoupeOverlay } from './LoupeOverlay'
+import { PanelCorner, SlotStatusBadges } from './SlotStatusBadges'
+import { MapNavControls } from './MapNavControls'
+import { NAV_CLEARANCE, navEaseMs, panView, zoomView } from './map-nav'
+import type { PinnedLegendItem } from '../components/PinnedLegendsBar'
+import type { MapAnnotation } from './annotations'
+import type { ContextOverlay } from './overlays'
+import type { MeasureMode, Measurement } from '../hooks/useMeasure'
+import type Geometry from 'ol/geom/Geometry'
+import type View from 'ol/View'
+import type { SourceSlot } from './layer-pairing'
+import type { CaptureResult, CompareMapSource, FitBboxAction } from './types'
+import { useUiStore } from '@/stores/uiStore'
+import { cn } from '@/lib/utils'
+
+const noop = () => {}
+
+/** Cursor position as container fractions, mirrored across panels. */
+type CrossPosition = { x: number; y: number } | null
+
+type SlotLegendItem = PinnedLegendItem & { slot: SourceSlot }
+
+export function DualMapView({
+  view,
+  a,
+  b,
+  loupeMirror = true,
+  loupeSizePx = 180,
+  loupeZoom = 2,
+  loupeLatched = false,
+  preload = false,
+  pinnedLegends = [],
+  onUnpinLegend = noop,
+  basemapId,
+  basemapOpacity,
+  measureMode,
+  measurements,
+  onMeasurementAdd,
+  onMeasurementRemove,
+  overlays,
+  annotations,
+  annotateArmed,
+  annotationHighlightId,
+  onAnnotationCreate,
+  onAnnotationEdit,
+  onAnnotationMove,
+  onRegisterFit,
+  onRegisterFitBbox,
+  onRegisterCapture,
+}: {
+  view: View
+  a: CompareMapSource
+  b: CompareMapSource
+  /** Mirror the hold-Z loupe onto both panels; else only the hovered one. */
+  loupeMirror?: boolean
+  /** Hold-Z loupe diameter in CSS pixels. */
+  loupeSizePx?: number
+  /** Hold-Z loupe magnification factor. */
+  loupeZoom?: number
+  /** Keep the loupe on without holding Z (keyboard/touch path). */
+  loupeLatched?: boolean
+  /** Prefetch every active layer × time step into the HTTP cache. */
+  preload?: boolean
+  pinnedLegends?: ReadonlyArray<SlotLegendItem>
+  onUnpinLegend?: (key: string) => void
+  basemapId: string
+  basemapOpacity: number
+  measureMode: MeasureMode
+  measurements: ReadonlyArray<Measurement>
+  onMeasurementAdd: (
+    geometry: Geometry,
+    label: string,
+    sourceId: string | null,
+  ) => void
+  onMeasurementRemove: (id: string) => void
+  overlays: ReadonlyArray<ContextOverlay>
+  annotations: ReadonlyArray<MapAnnotation>
+  annotateArmed: boolean
+  annotationHighlightId: string | null
+  onAnnotationCreate: (
+    coordinate: [number, number],
+    sourceId: string | null,
+    slot: SourceSlot | null,
+  ) => void
+  onAnnotationEdit: (id: string) => void
+  onAnnotationMove: (id: string, coordinate: [number, number]) => void
+  /** Register this component's fit-to-bbox action with the toolbar. */
+  onRegisterFit: (fit: (() => void) | null) => void
+  onRegisterFitBbox: (fit: FitBboxAction | null) => void
+  onRegisterCapture: (
+    capture: (() => Promise<Array<CaptureResult>>) | null,
+  ) => void
+}) {
+  const [cross, setCross] = useState<CrossPosition>(null)
+  const fitsRef = useRef<Map<string, () => void>>(new Map())
+  const capturesRef = useRef<Map<string, () => Promise<CaptureResult | null>>>(
+    new Map(),
+  )
+
+  useEffect(() => {
+    onRegisterCapture(async () => {
+      const results = await Promise.all(
+        [...capturesRef.current.values()].map((capture) => capture()),
+      )
+      return results.filter((r): r is CaptureResult => r !== null)
+    })
+    return () => onRegisterCapture(null)
+  }, [onRegisterCapture])
+
+  const registerCapture = useCallback(
+    (slot: string, capture: (() => Promise<CaptureResult | null>) | null) => {
+      if (capture) capturesRef.current.set(slot, capture)
+      else capturesRef.current.delete(slot)
+    },
+    [],
+  )
+
+  // One shared View: any panel's zoom-to-bbox serves both.
+  const fitBboxesRef = useRef(new Map<string, FitBboxAction>())
+  const registerFitBbox = useCallback(
+    (slot: string, fit: FitBboxAction | null) => {
+      if (fit) fitBboxesRef.current.set(slot, fit)
+      else fitBboxesRef.current.delete(slot)
+      const first = fitBboxesRef.current.values().next().value
+      onRegisterFitBbox(first ?? null)
+    },
+    [onRegisterFitBbox],
+  )
+  const registerFit = useCallback(
+    (slot: string, fit: (() => void) | null) => {
+      if (fit) fitsRef.current.set(slot, fit)
+      else fitsRef.current.delete(slot)
+      onRegisterFit(
+        fitsRef.current.size > 0
+          ? () => fitsRef.current.forEach((f) => f())
+          : null,
+      )
+    },
+    [onRegisterFit],
+  )
+
+  return (
+    // Columns only when EACH map gets ~380px+ — with sidebars open at
+    // ~1024px the pair would otherwise render as two skinny strips.
+    <div className="@container h-full min-h-0">
+      <div className="grid h-full min-h-0 grid-cols-1 gap-2 @3xl:grid-cols-2">
+        <DualMapPanel
+          source={a}
+          view={view}
+          preload={preload}
+          pinnedLegends={pinnedLegends}
+          onUnpinLegend={onUnpinLegend}
+          cross={cross}
+          onCross={setCross}
+          loupeMirror={loupeMirror}
+          loupeSizePx={loupeSizePx}
+          loupeZoom={loupeZoom}
+          loupeLatched={loupeLatched}
+          basemapId={basemapId}
+          basemapOpacity={basemapOpacity}
+          measureMode={measureMode}
+          measurements={measurements}
+          onMeasurementAdd={onMeasurementAdd}
+          onMeasurementRemove={onMeasurementRemove}
+          overlays={overlays}
+          annotations={annotations}
+          annotateArmed={annotateArmed}
+          annotationHighlightId={annotationHighlightId}
+          onAnnotationCreate={onAnnotationCreate}
+          onAnnotationEdit={onAnnotationEdit}
+          onAnnotationMove={onAnnotationMove}
+          onRegisterFit={registerFit}
+          onRegisterFitBbox={registerFitBbox}
+          onRegisterCapture={registerCapture}
+        />
+        <DualMapPanel
+          source={b}
+          view={view}
+          preload={preload}
+          pinnedLegends={pinnedLegends}
+          onUnpinLegend={onUnpinLegend}
+          cross={cross}
+          onCross={setCross}
+          loupeMirror={loupeMirror}
+          loupeSizePx={loupeSizePx}
+          loupeZoom={loupeZoom}
+          loupeLatched={loupeLatched}
+          basemapId={basemapId}
+          basemapOpacity={basemapOpacity}
+          measureMode={measureMode}
+          measurements={measurements}
+          onMeasurementAdd={onMeasurementAdd}
+          onMeasurementRemove={onMeasurementRemove}
+          overlays={overlays}
+          annotations={annotations}
+          annotateArmed={annotateArmed}
+          annotationHighlightId={annotationHighlightId}
+          onAnnotationCreate={onAnnotationCreate}
+          onAnnotationEdit={onAnnotationEdit}
+          onAnnotationMove={onAnnotationMove}
+          onRegisterFit={registerFit}
+          onRegisterFitBbox={registerFitBbox}
+          onRegisterCapture={registerCapture}
+        />
+      </div>
+    </div>
+  )
+}
+
+function DualMapPanel({
+  source,
+  view,
+  preload,
+  pinnedLegends,
+  onUnpinLegend,
+  cross,
+  onCross,
+  loupeMirror,
+  loupeSizePx,
+  loupeZoom,
+  loupeLatched,
+  basemapId,
+  basemapOpacity,
+  measureMode,
+  measurements,
+  onMeasurementAdd,
+  onMeasurementRemove,
+  overlays,
+  annotations,
+  annotateArmed,
+  annotationHighlightId,
+  onAnnotationCreate,
+  onAnnotationEdit,
+  onAnnotationMove,
+  onRegisterFit,
+  onRegisterFitBbox,
+  onRegisterCapture,
+}: {
+  source: CompareMapSource
+  view: View
+  preload: boolean
+  pinnedLegends: ReadonlyArray<SlotLegendItem>
+  onUnpinLegend: (key: string) => void
+  cross: CrossPosition
+  onCross: (pos: CrossPosition) => void
+  loupeMirror: boolean
+  loupeSizePx: number
+  loupeZoom: number
+  loupeLatched: boolean
+  basemapId: string
+  basemapOpacity: number
+  measureMode: MeasureMode
+  measurements: ReadonlyArray<Measurement>
+  onMeasurementAdd: (
+    geometry: Geometry,
+    label: string,
+    sourceId: string | null,
+  ) => void
+  onMeasurementRemove: (id: string) => void
+  overlays: ReadonlyArray<ContextOverlay>
+  annotations: ReadonlyArray<MapAnnotation>
+  annotateArmed: boolean
+  annotationHighlightId: string | null
+  onAnnotationCreate: (
+    coordinate: [number, number],
+    sourceId: string | null,
+    slot: SourceSlot | null,
+  ) => void
+  onAnnotationEdit: (id: string) => void
+  onAnnotationMove: (id: string, coordinate: [number, number]) => void
+  onRegisterFit: (slot: string, fit: (() => void) | null) => void
+  onRegisterFitBbox: (slot: string, fit: FitBboxAction | null) => void
+  onRegisterCapture: (
+    slot: string,
+    capture: (() => Promise<CaptureResult | null>) | null,
+  ) => void
+}) {
+  const { t } = useTranslation('visualise')
+  const containerRef = useRef<HTMLDivElement>(null)
+  const [loadingCount, setLoadingCount] = useState(0)
+  const incLoading = useCallback(() => setLoadingCount((c) => c + 1), [])
+  const decLoading = useCallback(
+    () => setLoadingCount((c) => Math.max(0, c - 1)),
+    [],
+  )
+  const theme = useUiStore((s) => s.resolvedTheme)
+  const { mapRef, basemapLayerRef, tryFit, fitBbox, setFitBbox, mapVersion } =
+    useOlMapBase(containerRef, {
+      view,
+      // A projection switch swaps the View — rebuild around it.
+      resetKey: `${source.slot}:${source.baseUrl}|${view.getProjection().getCode()}`,
+      theme,
+      incLoading: noop,
+      decLoading: noop,
+    })
+  useBasemap({
+    mapRef,
+    basemapLayerRef,
+    baseUrl: source.baseUrl,
+    decorationLayers: source.decorationLayers,
+    basemapId,
+    opacity: basemapOpacity,
+    theme,
+    incLoading,
+    decLoading,
+    mapVersion,
+  })
+  const stack = useWmsLayerStack(mapRef, source.baseUrl, source.layers, {
+    zBase: 100,
+    masterOpacity: source.hiddenAtTime ? 0 : source.masterOpacity,
+    activeOrder: source.activeOrder,
+    layerOpacities: source.layerOpacities,
+    layerSettings: source.layerSettings,
+    bboxAxisOrder: source.bboxAxisOrder,
+    resolveTime: source.resolveTime,
+    incLoading,
+    decLoading,
+    onLoadResult: source.onLoadResult,
+    mapVersion,
+  })
+
+  useTimeStepPrefetch(mapRef, {
+    enabled: preload,
+    baseUrl: source.baseUrl,
+    layers: source.layers,
+    activeOrder: source.activeOrder,
+    layerSettings: source.layerSettings,
+    bboxAxisOrder: source.bboxAxisOrder,
+    timeSteps: source.timeSteps,
+    mapVersion,
+  })
+  const pointer = usePointerReadout(mapRef, mapVersion)
+  useContextOverlays(mapRef, overlays, mapVersion)
+  const overlayHover = useOverlayHover(mapRef, overlays, mapVersion)
+  // A panel shows exactly its source's pins; creations bind to it.
+  const pinScope = useMemo(() => [source.id], [source.id])
+  useAnnotationLayer(
+    mapRef,
+    annotations,
+    pinScope,
+    annotateArmed,
+    {
+      onCreate: (coordinate) =>
+        onAnnotationCreate(coordinate, source.id, source.slot),
+      onEdit: onAnnotationEdit,
+      onMove: onAnnotationMove,
+    },
+    annotationHighlightId,
+    mapVersion,
+  )
+  // Measurements follow the pins' binding rule.
+  const shownMeasurements = useMemo(
+    () => measurements.filter((m) => annotationVisibleOn(m, pinScope)),
+    [measurements, pinScope],
+  )
+  useMeasure(
+    mapRef,
+    measureMode,
+    shownMeasurements,
+    {
+      onAdd: (geometry, label) => onMeasurementAdd(geometry, label, source.id),
+      onRemove: onMeasurementRemove,
+    },
+    t('measure.remove'),
+    mapVersion,
+  )
+
+  useEffect(() => {
+    setFitBbox(source.bbox)
+  }, [source.bbox, setFitBbox])
+
+  useEffect(() => {
+    onRegisterFit(source.slot, () => tryFit(true))
+    return () => onRegisterFit(source.slot, null)
+  }, [source.slot, tryFit, onRegisterFit])
+  useEffect(() => {
+    onRegisterFitBbox(source.slot, fitBbox)
+    return () => onRegisterFitBbox(source.slot, null)
+  }, [source.slot, fitBbox, onRegisterFitBbox])
+
+  useEffect(() => {
+    onRegisterCapture(source.slot, () => {
+      const map = mapRef.current
+      if (!map) return Promise.resolve(null)
+      return new Promise((resolve) => {
+        map.once('rendercomplete', () => {
+          const canvas = compositeMapToCanvas(map.getTargetElement())
+          resolve(
+            canvas
+              ? {
+                  label: `${source.slot.toUpperCase()} · ${source.label}`,
+                  slot: source.slot,
+                  canvas,
+                  timeLabel: source.timeLabel,
+                }
+              : null,
+          )
+        })
+        map.renderSync()
+      })
+    })
+    return () => onRegisterCapture(source.slot, null)
+  }, [source.slot, source.label, source.timeLabel, mapRef, onRegisterCapture])
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    onCross({
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height,
+    })
+  }
+
+  return (
+    <div
+      className="relative min-h-0 overflow-hidden rounded-md border border-border bg-muted/20"
+      onPointerMove={onPointerMove}
+      onPointerLeave={() => onCross(null)}
+    >
+      <div
+        ref={containerRef}
+        className={cn('absolute inset-0', annotateArmed && 'cursor-copy')}
+      />
+      <MapLoadingBar
+        loading={loadingCount > 0 || source.layersLoading}
+        slot={source.slot}
+      />
+      <LoupeOverlay
+        containerRef={containerRef}
+        mirror={loupeMirror ? cross : null}
+        sizePx={loupeSizePx}
+        zoom={loupeZoom}
+        latched={loupeLatched}
+      />
+      <OverlayHoverCard hover={overlayHover} />
+      <PinnedLegendsBar
+        items={pinnedLegends.filter((i) => i.slot === source.slot)}
+        onUnpin={onUnpinLegend}
+      />
+      {pointer && (
+        <PointerReadoutBadge
+          pointer={pointer}
+          label={t(`projections.short.${viewerProjectionOf(view).id}`)}
+          crs={view.getProjection().getCode()}
+          metres={viewerProjectionOf(view).gridReadout}
+        />
+      )}
+      {annotateArmed && (
+        <div className="pointer-events-none absolute bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-md border border-border bg-background/90 px-2.5 py-1 text-xs font-medium shadow-sm backdrop-blur-sm">
+          {t('annotations.armedHint')}
+        </div>
+      )}
+      {measureMode !== 'none' && (
+        <div className="pointer-events-none absolute bottom-2 left-1/2 z-10 -translate-x-1/2 rounded-md border border-border bg-background/90 px-2.5 py-1 text-xs font-medium shadow-sm backdrop-blur-sm">
+          {t(
+            measureMode === 'box'
+              ? 'measure.armedHintBox'
+              : 'measure.armedHint',
+          )}
+        </div>
+      )}
+      <div
+        className={cn(
+          'pointer-events-none absolute top-2 left-2 z-10 flex',
+          NAV_CLEARANCE,
+        )}
+      >
+        <CompareSlotTag
+          slot={source.slot}
+          label={source.label}
+          loading={loadingCount > 0 || source.layersLoading}
+          timeLabel={source.timeLabel}
+          runLabel={source.runLabel}
+          submittedAt={source.submittedAt}
+        />
+      </div>
+      <PanelCorner side="left">
+        <SlotStatusBadges source={source} erroredNames={stack.erroredNames} />
+      </PanelCorner>
+      <MapNavControls
+        onPan={(dx, dy) => panView(view, dx, dy, navEaseMs())}
+        onZoom={(delta) => zoomView(view, delta)}
+      />
+      {cross && (
+        <>
+          <div
+            className="pointer-events-none absolute inset-y-0 z-10 w-px bg-foreground/40"
+            style={{ left: `${cross.x * 100}%` }}
+          />
+          <div
+            className="pointer-events-none absolute inset-x-0 z-10 h-px bg-foreground/40"
+            style={{ top: `${cross.y * 100}%` }}
+          />
+        </>
+      )}
+    </div>
+  )
+}

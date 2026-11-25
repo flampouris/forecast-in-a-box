@@ -11,32 +11,54 @@
 Types pertaining to declaring FIAB Plugins, in particular their Fable-based interface.
 """
 
-from dataclasses import dataclass
-from typing import Callable
+from dataclasses import dataclass, field, replace
+from typing import Callable, Self
 
 from cascade.low.func import Either
 from earthkit.workflows.fluent import Action
 
 from fiab_core.fable import (
     ActionLookup,
+    BlockExpansion,
     BlockFactoryCatalogue,
     BlockFactoryId,
     BlockInstance,
-    BlockInstanceId,
     BlockInstanceOutput,
+    BlueprintTemplate,
+    ConfigurationOptionRestriction,
+    Error,
 )
 
-Error = str
-Validator = Callable[[BlockInstance, dict[str, BlockInstanceOutput]], Either[BlockInstanceOutput, Error]]  # type:ignore[invalid-argument] # semigroup
-"""Given a block instance corresponding to this plugin's Factory and its inputs, either provide error or determine what it outputs"""
 
-Expander = Callable[[BlockInstanceOutput], list[BlockFactoryId]]
+@dataclass(frozen=True, eq=True, slots=True)
+class BlockValidationError:
+    reason: str
+    is_hard: bool
+
+    def __add__(self, other: Self) -> Self:
+        if not isinstance(other, BlockValidationError):
+            raise TypeError(other.__class__.__name__)
+        return replace(
+            self,
+            reason=self.reason + other.reason,
+            is_hard=self.is_hard or other.is_hard,
+        )
+
+
+@dataclass(frozen=True, eq=True, slots=True)
+class BlockValidation:
+    result: Either[BlockInstanceOutput, BlockValidationError]
+    restrictions: ConfigurationOptionRestriction = field(default_factory=dict)
+
+
+Validator = Callable[[BlockFactoryId, BlockInstance, dict[str, BlockInstanceOutput]], BlockValidation]
+"""Given a factory id from this PLugin, a block instance corresponding to it, and its inputs, return either error or output and configuration restrictions"""
+
+Expander = Callable[[BlockInstanceOutput], list[BlockExpansion]]
 """Given a block instance output (including from other plugin), provide which block factories from this plugin can expand it"""
 
-Compiler = Callable[
-    [ActionLookup, BlockInstanceId, BlockInstance], Either[Action, Error]  # type:ignore[invalid-argument] # semigroup
-]
-"""Given a cascade builder, represented as lookup of fluent actions, and a block instance corresponding to this plugin's Factory, either return the fluent action resulting from this block or an error"""
+Compiler = Callable[[ActionLookup, BlockFactoryId, BlockInstance], Either[Action, Error]]  # ty:ignore[invalid-type-arguments] # semigroup
+"""Given a cascade builder, represented as lookup of fluent actions, a factory id from this Plugin, and a block instance corresponding to it, either return the fluent action resulting from this block or an error"""
 
 
 @dataclass(frozen=True, eq=True, slots=True)
@@ -51,3 +73,4 @@ class Plugin:
     validator: Validator
     expander: Expander
     compiler: Compiler
+    blueprint_templates: tuple[BlueprintTemplate, ...] = field(default_factory=tuple)

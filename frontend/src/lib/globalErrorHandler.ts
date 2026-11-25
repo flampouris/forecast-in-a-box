@@ -8,10 +8,24 @@
  * does it submit to any jurisdiction.
  */
 
+import i18n from 'i18next'
 import { createLogger } from './logger'
 import { showToast } from './toast'
 
 const log = createLogger('GlobalError')
+
+/** Browser-emitted notifications that look like errors but are benign.
+ * The two `ResizeObserver loop ...` messages fire when an RO callback
+ * triggers layout work that spans more than one frame — spec-compliant,
+ * not failures. Silencing them keeps the UI free of spurious toasts. */
+function isBenignBrowserNotification(message: string | Event): boolean {
+  const text = typeof message === 'string' ? message : ''
+  return (
+    text.includes(
+      'ResizeObserver loop completed with undelivered notifications',
+    ) || text.includes('ResizeObserver loop limit exceeded')
+  )
+}
 
 /**
  * Extracts a user-friendly message from an error of unknown type.
@@ -23,7 +37,7 @@ function extractErrorMessage(reason: unknown): string {
   if (typeof reason === 'string') {
     return reason
   }
-  return 'An unexpected error occurred'
+  return i18n.t('errors:toast.unexpected')
 }
 
 /**
@@ -44,6 +58,11 @@ export function setupGlobalErrorHandlers(): void {
     colno?: number,
     error?: Error,
   ): boolean => {
+    if (isBenignBrowserNotification(message)) {
+      // Don't log or toast — but still let the browser print to DevTools.
+      return false
+    }
+
     log.error('Uncaught error:', {
       message,
       source,
@@ -53,8 +72,8 @@ export function setupGlobalErrorHandlers(): void {
     })
 
     showToast.error(
-      'An unexpected error occurred',
-      'Please try refreshing the page',
+      i18n.t('errors:toast.unexpected'),
+      i18n.t('errors:toast.unexpectedHint'),
     )
 
     // Return false to allow default browser error handling (e.g., DevTools logging)

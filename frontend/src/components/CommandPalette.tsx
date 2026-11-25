@@ -12,43 +12,116 @@
  * Command Palette Component
  *
  * Global command palette accessible via ⌘K (Mac) or Ctrl+K (Windows/Linux).
- * Provides quick access to Getting Started presets and navigation.
+ * Built on Base UI Autocomplete — provides quick access to Getting Started
+ * presets and navigation.
  */
 
-import { useMemo } from 'react'
-import { useHotkey } from '@tanstack/react-hotkeys'
-import { useNavigate } from '@tanstack/react-router'
-import type { Command } from '@/commands/registry'
+import { useMemo, useRef, useState } from 'react'
+import { formatForDisplay, useHotkey } from '@tanstack/react-hotkeys'
+import { useNavigate, useRouterState } from '@tanstack/react-router'
+import { useTranslation } from 'react-i18next'
+import type { Command, CommandCategory } from '@/commands/registry'
 import { groupCommandsByCategory } from '@/commands/registry'
 import { navigationCommands } from '@/commands/navigationCommands'
 import {
+  useBlockCommands,
+  usePresetCommands,
+  useRunCommands,
+} from '@/commands/dataCommands'
+import {
+  CommandCollection,
   CommandDialog,
   CommandEmpty,
+  CommandFooter,
   CommandGroup,
+  CommandGroupLabel,
   CommandInput,
   CommandItem,
   CommandList,
+  Command as CommandRoot,
   CommandShortcut,
 } from '@/components/ui/command'
 import { useCommandStore } from '@/stores/commandStore'
 
+/** A category of commands, shaped for Base UI Autocomplete's grouped `items`. */
+interface CommandPaletteGroup {
+  value: CommandCategory
+  items: Array<Command>
+}
+
+/**
+ * Matches a command against the search query across its label, description and
+ * keyword aliases. Every whitespace-separated term must appear somewhere.
+ */
+function commandFilter(command: Command, query: string): boolean {
+  const trimmed = query.trim().toLowerCase()
+  if (!trimmed) return true
+
+  const haystack = [
+    command.label,
+    command.description ?? '',
+    ...(command.keywords ?? []),
+  ]
+    .join(' ')
+    .toLowerCase()
+
+  return trimmed.split(/\s+/).every((term) => haystack.includes(term))
+}
+
 export function CommandPalette() {
-  const navigate = useNavigate()
   const { isOpen, setOpen } = useCommandStore()
 
-  // Build commands with navigate function
-  const commands = useMemo(() => navigationCommands(navigate), [navigate])
-  const groupedCommands = useMemo(
-    () => groupCommandsByCategory(commands),
-    [commands],
-  )
-
-  // Listen for ⌘K / Ctrl+K keyboard shortcut
-  // Mod+K covers ⌘K on Mac and Ctrl+K on Windows/Linux.
+  // Listen for ⌘K / Ctrl+K. Mod+K covers ⌘ on Mac and Ctrl elsewhere;
   // Control+K ensures Ctrl+K also works on Mac for consistency.
   const toggle = () => setOpen(!isOpen)
   useHotkey('Mod+K', toggle)
   useHotkey('Control+K', toggle)
+
+  return (
+    <CommandDialog open={isOpen} onOpenChange={setOpen}>
+      {isOpen && <CommandPaletteContent />}
+    </CommandDialog>
+  )
+}
+
+/** Mounted only while open, so the preset and run queries stay idle otherwise. */
+function CommandPaletteContent() {
+  const navigate = useNavigate()
+  const setOpen = useCommandStore((state) => state.setOpen)
+  const { t } = useTranslation('common')
+  const onConfigure = useRouterState({
+    select: (state) => state.location.pathname.startsWith('/configure'),
+  })
+
+  // Category headings are union values used for grouping; map them to labels.
+  const categoryLabels: Record<CommandCategory, string> = {
+    'Getting Started': t('commands.categoryGettingStarted'),
+    Navigation: t('commands.categoryNavigation'),
+    Presets: t('commands.categoryPresets'),
+    Runs: t('commands.categoryRuns'),
+    Blocks: t('commands.categoryBlocks'),
+  }
+
+  // Tracks the highlighted command so Tab can confirm it, mirroring Enter.
+  const highlightedCommand = useRef<Command | undefined>(undefined)
+
+  // Base UI skips the filter on an empty query, so search-only commands are
+  // dropped from the item list itself until the user types.
+  const [query, setQuery] = useState('')
+  const pages = useMemo(() => navigationCommands(navigate), [navigate])
+  const presets = usePresetCommands(navigate)
+  const runs = useRunCommands(navigate)
+  const blocks = useBlockCommands(onConfigure)
+  const groups = useMemo<Array<CommandPaletteGroup>>(() => {
+    const all = [...pages, ...presets, ...runs, ...blocks]
+    const listed = query.trim()
+      ? all
+      : all.filter((command) => !command.searchOnly)
+    return groupCommandsByCategory(listed).map((group) => ({
+      value: group.category,
+      items: group.commands,
+    }))
+  }, [pages, presets, runs, blocks, query])
 
   const handleSelect = (command: Command) => {
     setOpen(false)
@@ -56,37 +129,63 @@ export function CommandPalette() {
   }
 
   return (
-    <CommandDialog open={isOpen} onOpenChange={setOpen}>
-      <CommandInput placeholder="Type a command or search..." />
+    <CommandRoot
+      open
+      inline
+      items={groups}
+      value={query}
+      onValueChange={setQuery}
+      autoHighlight="always"
+      keepHighlight
+      filter={commandFilter}
+      itemToStringValue={(command: Command) => command.label}
+      onItemHighlighted={(command) => {
+        highlightedCommand.current = command
+      }}
+    >
+      <CommandInput
+        placeholder={t('commandPalette.placeholder')}
+        onKeyDown={(event) => {
+          // Tab confirms the highlighted command, mirroring Enter.
+          if (event.key === 'Tab' && highlightedCommand.current) {
+            event.preventDefault()
+            handleSelect(highlightedCommand.current)
+          }
+        }}
+      />
+      <CommandEmpty>{t('commandPalette.empty')}</CommandEmpty>
       <CommandList>
-        <CommandEmpty>No results found.</CommandEmpty>
-
-        {groupedCommands.map((group) => (
-          <CommandGroup key={group.category} heading={group.category}>
-            {group.commands.map((command) => (
-              <CommandItem
-                key={command.id}
-                value={command.id}
-                keywords={command.keywords}
-                onSelect={() => handleSelect(command)}
-              >
-                {command.icon}
-                <div className="flex flex-col gap-0.5">
-                  <span>{command.label}</span>
-                  {command.description && (
-                    <span className="text-xs text-muted-foreground">
-                      {command.description}
-                    </span>
+        {(group: CommandPaletteGroup) => (
+          <CommandGroup key={group.value} items={group.items}>
+            <CommandGroupLabel>{categoryLabels[group.value]}</CommandGroupLabel>
+            <CommandCollection>
+              {(command: Command) => (
+                <CommandItem
+                  key={command.id}
+                  value={command}
+                  onClick={() => handleSelect(command)}
+                >
+                  {command.icon}
+                  <div className="flex flex-col gap-0.5">
+                    <span>{command.label}</span>
+                    {command.description && (
+                      <span className="text-xs text-muted-foreground">
+                        {command.description}
+                      </span>
+                    )}
+                  </div>
+                  {command.hotkey && (
+                    <CommandShortcut
+                      keys={command.hotkey.map((key) => formatForDisplay(key))}
+                    />
                   )}
-                </div>
-                {command.shortcut && (
-                  <CommandShortcut>{command.shortcut}</CommandShortcut>
-                )}
-              </CommandItem>
-            ))}
+                </CommandItem>
+              )}
+            </CommandCollection>
           </CommandGroup>
-        ))}
+        )}
       </CommandList>
-    </CommandDialog>
+      <CommandFooter />
+    </CommandRoot>
   )
 }

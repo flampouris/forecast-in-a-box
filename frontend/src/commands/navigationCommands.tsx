@@ -11,19 +11,11 @@
 /**
  * Navigation Commands
  *
- * Commands for navigating to different pages and Getting Started presets.
+ * Commands for navigating to different pages and starting a new configuration.
  */
 
-import {
-  BarChart3,
-  Database,
-  History,
-  Home,
-  Layers,
-  PlayCircle,
-  Settings,
-  Wrench,
-} from 'lucide-react'
+import { Earth, History, Home, Layers, Settings, Wrench } from 'lucide-react'
+import i18n from 'i18next'
 import type { NavigateFn } from '@tanstack/react-router'
 import type { Command } from './registry'
 
@@ -32,83 +24,65 @@ import type { Command } from './registry'
  */
 export function navigationCommands(navigate: NavigateFn): Array<Command> {
   return [
-    // Getting Started presets
     {
-      id: 'preset-quick-start',
-      label: 'Quick Start',
-      description: 'Start with AIFS model preset',
-      icon: <PlayCircle className="h-4 w-4 text-primary" />,
+      id: 'new-configuration',
+      label: i18n.t('common:commands.newConfiguration.label'),
+      description: i18n.t('common:commands.newConfiguration.description'),
+      icon: <Layers className="h-4 w-4 text-primary" />,
       category: 'Getting Started',
-      keywords: ['quick', 'start', 'aifs', 'preset', 'recommended'],
-      action: () =>
-        navigate({ to: '/configure', search: { preset: 'quick-start' } }),
-    },
-    {
-      id: 'preset-standard',
-      label: 'Standard Forecast',
-      description: 'Choose model, 120h forecast',
-      icon: <BarChart3 className="h-4 w-4 text-blue-500" />,
-      category: 'Getting Started',
-      keywords: ['standard', 'forecast', 'model', 'configurable'],
-      action: () =>
-        navigate({ to: '/configure', search: { preset: 'standard' } }),
-    },
-    {
-      id: 'preset-custom-model',
-      label: 'Custom Model Forecast',
-      description: 'Blank canvas, full control',
-      icon: <Layers className="h-4 w-4 text-emerald-500" />,
-      category: 'Getting Started',
-      keywords: ['custom', 'model', 'blank', 'canvas', 'advanced'],
-      action: () =>
-        navigate({ to: '/configure', search: { preset: 'custom-model' } }),
-    },
-    {
-      id: 'preset-dataset',
-      label: 'Dataset Forecast',
-      description: 'Use AIFS data from external source',
-      icon: <Database className="h-4 w-4 text-purple-500" />,
-      category: 'Getting Started',
-      keywords: ['dataset', 'data', 'external', 'source'],
-      action: () =>
-        navigate({ to: '/configure', search: { preset: 'dataset' } }),
+      keywords: ['new', 'blank', 'canvas', 'configure', 'forecast'],
+      action: () => navigate({ to: '/configure', search: { fresh: true } }),
     },
 
     // Navigation
     {
       id: 'nav-dashboard',
-      label: 'Dashboard',
-      description: 'Go to dashboard',
+      label: i18n.t('common:commands.dashboard.label'),
+      description: i18n.t('common:commands.dashboard.description'),
       icon: <Home className="h-4 w-4" />,
       category: 'Navigation',
       keywords: ['home', 'dashboard', 'main'],
-      action: () => navigate({ to: '/dashboard' }),
+      hotkey: ['G', 'O'],
+      action: () => navigate({ to: '/overview' }),
     },
     {
       id: 'nav-configure',
-      label: 'Configure',
-      description: 'Create a new forecast configuration',
+      label: i18n.t('common:commands.configure.label'),
+      description: i18n.t('common:commands.configure.description'),
       icon: <Wrench className="h-4 w-4" />,
       category: 'Navigation',
       keywords: ['configure', 'fable', 'builder', 'new'],
+      hotkey: ['G', 'C'],
       action: () => navigate({ to: '/configure' }),
     },
     {
       id: 'nav-executions',
-      label: 'Executions',
-      description: 'Monitor forecast job executions',
+      label: i18n.t('common:commands.executions.label'),
+      description: i18n.t('common:commands.executions.description'),
       icon: <History className="h-4 w-4" />,
       category: 'Navigation',
       keywords: ['executions', 'history', 'past', 'runs', 'journal', 'jobs'],
-      action: () => navigate({ to: '/executions' }),
+      hotkey: ['G', 'E'],
+      action: () => navigate({ to: '/execute' }),
+    },
+    {
+      id: 'nav-visualise',
+      label: i18n.t('common:commands.visualise.label'),
+      description: i18n.t('common:commands.visualise.description'),
+      icon: <Earth className="h-4 w-4" />,
+      category: 'Navigation',
+      keywords: ['visualise', 'visualize', 'map', 'compare', 'wms', 'viewer'],
+      hotkey: ['G', 'V'],
+      action: () => navigate({ to: '/visualise' }),
     },
     {
       id: 'nav-admin',
-      label: 'Admin',
-      description: 'Manage plugins and models',
+      label: i18n.t('common:commands.admin.label'),
+      description: i18n.t('common:commands.admin.description'),
       icon: <Settings className="h-4 w-4" />,
       category: 'Navigation',
       keywords: ['admin', 'settings', 'plugins', 'models'],
+      hotkey: ['G', 'A'],
       action: () => navigate({ to: '/admin' }),
     },
   ]

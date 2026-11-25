@@ -8,13 +8,16 @@
  * does it submit to any jurisdiction.
  */
 
-import { URL, fileURLToPath } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 import viteReact from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { visualizer } from 'rollup-plugin-visualizer'
 
 import { tanstackRouter } from '@tanstack/router-plugin/vite'
+// Dependency-free data module — safe to share with the app bundle. Must stay
+// a relative path: the config loader runs before tsconfig aliases exist.
+// noinspection ES6PreferShortImport
+import { CURATED_WMS_SERVERS } from './src/features/visualise/curated-wms.ts'
 
 // https://vite.dev/config/
 export default defineConfig(({ mode }) => {
@@ -25,10 +28,34 @@ export default defineConfig(({ mode }) => {
     plugins: [
       tanstackRouter({
         target: 'react',
-        autoCodeSplitting: true,
+        // Prod-only: in dev the tsr-split route chunks fail to fetch on HMR/
+        // re-optimization (Vite 8), so bundle routes eagerly instead.
+        autoCodeSplitting: !isDev,
       }),
       viteReact(),
       tailwindcss(),
+      // Loopback is not for the lens (same-origin via the proxy) but for a
+      // user's own WMS — one bundle serves both a domain and localhost.
+      // External WMS hosts: dev allows all; prod bakes in the curated list
+      // plus FIAB_CSP_EXTRA_HOSTS (space-separated source expressions).
+      {
+        name: 'csp-loopback-hosts',
+        transformIndexHtml(html) {
+          const curatedOrigins = [
+            ...new Set(CURATED_WMS_SERVERS.map((s) => new URL(s.url).origin)),
+          ]
+          const hosts = [
+            'http://localhost:*',
+            'http://127.0.0.1:*',
+            ...(isDev ? ['https:', 'http:'] : curatedOrigins),
+            ...(env.FIAB_CSP_EXTRA_HOSTS ? [env.FIAB_CSP_EXTRA_HOSTS] : []),
+          ]
+          return html.replaceAll(
+            '<!--CSP_LOOPBACK_HOSTS-->',
+            hosts.join(' ').trim(),
+          )
+        },
+      },
       ...(mode === 'analyze'
         ? [
             visualizer({
@@ -40,20 +67,49 @@ export default defineConfig(({ mode }) => {
         : []),
     ],
     resolve: {
-      alias: {
-        '@': fileURLToPath(new URL('./src', import.meta.url)),
-        '@tests': fileURLToPath(new URL('./tests', import.meta.url)),
-      },
+      tsconfigPaths: true,
     },
     build: {
       sourcemap: false,
       chunkSizeWarningLimit: 500,
-      rollupOptions: {
+      rolldownOptions: {
         output: {
-          manualChunks: {
-            vendor: ['react', 'react-dom'],
-            router: ['@tanstack/react-router'],
-            query: ['@tanstack/react-query'],
+          codeSplitting: {
+            groups: [
+              { name: 'vendor', test: /node_modules[\\/]react(-dom)?[\\/]/ },
+              {
+                name: 'router',
+                test: /node_modules[\\/]@tanstack[\\/]react-router[\\/]/,
+              },
+              {
+                name: 'query',
+                test: /node_modules[\\/]@tanstack[\\/]react-query[\\/]/,
+              },
+              // Heavy shared libs — carve into dedicated chunks so they are
+              // not duplicated into / bundled with individual route chunks.
+              {
+                name: 'charts',
+                test: /node_modules[\\/](@tanstack[\\/]charts|d3-[^\\/]+)[\\/]/,
+              },
+              {
+                name: 'flow',
+                test: /node_modules[\\/](@xyflow[\\/]react|@dagrejs[\\/][^\\/]+)[\\/]/,
+              },
+              {
+                name: 'three',
+                test: /node_modules[\\/]three[\\/]/,
+              },
+              {
+                name: 'datefns',
+                test: /node_modules[\\/]date-fns[\\/]/,
+              },
+              // i18n namespace JSON — split out so translation strings load
+              // as their own chunk instead of inflating the main bundle.
+              {
+                name: 'locales',
+                test: /[\\/]src[\\/]locales[\\/]/,
+              },
+            ],
           },
         },
       },
@@ -66,6 +122,8 @@ export default defineConfig(({ mode }) => {
             target: env.VITE_API_BASE || 'http://localhost:8000',
             changeOrigin: true,
             secure: false,
+            // Forward WebSocket upgrades (notification push channel)
+            ws: true,
             cookieDomainRewrite: 'localhost',
             // Rewrite Location headers in redirect responses to use the proxy host
             // This fixes issues with backend 303 redirects containing absolute URLs to port 8000

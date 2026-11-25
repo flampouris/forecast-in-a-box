@@ -1,0 +1,55 @@
+# (C) Copyright 2026- ECMWF.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+"""
+Tests parsing methods on a fake catalog.
+Does not interact with the *real* catalog in install/artifacts.json -- that is not a unit test,
+that is a responsibility of the scripts/parse_test_artifacts_catalog.py
+"""
+
+import json
+
+from fiab_core.artifacts import AnemoiCheckpoint, ArtifactLocalId, ArtifactStoreId, CommonArtifactMetadata, CompositeArtifactId, parse_json
+
+
+def test_parse_json() -> None:
+    payload = {
+        "display_name": "Store",
+        "artifacts": {
+            "model1": {
+                "artifact_type": "AnemoiCheckpoint",
+                "common": {
+                    "url": "https://example.com/model1.ckpt",
+                    "display_name": "Model 1",
+                    "display_author": "ECMWF",
+                    "display_description": "Example model",
+                    "disk_size_bytes": 1,
+                    "supported_platforms": ["linux"],
+                },
+                "specific": {
+                    "pip_package_constraints": [],
+                    "input_characteristics": [],
+                    "input_qube": {},
+                    "output_qube": {},
+                    "timestep": "1h",
+                },
+            }
+        },
+    }
+
+    parsed = dict(parse_json(ArtifactStoreId("store1"), json.dumps(payload), lambda common, specific: (True, common.display_name)))
+
+    composite_id = CompositeArtifactId(artifact_store_id=ArtifactStoreId("store1"), artifact_local_id=ArtifactLocalId("model1"))
+    artifact = parsed[composite_id]
+
+    assert isinstance(artifact.common, CommonArtifactMetadata)
+    assert isinstance(artifact.specific, AnemoiCheckpoint)
+    assert artifact.common.display_name == "Model 1"
+    assert artifact.is_locally_compatible is True
+    assert artifact.local_compatibility_detail == "Model 1"

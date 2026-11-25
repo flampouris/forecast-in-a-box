@@ -1,3 +1,6 @@
+default:
+    @just --list
+
 dbuild:
     docker build -t forecast-in-a-box -f Dockerfile .
 
@@ -7,28 +10,28 @@ drun-mongo:
 drun:
     docker run --rm -it --network host --name forecast-in-a-box forecast-in-a-box
 
-fiabwheel:
+fiabfrontend:
     #!/usr/bin/env bash
+    set -euo pipefail
     pushd frontend
-    npm install --force # TODO fix the npm dependencies to get rid of --force !!!
+    npm ci
     npm run prodbuild
+    git rev-parse HEAD > dist/.git-commit
     popd
 
     pushd backend
     rm -rf src/forecastbox/static
     ln -s ../../../frontend/dist src/forecastbox/static
-    find src/forecastbox/static/ -type f | sed 's/.*/include &/' > MANIFEST.in
+    popd
+
+fiabwheel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just fiabfrontend
+
+    pushd backend
+    find src/forecastbox/static/ -type f ! -name .git-commit | sed 's/.*/include &/' > MANIFEST.in
     python -m build --installer uv .
-
-    # NOTE building packagesDist disabled for now
-    # mkdir packagesDist
-    # for e in $(ls -d packages/*) ; do 
-    #     pushd $e
-    #     python -m build --installer uv .
-    #     mv dist/* ../../packagesDist
-    #     popd
-    # done
-
     popd
 
 clean:
@@ -36,11 +39,16 @@ clean:
 	find backend -name '__pycache__' -exec rm -fr {} +
 	find backend -name 'dist' -type d -exec rm -rf {} +
 
+val-cicd-scripts:
+    bash scripts/cicd/test_scripts.sh
+
 val:
     #!/usr/bin/env bash
-    for d in $(ls backend/packages) ; do
-        if [[ -f $d/justfile ]] ; then
-            just -f $d/justfile -d $d val
+    set -euo pipefail
+    pkgLoc=backend/packages
+    for d in $(ls $pkgLoc) ; do
+        if [[ -f $pkgLoc/$d/justfile ]] ; then
+            just -f $pkgLoc/$d/justfile -d $pkgLoc/$d val
         fi
     done
         
@@ -49,7 +57,79 @@ val:
 f2:
     echo "f2"
 
-dev:
+dev *args:
     #!/usr/bin/env bash
-    if [[ ! -d backend/src/forecastbox/static ]] ; then just fiabwheel ; fi
-    just -f backend/justfile -d backend dev
+    set -euo pipefail
+
+    args=({{args}})
+    FIAB_FIRSTRUN_MARKER="${FIAB_ROOT:-.fiab}"/firstrun
+
+    # NOTE on MacOS, empty array fails to expand in a for-safe way, hence we need
+    # conditional expansion into itself (${var+"$var"} basically)
+    for arg in ${args[@]+"${args[@]}"} ; do
+        if [ "$arg" == "reinstall" ] ; then
+            echo "reinstall! Will drop the db and sync the venv"
+            pushd backend
+            uv sync --extra runtime --all-packages
+            rm -rf .fiab/*db
+            rm -f $FIAB_FIRSTRUN_MARKER
+            popd
+        fi
+    done
+
+    frontend_build_marker=frontend/dist/.git-commit
+    frontend_build_needed=false
+    if [[ ! -e frontend ]] ; then
+        # exotic scenario during docker dev
+        frontend_build_needed=false
+    elif [[ ! -L backend/src/forecastbox/static ||
+        ! -d backend/src/forecastbox/static ||
+        ! -f "$frontend_build_marker" ]] ; then
+        frontend_build_needed=true
+    else
+        frontend_build_commit=$(< "$frontend_build_marker")
+        if ! git cat-file -e "${frontend_build_commit}^{commit}" 2>/dev/null ||
+            ! git diff --quiet "$frontend_build_commit" HEAD -- frontend; then
+            frontend_build_needed=true
+        fi
+    fi
+
+    if [[ "$frontend_build_needed" == true ]] ; then
+        if ! read -r -p "The frontend build is missing or out of date. Build it now? [y/N] " response ; then
+            response=y
+        fi
+        case "$response" in
+            y|Y|yes|Yes|YES)
+                just fiabfrontend
+                ;;
+            *)
+                echo "Skipping frontend build; the backend will use the existing frontend files."
+                ;;
+        esac
+    fi
+
+    pushd backend
+    if [[ -z "${FIAB_ROOT-}" ]] ; then
+        export FIAB_ROOT=.fiab
+        if [[ ! -d .fiab ]] ; then mkdir -p .fiab/data_dir ; fi
+        echo "1761908420:d0.0.1" > .fiab/pylock.toml.timestamp
+    fi
+    if [[ ! -d .venv ]] ; then uv sync --extra runtime --all-packages ; fi
+    if [ -f "$FIAB_FIRSTRUN_MARKER" ] ; then
+        >&2 echo ".fiab firstrun found, assuming this is not first run"
+        export FIAB_FIRSTRUN="false"
+    else
+        >&2 echo ".fiab firstrun not found, assuming this is first run"
+        export FIAB_FIRSTRUN="true"
+        touch "$FIAB_FIRSTRUN_MARKER" # TODO create this in the python command instead!
+    fi
+
+    if [[ ! -f "${FIAB_ROOT}/config.toml" ]] ; then
+        echo "copying example config"
+        cp ../docs/developer/guidelines/example_dev_config.toml "${FIAB_ROOT}"/config.toml
+    fi
+
+    export EARTHKIT_DATA_CACHE_POLICY=${EARTHKIT_DATA_CACHE_POLICY:-"user"}
+    export EARTHKIT_DATA_MAXIMUM_CACHE_SIZE=${EARTHKIT_DATA_MAXIMUM_CACHE_SIZE:-"50G"}
+    uv run --no-sync python -m forecastbox.entrypoint.main
+    popd

@@ -26,9 +26,11 @@ import type {
   FableValidationExpansion,
   GlobalGlyphPostRequest,
   GlobalGlyphResponse,
-  GlyphDetail,
   GlyphFunctionsResponse,
   GlyphListResponse,
+  IntrinsicGlyphItem,
+  ResolvableValue,
+  ResolveDisplayResponse,
 } from '@/api/types/fable.types'
 import { apiClient } from '@/api/client'
 import { API_ENDPOINTS } from '@/api/endpoints'
@@ -41,7 +43,9 @@ import {
   GlobalGlyphResponseSchema,
   GlyphFunctionsResponseSchema,
   GlyphListResponseSchema,
+  ResolveDisplayResponseSchema,
   normalizeCatalogueKeys,
+  serializeFable,
 } from '@/api/types/fable.types'
 
 /**
@@ -73,7 +77,7 @@ export async function getCatalogue(
 export async function expandFable(
   fable: FableBuilderV1,
 ): Promise<FableValidationExpansion> {
-  return apiClient.put(API_ENDPOINTS.fable.expand, fable, {
+  return apiClient.put(API_ENDPOINTS.fable.expand, serializeFable(fable), {
     schema: FableValidationExpansionSchema,
   })
 }
@@ -103,9 +107,23 @@ export async function retrieveFable(
 export async function upsertFable(
   request: FableUpsertRequest,
 ): Promise<FableUpsertResponse> {
-  return apiClient.post(API_ENDPOINTS.fable.create, request, {
-    schema: FableUpsertResponseSchema,
-  })
+  return apiClient.post(
+    API_ENDPOINTS.fable.create,
+    {
+      ...request,
+      builder: serializeFable(request.builder),
+      tags: request.tags.map((k) => ({ key: k })),
+    },
+    { schema: FableUpsertResponseSchema },
+  )
+}
+
+/** Optional server-side filters for the blueprint list endpoint */
+export interface BlueprintListFilters {
+  /** Restrict to blueprints with this source (e.g. 'plugin_template', 'user_defined') */
+  source?: string
+  /** Restrict to blueprints owned by this user or plugin */
+  createdBy?: string
 }
 
 /**
@@ -114,9 +132,15 @@ export async function upsertFable(
 export async function listBlueprints(
   page: number = 1,
   pageSize: number = 10,
+  filters?: BlueprintListFilters,
 ): Promise<BlueprintListResponse> {
   return apiClient.get(API_ENDPOINTS.fable.list, {
-    params: { page, page_size: pageSize },
+    params: {
+      page,
+      page_size: pageSize,
+      ...(filters?.source && { source: filters.source }),
+      ...(filters?.createdBy && { created_by: filters.createdBy }),
+    },
     schema: BlueprintListResponseSchema,
   })
 }
@@ -127,9 +151,15 @@ export async function listBlueprints(
 export async function updateBlueprint(
   request: BlueprintUpdateRequest,
 ): Promise<FableUpsertResponse> {
-  return apiClient.post(API_ENDPOINTS.fable.update, request, {
-    schema: FableUpsertResponseSchema,
-  })
+  return apiClient.post(
+    API_ENDPOINTS.fable.update,
+    {
+      ...request,
+      builder: serializeFable(request.builder),
+      tags: request.tags?.map((k) => ({ key: k })),
+    },
+    { schema: FableUpsertResponseSchema },
+  )
 }
 
 /**
@@ -144,7 +174,7 @@ export async function deleteBlueprint(
 /**
  * List available intrinsic glyphs for ${glyph} interpolation in block configs
  */
-export async function getAvailableGlyphs(): Promise<Array<GlyphDetail>> {
+export async function getAvailableGlyphs(): Promise<Array<IntrinsicGlyphItem>> {
   const response: GlyphListResponse = await apiClient.get(
     API_ENDPOINTS.fable.glyphsList,
     {
@@ -152,7 +182,9 @@ export async function getAvailableGlyphs(): Promise<Array<GlyphDetail>> {
       schema: GlyphListResponseSchema,
     },
   )
-  return response.glyphs
+  return response.glyphs.filter(
+    (g): g is IntrinsicGlyphItem => g.glyph_type === 'intrinsic',
+  )
 }
 
 /**
@@ -189,13 +221,21 @@ export async function createGlobalGlyph(
 }
 
 /**
- * Get a global glyph by ID
+ * Delete a global glyph by ID
  */
-export async function getGlobalGlyph(
-  globalGlyphId: string,
-): Promise<GlobalGlyphResponse> {
-  return apiClient.get(API_ENDPOINTS.fable.glyphsGlobalGet, {
-    params: { global_glyph_id: globalGlyphId },
-    schema: GlobalGlyphResponseSchema,
+export async function deleteGlobalGlyph(globalGlyphId: string): Promise<void> {
+  return apiClient.post(API_ENDPOINTS.fable.glyphsGlobalDelete, {
+    global_glyph_id: globalGlyphId,
   })
+}
+
+/** Resolve option values to display strings; 404 on an invalid `typeName`. */
+export async function resolveDisplay(
+  elements: Array<ResolvableValue>,
+): Promise<ResolveDisplayResponse> {
+  return apiClient.post(
+    API_ENDPOINTS.fable.resolveDisplay,
+    { elements },
+    { schema: ResolveDisplayResponseSchema },
+  )
 }

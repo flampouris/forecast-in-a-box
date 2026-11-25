@@ -1,0 +1,1088 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * WMS GetCapabilities helpers for the geo viewer.
+ *
+ * Parses the WMS 1.3.0 capabilities XML produced by SkinnyWMS into a flat
+ * list of leaf layers and extracts the geographic bounding box for
+ * auto-fit. Two helpers handle URL rebasing
+ * (capabilities embed the lens server's bind address, which we redirect
+ * through our known base URL) and ISO 8601 time-interval expansion.
+ */
+
+// The singleton, not `@/lib/i18n` — no init side-effect in a plain module.
+import i18n from 'i18next'
+import { API_ENDPOINTS } from '@/api/endpoints'
+
+export interface ParsedStyle {
+  name: string
+  /** Human title (`<Title>`); falls back to the name in UIs. */
+  title?: string
+  abstract?: string
+  legendUrl?: string
+  /** Advertised LegendURL size, when given. */
+  legendSize?: { width: number; height: number }
+}
+
+export interface ParsedTime {
+  /** Raw `<Dimension name="time">` content as advertised. */
+  raw: string
+}
+
+/** A non-time dimension (e.g. `reference_time`, `elevation`). */
+export interface ParsedDimension {
+  name: string
+  /** Raw content: a list or `start/end/period`. */
+  raw: string
+  default?: string
+  units?: string
+}
+
+export interface ParsedLayer {
+  name: string
+  title: string
+  styles: Array<ParsedStyle>
+  time?: ParsedTime
+  /** Extra dimensions the layer takes (inherited), e.g. `reference_time`. */
+  dimensions?: Array<ParsedDimension>
+  /** Resolution range the server serves this in (scale limits); absent = every zoom. */
+  scale?: ScaleBand
+  /** WGS84 footprint [W, S, E, N], inherited (WMS 1.3.0 §7.2.4.6.6). */
+  bbox?: [number, number, number, number]
+}
+
+/** Resolution range (m/px) a layer serves within; unbounded sides are 0 / Infinity. */
+export interface ScaleBand {
+  minRes: number
+  maxRes: number
+}
+
+export interface ParsedCapabilities {
+  layers: Array<ParsedLayer>
+  /** SkinnyWMS decoration layers (background, coastlines, borders…), excluded
+   * from the parameter grid — see {@link skinnyWmsBasemap}. */
+  decorationLayers: Array<ParsedLayer>
+  /** [minLon, minLat, maxLon, maxLat] in WGS84 (EPSG:4326). */
+  bbox: [number, number, number, number]
+  /** Every CRS/SRS code advertised anywhere in the layer tree. */
+  crs: ReadonlyArray<string>
+  /** Largest GetMap image accepted (1.3.0 MaxWidth/MaxHeight; Infinity = unlimited side), null when unadvertised. */
+  maxImageSize: readonly [number, number] | null
+}
+
+/** Codes a server may advertise instead of the one we request. */
+const CRS_ALIASES: Record<string, ReadonlyArray<string>> = {
+  'EPSG:3857': ['EPSG:900913'],
+  // Magics advertises UPS South under a non-existent code (upstream typo).
+  'EPSG:32761': ['EPSG:32762'],
+}
+
+/** Can `code` be requested? An empty list means the two web defaults. */
+export function supportsCrs(
+  advertised: ReadonlyArray<string>,
+  code: string,
+): boolean {
+  if (advertised.length === 0) {
+    return code === 'EPSG:3857' || code === 'EPSG:4326'
+  }
+  return (
+    advertised.includes(code) ||
+    (CRS_ALIASES[code] ?? []).some((alias) => advertised.includes(alias))
+  )
+}
+
+/** True when `baseUrl` is our own lens proxy path (a same-origin, relative
+ *  path under `/lens/proxy/<id>`) rather than an external/curated WMS
+ *  endpoint (always an absolute URL — see `allowedWmsUrl`). Lens traffic is
+ *  never CORS territory and is worth a patient capabilities retry while
+ *  SkinnyWMS boots behind it. */
+export function isLensProxyUrl(baseUrl: string): boolean {
+  return baseUrl.startsWith(`${API_ENDPOINTS.lens.proxyBase}/`)
+}
+
+const DEFAULT_BBOX: [number, number, number, number] = [-180, -90, 180, 90]
+const XLINK_NS = 'http://www.w3.org/1999/xlink'
+
+/**
+ * SkinnyWMS exposes a handful of built-in decoration layers (Magics
+ * coastlines / political boundaries / ocean shading / etc.) alongside the
+ * actual data parameters. They aren't useful in a forecast inspection
+ * context — they just clutter the parameter grid — so we drop them at
+ * parse time. Match is case-insensitive on either the layer name or a
+ * normalised form of the title (whitespace → underscore).
+ */
+const DECORATION_LAYER_KEYS = new Set([
+  'background',
+  'foreground',
+  'boundaries',
+  'coastlines',
+  'continents',
+  'countries',
+  'graticule',
+  'land',
+  'lakes',
+  'oceans',
+  'rivers',
+  'us_states',
+  'us-states',
+])
+
+/** The decoration-layer key a layer matches (by name or normalised title),
+ * or null if it's a real data parameter. */
+function decorationKeyOf(layer: ParsedLayer): string | null {
+  const nameKey = layer.name.toLowerCase()
+  if (DECORATION_LAYER_KEYS.has(nameKey)) return nameKey
+  const titleKey = layer.title.toLowerCase().trim().replace(/\s+/g, '_')
+  return DECORATION_LAYER_KEYS.has(titleKey) ? titleKey : null
+}
+
+function isDecorationLayer(layer: ParsedLayer): boolean {
+  return decorationKeyOf(layer) !== null
+}
+
+/** Line-style decoration layers — safe to draw on top of data, unlike the
+ * `background` base or area fills (land/ocean), which would hide it. */
+const REFERENCE_LAYER_KEYS = new Set([
+  'foreground',
+  'boundaries',
+  'coastlines',
+  'countries',
+  'rivers',
+  'graticule',
+  'us_states',
+  'us-states',
+])
+
+/** SkinnyWMS decoration layers split for use as a native basemap. */
+export interface SkinnyWmsBasemap {
+  /** Opaque base map (ocean/land shading); null if not advertised. */
+  background: ParsedLayer | null
+  /** Coastlines/borders/grid — drawn on top of the data. */
+  reference: Array<ParsedLayer>
+}
+
+/** Split decoration layers into a native basemap: the opaque `background`
+ * plus line-style reference layers. Area fills are dropped (they'd hide data). */
+export function skinnyWmsBasemap(
+  decorationLayers: ReadonlyArray<ParsedLayer>,
+): SkinnyWmsBasemap {
+  let background: ParsedLayer | null = null
+  const reference: Array<ParsedLayer> = []
+  for (const layer of decorationLayers) {
+    const key = decorationKeyOf(layer)
+    if (key === 'background') background = layer
+    else if (key !== null && REFERENCE_LAYER_KEYS.has(key)) {
+      reference.push(layer)
+    }
+  }
+  return { background, reference }
+}
+
+// No total deadline: slow multi-MB catalogs are legit — response+stall guards.
+export const CAPABILITIES_RESPONSE_TIMEOUT_MS = 60_000
+export const CAPABILITIES_STALL_TIMEOUT_MS = 30_000
+
+export type CapabilitiesErrorKind = 'timeout' | 'interrupted' | 'http' | 'parse'
+
+/** Typed capability-fetch failure; `kind` drives retry and message mapping. */
+export class CapabilitiesError extends Error {
+  constructor(
+    readonly kind: CapabilitiesErrorKind,
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message)
+    this.name = 'CapabilitiesError'
+  }
+}
+
+export interface CapabilitiesLimits {
+  responseMs?: number
+  stallMs?: number
+}
+
+/** Fetch + parse GetCapabilities with stall-aware timeouts. */
+export async function fetchCapabilities(
+  baseUrl: string,
+  signal?: AbortSignal,
+  limits: CapabilitiesLimits = {},
+): Promise<ParsedCapabilities> {
+  const responseMs = limits.responseMs ?? CAPABILITIES_RESPONSE_TIMEOUT_MS
+  const stallMs = limits.stallMs ?? CAPABILITIES_STALL_TIMEOUT_MS
+  const controller = new AbortController()
+  signal?.addEventListener('abort', () => controller.abort(signal.reason), {
+    once: true,
+  })
+  let timedOut: string | null = null
+  let timer = 0
+  const arm = (message: string, ms: number) => {
+    window.clearTimeout(timer)
+    timer = window.setTimeout(() => {
+      timedOut = message
+      controller.abort()
+    }, ms)
+  }
+  // Deadline abort ≠ caller cancellation (query unmount aborts too).
+  const asTimeout = (err: unknown): unknown =>
+    timedOut !== null && !signal?.aborted
+      ? new CapabilitiesError('timeout', timedOut)
+      : err
+  // Detached bodies don't observe the fetch signal — race reads so aborts win.
+  const aborted = new Promise<never>((_, reject) => {
+    const fail = () =>
+      reject(controller.signal.reason ?? new DOMException('', 'AbortError'))
+    if (controller.signal.aborted) fail()
+    else controller.signal.addEventListener('abort', fail, { once: true })
+  })
+  aborted.catch(() => {}) // not always awaited — silence unhandled rejection
+
+  let xml = ''
+  try {
+    arm(`GetCapabilities: no response after ${responseMs / 1000}s`, responseMs)
+    let res: Response
+    try {
+      res = await fetch(
+        appendWmsParams(
+          toWmsEndpoint(baseUrl),
+          'service=WMS&version=1.3.0&request=GetCapabilities',
+        ),
+        { signal: controller.signal },
+      )
+    } catch (err) {
+      throw asTimeout(err)
+    }
+    if (!res.ok) {
+      throw new CapabilitiesError(
+        'http',
+        `GetCapabilities ${res.status}`,
+        res.status,
+      )
+    }
+    const reader = res.body?.getReader()
+    if (!reader) {
+      xml = await res.text()
+    } else {
+      const stallMessage = `GetCapabilities: download stalled for ${stallMs / 1000}s`
+      const decoder = new TextDecoder()
+      arm(stallMessage, stallMs)
+      try {
+        for (;;) {
+          const { done, value } = await Promise.race([reader.read(), aborted])
+          if (done) break
+          arm(stallMessage, stallMs)
+          xml += decoder.decode(value, { stream: true })
+        }
+      } catch (err) {
+        void reader.cancel().catch(() => {})
+        const mapped = asTimeout(err)
+        if (mapped !== err || signal?.aborted) throw mapped
+        // The response began, then the transport died under us.
+        throw new CapabilitiesError(
+          'interrupted',
+          'GetCapabilities connection interrupted mid-download',
+        )
+      }
+      xml += decoder.decode()
+    }
+  } finally {
+    window.clearTimeout(timer)
+  }
+  try {
+    return parseCapabilities(xml)
+  } catch (err) {
+    if (err instanceof CapabilitiesError) throw err
+    throw new CapabilitiesError('parse', 'GetCapabilities XML parse failed')
+  }
+}
+
+/**
+ * Parse a WMS 1.3.0 capabilities XML document. Recursively descends
+ * nested `<Layer>` elements and emits only leaves (those with a `<Name>`).
+ * The root layer's `EX_GeographicBoundingBox` provides the global bbox;
+ * if absent, falls back to the world.
+ */
+export function parseCapabilities(xml: string): ParsedCapabilities {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml')
+  if (doc.querySelector('parsererror')) {
+    throw new Error('GetCapabilities XML parse failed')
+  }
+  // Servers report failures as an exception document, often with HTTP 200.
+  const failure = exceptionReportText(doc)
+  if (failure !== null) {
+    throw new CapabilitiesError(
+      'parse',
+      `GetCapabilities exception: ${failure}`,
+    )
+  }
+
+  const root = doc.querySelector('Capability > Layer')
+  const bbox = parseBbox(root) ?? DEFAULT_BBOX
+
+  const collected: Array<ParsedLayer> = []
+  const crs = new Set<string>()
+  if (root) collectLayers(root, { styles: [] }, collected, crs)
+  const layers: Array<ParsedLayer> = []
+  const decorationLayers: Array<ParsedLayer> = []
+  for (const layer of collected) {
+    ;(isDecorationLayer(layer) ? decorationLayers : layers).push(layer)
+  }
+
+  return {
+    layers,
+    decorationLayers,
+    bbox,
+    crs: [...crs],
+    maxImageSize: parseMaxImageSize(doc),
+  }
+}
+
+/** Message of an OGC exception report (WMS or OWS), else null. */
+function exceptionReportText(doc: Document): string | null {
+  const root = doc.documentElement
+  if (
+    root.localName !== 'ServiceExceptionReport' &&
+    root.localName !== 'ExceptionReport'
+  ) {
+    return null
+  }
+  return root.textContent.replace(/\s+/g, ' ').trim() || root.localName
+}
+
+function parseMaxImageSize(doc: Document): readonly [number, number] | null {
+  const side = (tag: string) => {
+    const n = Number(doc.querySelector(`Service > ${tag}`)?.textContent)
+    return Number.isFinite(n) && n > 0 ? n : Infinity
+  }
+  const size = [side('MaxWidth'), side('MaxHeight')] as const
+  return size.every((n) => n === Infinity) ? null : size
+}
+
+/** Properties child layers inherit from ancestors (WMS 1.3.0 §7.2.4.8). */
+interface LayerInheritance {
+  time?: ParsedTime
+  dimensions?: Array<ParsedDimension>
+  styles: ReadonlyArray<ParsedStyle>
+  scale?: ScaleBand
+  bbox?: [number, number, number, number]
+}
+
+/** Every NAMED layer is requestable — including composite parents; real
+ *  catalogs declare TIME/Style once on a group and inherit downward. */
+function collectLayers(
+  el: Element,
+  inherited: LayerInheritance,
+  out: Array<ParsedLayer>,
+  crs: Set<string>,
+): void {
+  // 1.3.0 <CRS> one per element; 1.1.1 <SRS> may be space-separated.
+  for (const tag of ['CRS', 'SRS']) {
+    for (const node of directChildren(el, tag)) {
+      for (const code of node.textContent.trim().split(/\s+/)) {
+        if (code) crs.add(code)
+      }
+    }
+  }
+  const ownStyles = parseStyles(el)
+  const merged: LayerInheritance = {
+    // A redeclared dimension replaces the ancestor's; styles are additive.
+    time: parseTime(el) ?? inherited.time,
+    dimensions: parseDimensions(el) ?? inherited.dimensions,
+    styles: [
+      ...ownStyles,
+      ...inherited.styles.filter(
+        (s) => !ownStyles.some((o) => o.name === s.name),
+      ),
+    ],
+    scale: parseScaleBand(el) ?? inherited.scale,
+    bbox: parseBbox(el) ?? inherited.bbox,
+  }
+
+  const name = textOf(el, 'Name')
+  if (name) {
+    out.push({
+      name,
+      title: textOf(el, 'Title') ?? name,
+      styles: [...merged.styles],
+      time: merged.time,
+      dimensions: merged.dimensions,
+      scale: merged.scale,
+      bbox: merged.bbox,
+    })
+  }
+  for (const child of directChildren(el, 'Layer')) {
+    collectLayers(child, merged, out, crs)
+  }
+}
+
+function parseStyles(el: Element): Array<ParsedStyle> {
+  const styles: Array<ParsedStyle> = []
+  for (const st of directChildren(el, 'Style')) {
+    const styleName = textOf(st, 'Name')
+    if (!styleName) continue
+    const legend = st.querySelector('LegendURL')
+    const online = legend?.querySelector('OnlineResource')
+    const legendUrl =
+      online?.getAttribute('xlink:href') ??
+      online?.getAttributeNS(XLINK_NS, 'href') ??
+      undefined
+    const width = Number(legend?.getAttribute('width'))
+    const height = Number(legend?.getAttribute('height'))
+    styles.push({
+      name: styleName,
+      title: textOf(st, 'Title') ?? undefined,
+      abstract: textOf(st, 'Abstract')?.replace(/\s+/g, ' ') ?? undefined,
+      legendUrl: legendUrl || undefined,
+      legendSize: width > 0 && height > 0 ? { width, height } : undefined,
+    })
+  }
+  return styles
+}
+
+/** Time values: 1.3.0 Dimension text, else 1.1.1's separate Extent.
+ *  Dimension names are case-insensitive per spec (`TIME` is legal). */
+function parseTime(el: Element): ParsedTime | undefined {
+  const timeChild = (tag: string) =>
+    directChildren(el, tag).find(
+      (d) => d.getAttribute('name')?.toLowerCase() === 'time',
+    )
+  const raw =
+    timeChild('Dimension')?.textContent.trim() ||
+    timeChild('Extent')?.textContent.trim()
+  return raw ? { raw } : undefined
+}
+
+/** Non-time `<Dimension>`s declared on this element, if any. */
+function parseDimensions(el: Element): Array<ParsedDimension> | undefined {
+  const dims = directChildren(el, 'Dimension').flatMap((d) => {
+    const name = d.getAttribute('name')?.toLowerCase()
+    const raw = d.textContent.trim()
+    if (!name || name === 'time' || !raw) return []
+    return [
+      {
+        name,
+        raw,
+        default: d.getAttribute('default') ?? undefined,
+        units: d.getAttribute('units') ?? undefined,
+      },
+    ]
+  })
+  return dims.length > 0 ? dims : undefined
+}
+
+/** OGC rendering pixel size (0.28 mm): scaleDenominator = resolution / 0.00028. */
+const OGC_PIXEL_M = 0.00028
+
+/** Scale limits → resolution band: WMS 1.3.0 denominators, else 1.1.1 ScaleHint (÷√2); undefined if unconstrained. */
+function parseScaleBand(el: Element): ScaleBand | undefined {
+  let minRes = 0
+  let maxRes = Infinity
+  const minDenom = numOf(el, 'MinScaleDenominator')
+  const maxDenom = numOf(el, 'MaxScaleDenominator')
+  if (!Number.isNaN(minDenom) || !Number.isNaN(maxDenom)) {
+    if (!Number.isNaN(minDenom)) minRes = minDenom * OGC_PIXEL_M
+    if (!Number.isNaN(maxDenom)) maxRes = maxDenom * OGC_PIXEL_M
+  } else {
+    const hints = directChildren(el, 'ScaleHint')
+    if (hints.length > 0) {
+      const min = hints[0].getAttribute('min')
+      const max = hints[0].getAttribute('max')
+      if (min && Number.isFinite(Number(min)) && Number(min) > 0) {
+        minRes = Number(min) / Math.SQRT2
+      }
+      if (max && Number.isFinite(Number(max))) maxRes = Number(max) / Math.SQRT2
+    }
+  }
+  if (minRes >= maxRes) return undefined // degenerate/inverted
+  return minRes > 0 || Number.isFinite(maxRes) ? { minRes, maxRes } : undefined
+}
+
+/** Intersection of two bands — a pair shows only where both do. */
+export function combineScaleBands(
+  a: ScaleBand | undefined,
+  b: ScaleBand | undefined,
+): ScaleBand | undefined {
+  if (!a) return b
+  if (!b) return a
+  return {
+    minRes: Math.max(a.minRes, b.minRes),
+    maxRes: Math.min(a.maxRes, b.maxRes),
+  }
+}
+
+export type ScaleState = 'in-range' | 'zoom-in' | 'zoom-out'
+
+/** Where a resolution sits vs a band: zoom-in = too coarse, zoom-out = too fine. */
+export function scaleBandState(
+  band: ScaleBand,
+  resolution: number,
+): ScaleState {
+  if (resolution >= band.maxRes) return 'zoom-in'
+  if (resolution < band.minRes) return 'zoom-out'
+  return 'in-range'
+}
+
+/** A resolution comfortably inside the band to animate the view to. */
+export function scaleBandTargetResolution(band: ScaleBand): number {
+  const { minRes, maxRes } = band
+  if (minRes > 0 && Number.isFinite(maxRes)) return Math.sqrt(minRes * maxRes)
+  return Number.isFinite(maxRes) ? maxRes / 2 : minRes * 2
+}
+
+/** Own WGS84 box: the 1.3.0 element, else 1.1.1 LatLonBoundingBox attrs. */
+function parseBbox(
+  el: Element | null,
+): [number, number, number, number] | null {
+  if (!el) return null
+  const ex = directChildren(el, 'EX_GeographicBoundingBox').at(0)
+  if (ex) {
+    const box = [
+      numOf(ex, 'westBoundLongitude'),
+      numOf(ex, 'southBoundLatitude'),
+      numOf(ex, 'eastBoundLongitude'),
+      numOf(ex, 'northBoundLatitude'),
+    ]
+    return box.every(Number.isFinite)
+      ? (box as [number, number, number, number])
+      : null
+  }
+  // GeoServer (DWD) gives per-layer coverage only as BoundingBox.
+  const ll = directChildren(el, 'LatLonBoundingBox').at(0)
+  const geo =
+    ll ??
+    directChildren(el, 'BoundingBox').find((b) =>
+      ['CRS:84', 'EPSG:4326'].includes(
+        b.getAttribute('CRS') ?? b.getAttribute('SRS') ?? '',
+      ),
+    )
+  if (!geo) return null
+  const box = ['minx', 'miny', 'maxx', 'maxy'].map((a) =>
+    Number(geo.getAttribute(a)),
+  )
+  if (!box.every(Number.isFinite)) return null
+  // 1.3.0 EPSG:4326 is latitude-first; |x| > 91 betrays lon-first (1 deg for half-cell overhangs).
+  const latFirst =
+    geo.getAttribute('CRS') === 'EPSG:4326' &&
+    Math.abs(box[0]) <= 91 &&
+    Math.abs(box[2]) <= 91
+  return latFirst
+    ? [box[1], box[0], box[3], box[2]]
+    : (box as [number, number, number, number])
+}
+
+function directChildren(el: Element, tagName: string): Array<Element> {
+  return Array.from(el.children).filter((c) => c.tagName === tagName)
+}
+
+function textOf(el: Element, tag: string): string | null {
+  const child = Array.from(el.children).find((c) => c.tagName === tag)
+  if (!child) return null
+  return child.textContent.trim() || null
+}
+
+function numOf(el: Element, tag: string): number {
+  const t = textOf(el, tag)
+  return t === null ? Number.NaN : Number(t)
+}
+
+/** ISO zone designator: Z, ±hh, ±hhmm, ±hh:mm. */
+const EXPLICIT_ZONE_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/i
+
+/** Date.parse reading zone-less date-times as UTC (WMS Annex D) — the
+ *  viewer host's timezone must never shift a server's instants. */
+export function parseWmsTimestamp(value: string): number {
+  const v = value.trim()
+  const zoneless = v.includes('T') && !EXPLICIT_ZONE_RE.test(v)
+  return Date.parse(zoneless ? `${v}Z` : v)
+}
+
+/**
+ * Expand a WMS time `Dimension` raw value into discrete ISO timestamps.
+ * The WMS spec allows mixing literal values and ISO 8601 interval
+ * expressions in a single Dimension element, separated by commas — for
+ * example a literal initial time followed by a "<start>/<end>/<period>"
+ * range covering the rest of the forecast. So we split on commas first,
+ * then expand each segment independently.
+ *
+ * Malformed or unsupported segments fall back to the raw segment as a
+ * single step rather than throwing.
+ */
+export function expandTimeSteps(raw: string): Array<string> {
+  const trimmed = raw.trim()
+  if (!trimmed) return []
+  return trimmed.split(',').flatMap((s) => expandSingleTimeSegment(s.trim()))
+}
+
+function expandSingleTimeSegment(seg: string): Array<string> {
+  if (!seg) return []
+  if (!seg.includes('/')) return [seg]
+  const parts = seg.split('/')
+  if (parts.length !== 3) return [seg]
+  const [startStr, endStr, periodStr] = parts
+  const start = parseWmsTimestamp(startStr)
+  const end = parseWmsTimestamp(endStr)
+  if (Number.isNaN(start) || Number.isNaN(end)) return [seg]
+
+  // Whole-month/year periods (satellite archives: P1M across decades)
+  // must step the calendar — a fixed 30.4375-day approximation drifts off
+  // the server's advertised instants within a few steps, and servers with
+  // nearestValue=0 reject the drifted TIME outright.
+  const calendarMonths = parseWholeMonthPeriod(periodStr)
+  const out: Array<string> = []
+  if (calendarMonths !== null) {
+    const d = new Date(start)
+    while (d.getTime() <= end) {
+      out.push(d.toISOString())
+      d.setUTCMonth(d.getUTCMonth() + calendarMonths)
+      if (out.length > 10000) break
+    }
+    return out
+  }
+
+  const periodMs = parseIsoPeriodMs(periodStr)
+  if (periodMs === null || periodMs <= 0) return [seg]
+  for (let t = start; t <= end; t += periodMs) {
+    out.push(new Date(t).toISOString())
+    // Safety cap — a malformed forecast period shouldn't OOM the tab.
+    if (out.length > 10000) break
+  }
+  return out
+}
+
+/** P1M/P3M/P1Y… → total months; null when days/times are involved. */
+function parseWholeMonthPeriod(input: string): number | null {
+  const m = /^P(?:(\d+)Y)?(?:(\d+)M)?$/.exec(input)
+  if (!m || (!m[1] && !m[2])) return null
+  return (m[1] ? Number(m[1]) : 0) * 12 + (m[2] ? Number(m[2]) : 0)
+}
+
+const PERIOD_RE =
+  /^P(?:(\d+(?:\.\d+)?)Y)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/
+
+function parseIsoPeriodMs(input: string): number | null {
+  const m = PERIOD_RE.exec(input)
+  if (!m) return null
+  const [, y, mo, d, h, mi, s] = m
+  if (!y && !mo && !d && !h && !mi && !s) return null
+  // Calendar units approximated as fixed durations — adequate for stepping
+  // through a forecast that spans at most weeks or a few months.
+  let ms = 0
+  if (y) ms += parseFloat(y) * 365.25 * 24 * 3600 * 1000
+  if (mo) ms += parseFloat(mo) * 30.4375 * 24 * 3600 * 1000
+  if (d) ms += parseFloat(d) * 24 * 3600 * 1000
+  if (h) ms += parseFloat(h) * 3600 * 1000
+  if (mi) ms += parseFloat(mi) * 60 * 1000
+  if (s) ms += parseFloat(s) * 1000
+  return ms
+}
+
+/**
+ * Layer entry within a group. `level` is non-null for pressure-level
+ * layers detected via title or name suffix; null otherwise.
+ */
+export interface LayerLevelEntry {
+  level: number | null
+  layer: ParsedLayer
+}
+
+/**
+ * A logical parameter that may have one or more pressure-level variants.
+ * Single-instance entries are still surfaced as a one-element group so the
+ * UI can render them uniformly.
+ */
+export interface LayerGroup {
+  /** Stable key for React + filtering. */
+  key: string
+  /** Human-readable parameter title (level suffix stripped). */
+  title: string
+  /** Raw short code (e.g. `q@pl`) when the title was humanised via lookup;
+   * null when the title is already the canonical human form. */
+  subtitle: string | null
+  /** Detected level unit ("hPa") when grouped; null for single-instance groups. */
+  levelUnit: string | null
+  /** Layers in the group; sorted descending by level (1000 hPa first). */
+  entries: Array<LayerLevelEntry>
+}
+
+const TITLE_LEVEL_RE =
+  /^(.+?)\s+(?:at\s+)?([0-9]+(?:\.[0-9]+)?)\s*(hPa|mb|millibars?)\s*$/i
+// Require the `@pl` scope, else external `name_<n>` suffixes read as hPa levels.
+const NAME_LEVEL_RE = /^(.+?@pl)_(\d+)$/
+
+/**
+ * ECMWF / IFS / AIFS short-name → human-readable lookup. SkinnyWMS often
+ * exposes these short codes verbatim as layer names (e.g. `q@pl_500`,
+ * `2t`, `msl`), which are unfriendly in a parameter picker. Lookups are
+ * tried with the `@<scope>` suffix stripped, then on the raw input, then
+ * fall through to the input unchanged.
+ *
+ * Keep this list focused on what AIFS / IFS forecasts commonly emit; we
+ * don't aim for full GRIB code coverage. Display names live in
+ * `visualise.json` `wmsParams.*` — tsc checks every code has an entry.
+ */
+const PARAM_CODES = [
+  // Pressure-level (3D)
+  't',
+  'q',
+  'u',
+  'v',
+  'u/v',
+  'w',
+  'z',
+  'gh',
+  'd',
+  'vo',
+  'r',
+  // Surface (2D)
+  '2t',
+  '2d',
+  '10u',
+  '10v',
+  '10u/10v',
+  '100u',
+  '100v',
+  '100u/100v',
+  'skt',
+  'sp',
+  'msl',
+  'tp',
+  'tcw',
+  'tcwv',
+  'sst',
+  'sd',
+  'ci',
+] as const
+type ParamCode = (typeof PARAM_CODES)[number]
+const PARAM_CODE_SET: ReadonlySet<string> = new Set(PARAM_CODES)
+
+function paramName(code: string): string | null {
+  return PARAM_CODE_SET.has(code)
+    ? i18n.t(`visualise:wmsParams.${code as ParamCode}`)
+    : null
+}
+
+interface HumanizedParam {
+  title: string
+  subtitle: string | null
+}
+
+function humanizeParam(short: string): HumanizedParam {
+  // Strip a single `@<scope>` suffix (e.g. `@pl`, `@sfc`, `@ml`) before lookup.
+  const cleaned = short.toLowerCase().replace(/@\w+$/, '').trim()
+  const human = paramName(cleaned) ?? paramName(short.toLowerCase())
+  return human
+    ? { title: human, subtitle: short }
+    : { title: short, subtitle: null }
+}
+
+interface LevelHit {
+  base: string
+  level: number
+  unit: string | null
+  source: 'title' | 'name'
+}
+
+function detectLevel(layer: ParsedLayer): LevelHit | null {
+  const tm = TITLE_LEVEL_RE.exec(layer.title)
+  if (tm) {
+    return {
+      base: tm[1].trim(),
+      level: Number(tm[2]),
+      unit: 'hPa',
+      source: 'title',
+    }
+  }
+  const nm = NAME_LEVEL_RE.exec(layer.name)
+  if (nm) {
+    return { base: nm[1], level: Number(nm[2]), unit: null, source: 'name' }
+  }
+  return null
+}
+
+/**
+ * Group layers by detected parameter (e.g. "Specific humidity at 500 hPa",
+ * "… at 700 hPa", "… at 850 hPa" all collapse to one group with three
+ * entries). Layers with no detectable level become single-entry groups so
+ * the caller can render them uniformly.
+ *
+ * Group title uses the title-derived base when available (cleaner than
+ * the name-derived `q`-style short codes). Entries within a group are
+ * sorted descending by level, putting tropospheric / surface levels first
+ * — the meteorologically conventional reading order.
+ */
+export function groupLayers(
+  layers: ReadonlyArray<ParsedLayer>,
+): Array<LayerGroup> {
+  const groups = new Map<string, LayerGroup>()
+  for (const layer of layers) {
+    const hit = detectLevel(layer)
+    if (hit) {
+      const key = `param:${hit.base.toLowerCase()}`
+      let g = groups.get(key)
+      if (!g) {
+        // Title-derived bases are already human-readable; only short-code
+        // bases (from name regex) need lookup.
+        const humanized =
+          hit.source === 'name'
+            ? humanizeParam(hit.base)
+            : { title: hit.base, subtitle: null }
+        g = {
+          key,
+          title: humanized.title,
+          subtitle: humanized.subtitle,
+          levelUnit: hit.unit,
+          entries: [],
+        }
+        groups.set(key, g)
+      }
+      g.entries.push({ level: hit.level, layer })
+      if (g.levelUnit === null && hit.unit) g.levelUnit = hit.unit
+    } else {
+      const key = `single:${layer.name}`
+      groups.set(key, {
+        key,
+        title: layer.title,
+        subtitle: null, // single-instance rows already render the layer name as their own subtitle
+        levelUnit: null,
+        entries: [{ level: null, layer }],
+      })
+    }
+  }
+  for (const g of groups.values()) {
+    g.entries.sort((a, b) => {
+      if (a.level === null && b.level === null) return 0
+      if (a.level === null) return 1
+      if (b.level === null) return -1
+      return b.level - a.level
+    })
+  }
+  return Array.from(groups.values())
+}
+
+/**
+ * Split groups into single-level (surface / single-instance) and multi-level
+ * (pressure-level) buckets, each sorted alphabetically by title. The two
+ * lists are mutually exclusive and cover all input groups.
+ */
+export interface PartitionedGroups {
+  singles: Array<LayerGroup>
+  multiLevel: Array<LayerGroup>
+}
+
+export function partitionGroups(
+  groups: ReadonlyArray<LayerGroup>,
+): PartitionedGroups {
+  const singles: Array<LayerGroup> = []
+  const multiLevel: Array<LayerGroup> = []
+  for (const g of groups) {
+    const isMulti =
+      g.entries.length > 1 && g.entries.some((e) => e.level !== null)
+    ;(isMulti ? multiLevel : singles).push(g)
+  }
+  const byTitle = (a: LayerGroup, b: LayerGroup): number =>
+    a.title.localeCompare(b.title, undefined, { sensitivity: 'base' })
+  singles.sort(byTitle)
+  multiLevel.sort(byTitle)
+  return { singles, multiLevel }
+}
+
+/**
+ * Collect the union of pressure levels across all groups, sorted descending.
+ */
+export function uniquePressureLevels(
+  groups: ReadonlyArray<LayerGroup>,
+): Array<number> {
+  const set = new Set<number>()
+  for (const g of groups) {
+    for (const e of g.entries) {
+      if (e.level !== null) set.add(e.level)
+    }
+  }
+  return Array.from(set).sort((a, b) => b - a)
+}
+
+/**
+ * Rewrite a URL advertised by the lens so it is fetched via `baseUrl`, the
+ * browser-reachable lens proxy path. The advertised form may be an internal
+ * bind address (`http://0.0.0.0:54321/wms?...`), a relative reference, or
+ * already proxied (X-Forwarded-Prefix); each resolves onto the proxy path.
+ * External bases are used verbatim, as is anything that fails to parse.
+ */
+export function rebaseLensUrl(url: string, baseUrl: string): string {
+  try {
+    if (isLensProxyUrl(baseUrl)) {
+      const lensBase = baseUrl.replace(/\/+$/, '')
+      // Relative refs resolve against the document that carried them — the
+      // WMS endpoint — so a query-only href keeps `/wms`. The fake host is
+      // never contacted; it only lets `new URL` parse a host-less ref.
+      const docBase = `http://lens.invalid${toWmsEndpoint(lensBase)}`
+      const upstream = new URL(url, docBase)
+      const path = upstream.pathname.startsWith(`${lensBase}/`)
+        ? upstream.pathname
+        : `${lensBase}${upstream.pathname}`
+      return `${path}${upstream.search}`
+    }
+    const upstream = new URL(url)
+    // External endpoints carry a path and/or query in the base (e.g.
+    // `…/wms/?token=…`) and advertise public URLs — grafting the base onto
+    // those doubles the path/query, so use them verbatim.
+    const base = new URL(baseUrl)
+    if (base.pathname !== '/' || base.search !== '') return url
+    return `${baseUrl.replace(/\/$/, '')}${upstream.pathname}${upstream.search}`
+  } catch {
+    return url
+  }
+}
+
+/**
+ * Resolve a source's WMS request endpoint. The lens proxy base is a
+ * same-origin path whose service lives at `<proxyBase>/wms`; external
+ * servers arrive as full endpoints that may carry a path and/or query
+ * (e.g. `https://eccharts.ecmwf.int/wms/?token=…`) and must be used
+ * verbatim — appending `/wms` to those produces garbage URLs.
+ */
+export function toWmsEndpoint(baseUrl: string): string {
+  if (isLensProxyUrl(baseUrl)) {
+    return `${baseUrl.replace(/\/+$/, '')}/wms`
+  }
+  try {
+    const url = new URL(baseUrl)
+    if (url.pathname !== '/' || url.search !== '') return baseUrl
+    return `${baseUrl.replace(/\/+$/, '')}/wms`
+  } catch {
+    return baseUrl
+  }
+}
+
+/** Append WMS query params with the correct `?`/`&` separator. */
+export function appendWmsParams(endpoint: string, query: string): string {
+  return endpoint.includes('?')
+    ? `${endpoint}&${query}`
+    : `${endpoint}?${query}`
+}
+
+/** Requested style if advertised, else the first (= empty STYLES). */
+export function resolveStyle(
+  layer: ParsedLayer,
+  requested?: string | null,
+): ParsedStyle | undefined {
+  if (requested) {
+    const hit = layer.styles.find((s) => s.name === requested)
+    if (hit) return hit
+  }
+  return layer.styles[0]
+}
+
+/** Legend URL resized to a strip when the advertised URL carried a size. */
+export function legendStripUrl(
+  style: ParsedStyle,
+  width: number,
+): string | undefined {
+  if (!style.legendUrl) return undefined
+  if (!style.legendSize) return style.legendUrl
+  try {
+    const url = new URL(style.legendUrl, 'http://lens.invalid')
+    const wKey = [...url.searchParams.keys()].find(
+      (k) => k.toLowerCase() === 'width',
+    )
+    const hKey = [...url.searchParams.keys()].find(
+      (k) => k.toLowerCase() === 'height',
+    )
+    if (!wKey || !hKey) return style.legendUrl
+    const height = Math.max(
+      1,
+      Math.round((width * style.legendSize.height) / style.legendSize.width),
+    )
+    url.searchParams.set(wKey, String(width))
+    url.searchParams.set(hKey, String(height))
+    // Keep the advertised form (relative vs absolute).
+    return style.legendUrl.startsWith('http')
+      ? url.toString()
+      : `${url.pathname}${url.search}`
+  } catch {
+    return style.legendUrl
+  }
+}
+
+/** Per-layer request choices: style + extra dims (→ `DIM_<NAME>`). */
+export interface LayerRequestSettings {
+  style?: string
+  dims?: Readonly<Record<string, string>>
+}
+
+/** GetMap params for one layer — map, prefetch and preview share this. */
+export function layerRequestParams(
+  layer: ParsedLayer,
+  settings: LayerRequestSettings | undefined,
+  time: string | null,
+): Record<string, string> {
+  const params: Record<string, string> = {
+    LAYERS: layer.name,
+    // Some public servers advertise no <Style> → empty = server default.
+    STYLES: resolveStyle(layer, settings?.style)?.name ?? '',
+    FORMAT: 'image/png',
+    TRANSPARENT: 'TRUE',
+  }
+  if (time) params.TIME = time
+  for (const [name, value] of Object.entries(settings?.dims ?? {})) {
+    params[`DIM_${name.toUpperCase()}`] = value
+  }
+  return params
+}
+
+export type Bbox = [number, number, number, number]
+
+/** Whole-globe bbox: nothing to clip. */
+/** Global, allowing half-cell overhangs or insets (DWD ICON: -180.125..179.875, +/-90.125). */
+export const isWorldBbox = (bbox: Bbox): boolean =>
+  bbox[2] - bbox[0] >= 359 && bbox[1] <= -89 && bbox[3] >= 89
+
+/** Union of two bboxes; either may be absent. */
+export function unionBbox(a: Bbox | null, b: Bbox | null): Bbox | null {
+  if (!a || !b) return a ?? b
+  return [
+    Math.min(a[0], b[0]),
+    Math.min(a[1], b[1]),
+    Math.max(a[2], b[2]),
+    Math.max(a[3], b[3]),
+  ]
+}
+
+/** Union bbox of the active layers; null when any lacks one. */
+export function activeLayersBbox(
+  layers: ReadonlyArray<ParsedLayer>,
+  activeOrder: ReadonlyArray<string>,
+): Bbox | null {
+  let out: Bbox | null = null
+  for (const name of activeOrder) {
+    const bbox = layers.find((l) => l.name === name)?.bbox
+    if (!bbox) return null
+    out = unionBbox(out, bbox)
+  }
+  return out
+}
+
+/** Name of the model-run dimension (WMS convention, KNMI/DWD/ADAGUC). */
+export const RUN_DIMENSION = 'reference_time'
+
+/** Values a layer's extra dimension takes, in advertised order. */
+export function dimensionValues(
+  layer: ParsedLayer,
+  name: string,
+): Array<string> {
+  const dim = layer.dimensions?.find((d) => d.name === name)
+  if (!dim) return []
+  return dim.units === 'ISO8601'
+    ? expandTimeSteps(dim.raw)
+    : dim.raw
+        .split(',')
+        .map((v) => v.trim())
+        .filter(Boolean)
+}

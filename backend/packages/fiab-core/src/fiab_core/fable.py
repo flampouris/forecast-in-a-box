@@ -12,29 +12,45 @@ Types pertaining to Forecast As BLock Expression (Fable): blocks
 """
 
 import abc
-from typing import Any, Literal, NewType
+from enum import Enum
+from typing import Annotated, Any, Literal, NewType
 
 from earthkit.workflows.fluent import Action
-from pydantic import ConfigDict, Field
+from pydantic import BeforeValidator, ConfigDict, Field, PlainSerializer, WithJsonSchema, model_validator
 from qubed import Qube
 from typing_extensions import Self
 
 from fiab_core.pydantic_utils import FiabCoreBaseModel
+from fiab_core.types import FableType, parse
+
+Error = str
+"""Compiler/validator error message type alias."""
+
+
+FableTypeField = Annotated[
+    FableType,
+    BeforeValidator(parse),
+    PlainSerializer(lambda value: value.serialize(), return_type=str),
+    WithJsonSchema({"type": "string"}),
+]
 
 
 class BlockConfigurationOption(FiabCoreBaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     title: str
     """Brief string to display in the BlockFactory detail"""
     description: str
     """Extended description, possibly with example values and their effect"""
-    value_type: str
-    """Will be used when deserializing the actual value"""
-    # TODO do we want Literal instead of str for values? Probably `str` since this will need to be parsed anyway
-    # TODO do we prefer nesting or flattening for complex config? Ideally we support both, its just about the type system
+    value_type: FableTypeField
+    """Type used when deserializing the actual value; serialized as an expression for clients"""
     default_value: str | None = None
     """Used by the frontend to inject the default value"""
     is_advanced: bool = False
     """Used by the frontend to optionally hide the setting unless advanced. Do not set if no default provided / None not valid"""
+
+
+ConfigurationOptionId = NewType("ConfigurationOptionId", str)
 
 
 BlockKind = Literal["source", "transform", "product", "sink"]
@@ -50,7 +66,7 @@ class BlockFactory(FiabCoreBaseModel):
     """How to display in the catalogue listing / partial fable"""
     description: str
     """Extended detail for the user"""
-    configuration_options: dict[str, BlockConfigurationOption]
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption]
     """A key-value of config-option-key, config-option"""
     inputs: list[str]
     """A list of input names, such as 'initial conditions' or 'forecast', for the purpose of description/configuration"""
@@ -75,32 +91,41 @@ class PluginCompositeId(FiabCoreBaseModel):
         return cls(store=PluginStoreId(store), local=PluginId(local))
 
     @staticmethod
-    def to_str(k: Self) -> str:
+    def to_str(k: "PluginCompositeId") -> str:
         return f"{k.store}:{k.local}"
-
-
-class PluginBlockFactoryId(FiabCoreBaseModel):
-    """Note to plugin authors: This is a routing class. When you implement your BlockFactories for the catalogue,
-    you dont use this, you only need to declare a BlockFactoryId unique inside your plugin. Similarly, when you
-    return which BlockFactories are possible in the expand method, you only return your BlockFactoryIds. This
-    appears only when you receive BlockInstances in the compile/validate -- and again, you just need to use the
-    BlockFactoryId part of this class, as the PluginCompositeId is guaranteed to correspond to your plugin"""
-
-    plugin: PluginCompositeId
-    factory: BlockFactoryId
 
 
 class BlockFactoryCatalogue(FiabCoreBaseModel):
     factories: dict[BlockFactoryId, BlockFactory]
 
 
-class BlockInstance(FiabCoreBaseModel):
-    """As produced by BlockFactory *by the client* -- basically the configuration/inputs values"""
+ConfigurationOptionRestriction = dict[ConfigurationOptionId, FableType]
+"""Mapping from configuration option id to its FableType restriction"""
 
-    factory_id: PluginBlockFactoryId
-    configuration_values: dict[str, str]
-    """Keys come frome factory's `configuration_options`, values are serialized actual configuration values"""
-    input_ids: dict[str, BlockInstanceId]
+
+class BlockExpansion(FiabCoreBaseModel):
+    """Expansion of a block with potential restrictions on configuration options.
+
+    Plugin expanders return BlockExpansion objects describing which blocks can
+    expand the output of a given block, and what configuration restrictions apply
+    to those expansions.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    factory: BlockFactoryId
+    """The local factory id within the plugin"""
+    restrictions: ConfigurationOptionRestriction = Field(default_factory=dict)
+    """Restrictions on configuration options for this expansion"""
+
+
+class BlockInstance(FiabCoreBaseModel):
+    """Configuration values and input wiring, as specified by a client when building a Fable."""
+
+    configuration_values: dict[ConfigurationOptionId, Any]
+    """Keys come from factory's `configuration_options`, values are either str-serialized (frontend2backend) or deserialized (backend2plugin)"""
+    # TODO separate the backend class to have a str type there
+    input_ids: dict[str, BlockInstanceId] = Field(default_factory=dict)
     """Keys come from factory's `inputs`, values are other blocks in the (partial) fable"""
 
 
@@ -111,12 +136,43 @@ class QubedOutput(FiabCoreBaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+def is_textual(mime_type: str) -> bool:
+    # we check the starts with because of encoding, extension, etc
+    return mime_type.startswith("text/plain")
+
+
+class UrlDataFormat(str, Enum):
+    """Format of the data stored at the url that a textual output represents."""
+
+    gribdir = "gribdir"
+    zarr = "zarr"
+
+
 class RawOutput(FiabCoreBaseModel):
     # use for final outputs that are not expected to be expanded by blocks except for
     # some general purpose like 'dump to file'. If a browser could be capable of directly
     # processing, ie, its a known media object, set the mime_type
     type_fqn: str = "typing.Any"
     mime_type: str = "application/octet-stream"
+    """Standard mime type, optionally with standard parameters such as charset."""
+    fetchable: bool = False
+    """If true, the output value is a path to data (a file or a directory tree) that can be fetched as a zip. Requires text/plain mime type."""
+    url_dataformat: UrlDataFormat | None = Field(
+        default=None,
+        description="If the mime type is text/plain and the value represents an url, this describes the format of the data stored at that url.",
+    )
+    skinnywms_issue: str | None = Field(
+        default=None,
+        description="If set, the data at the url is known to be displayed incorrectly by skinnyWMS, and this holds the explanation.",
+    )
+
+    @model_validator(mode="after")
+    def _check_mime_consistency(self) -> Self:
+        if self.fetchable and not is_textual(self.mime_type):
+            raise ValueError(f"fetchable output requires text/plain mime type, got {self.mime_type!r}")
+        if self.url_dataformat is not None and not is_textual(self.mime_type):
+            raise ValueError(f"url_dataformat requires text/plain mime type, got {self.mime_type!r}")
+        return self
 
 
 class NoOutput(FiabCoreBaseModel):
@@ -127,3 +183,60 @@ class NoOutput(FiabCoreBaseModel):
 BlockInstanceOutput = QubedOutput | RawOutput | NoOutput
 
 ActionLookup = dict[BlockInstanceId, Action]
+
+
+class BlueprintTemplateEnvironment(FiabCoreBaseModel):
+    environment_variables: dict[str, str] = Field(default_factory=dict)
+
+
+class BlueprintTemplateBlock(FiabCoreBaseModel):
+    """A routing-equipped wrapper around a BlockInstance"""
+
+    factory_id: BlockFactoryId
+    instance: BlockInstance
+
+
+class BlueprintTemplateExampleInput(FiabCoreBaseModel):
+    """Regular blueprints have local glyphs and configuration options,
+    which in the latter case have a type and a description. In blueprint
+    templates, we allow for adding type and description to glyphs and
+    overriding those for configuration options.
+
+    These do *not* affect the blueprint persistence and execution. It only
+    plays a role in the user interface, when using the template as high-level
+    ready-to-go Job Preset, and when communicating the intent behind the
+    template.
+
+    The motivation for this is that in blueprints, the local glyphs
+    plays purely a role of variable *value*, whereas in templates, the
+    meaning shifts towards variable *definition*.
+
+    If the display_* or type_hint are not given here, the consumer of this
+    is assumed to take them from the underlying configuration option, or,
+    in the glyph case, assume no data."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    example_value: str
+    display_name: str | None = None
+    display_description: str | None = None
+    type_hint: FableTypeField | None = None
+
+
+class BlueprintTemplate(FiabCoreBaseModel):
+    """A partial, ready-to-customise blueprint shipped by a plugin.
+
+    Exposes the public subset of a blueprint builder plus separate guiding
+    example values/glyphs the user is expected to override. `display_name` is the
+    stable key used by the backend for upsert and exclusion; it must be unique
+    within a plugin.
+    """
+
+    display_name: str
+    display_description: str
+    tags: list[str] = Field(default_factory=list)
+    blocks: dict[BlockInstanceId, BlueprintTemplateBlock]
+    environment: BlueprintTemplateEnvironment | None = None
+    local_glyphs: dict[str, str] = Field(default_factory=dict)
+    example_values: dict[BlockInstanceId, dict[ConfigurationOptionId, BlueprintTemplateExampleInput]] = Field(default_factory=dict)
+    example_glyphs: dict[str, BlueprintTemplateExampleInput] = Field(default_factory=dict)

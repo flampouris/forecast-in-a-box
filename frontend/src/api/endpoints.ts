@@ -14,9 +14,8 @@
  * All API endpoint paths are defined here. Import and use these
  * constants instead of hardcoding paths.
  *
- * Key conventions:
- * - `API_ENDPOINTS`: For production code - static paths or functions for dynamic paths
- * - `API_PATTERNS`: For MSW mock handlers - uses `:param` syntax for path matching
+ * Every path is a static string; dynamic values travel as query params or
+ * request bodies, never as path segments.
  *
  * @see AGENTS.md for documentation on API endpoint conventions
  */
@@ -32,19 +31,16 @@ export const API_VERSION = 'v1'
 export const API_PREFIX = `/api/${API_VERSION}`
 
 /**
- * All API endpoint paths for production code
+ * All API endpoint paths for production code.
  *
- * Static endpoints are strings, dynamic endpoints are functions.
+ * Every path is a static string; dynamic values travel as query params
+ * or request bodies, never as path segments.
  *
  * Usage:
  * ```typescript
  * import { API_ENDPOINTS } from '@/api/endpoints'
  *
- * // Static endpoint
  * apiClient.get(API_ENDPOINTS.status)
- *
- * // Dynamic endpoint
- * apiClient.get(API_ENDPOINTS.job.list)
  * ```
  */
 export const API_ENDPOINTS = {
@@ -71,14 +67,16 @@ export const API_ENDPOINTS = {
     list: `${API_PREFIX}/blueprint/list`,
     /** POST - Delete a fable definition */
     delete: `${API_PREFIX}/blueprint/delete`,
-    /** GET - List available intrinsic glyphs for ${glyph} interpolation in block configs */
+    /** GET - List glyphs available for ${glyph} interpolation (query: glyph_type intrinsic|global) */
     glyphsList: `${API_PREFIX}/blueprint/glyphs/list`,
     /** GET - List custom Jinja filters/globals available in glyph expressions */
     glyphsFunctions: `${API_PREFIX}/blueprint/glyphs/functions`,
     /** POST - Create or update a global glyph */
     glyphsGlobalPost: `${API_PREFIX}/blueprint/glyphs/global/post`,
-    /** GET - Get a global glyph by ID */
-    glyphsGlobalGet: `${API_PREFIX}/blueprint/glyphs/global/get`,
+    /** POST - Delete a global glyph by ID */
+    glyphsGlobalDelete: `${API_PREFIX}/blueprint/glyphs/global/delete`,
+    /** POST - Resolve param/artifact option values to display strings */
+    resolveDisplay: `${API_PREFIX}/blueprint/options/resolveDisplay`,
   },
 
   /**
@@ -110,21 +108,21 @@ export const API_ENDPOINTS = {
    * Plugin management endpoints
    *
    * Note: Uses singular "plugin" not "plugins" to match backend.
-   * POST endpoints use request body for PluginCompositeId (except modifyEnabled which also uses query param).
+   * POST endpoints use request body for PluginCompositeId.
    */
   plugin: {
-    /** GET - Get plugin system status */
-    status: `${API_PREFIX}/plugin/status`,
     /** GET - Get all plugin details */
-    details: `${API_PREFIX}/plugin/details`,
+    list: `${API_PREFIX}/plugin/list`,
     /** POST - Install a plugin (body: PluginCompositeId) */
     install: `${API_PREFIX}/plugin/install`,
     /** POST - Uninstall a plugin (body: PluginCompositeId) */
     uninstall: `${API_PREFIX}/plugin/uninstall`,
     /** POST - Update a plugin (body: PluginCompositeId) */
     update: `${API_PREFIX}/plugin/update`,
-    /** POST - Enable/disable a plugin (body: PluginCompositeId, query: isEnabled) */
-    modifyEnabled: `${API_PREFIX}/plugin/modifyEnabled`,
+    /** POST - Update plugin settings, e.g. enable/disable (body: PluginSettingsUpdateRequest) */
+    settings: `${API_PREFIX}/plugin/settings`,
+    /** GET - Example values/glyphs for a blueprint template (query: store, local, displayName) */
+    templateExampleValues: `${API_PREFIX}/plugin/templateExampleValues`,
   },
 
   /**
@@ -142,6 +140,14 @@ export const API_ENDPOINTS = {
   },
 
   /**
+   * Notification push channel
+   */
+  notification: {
+    /** WS - Server-push ClientNotification stream */
+    ws: `${API_PREFIX}/notification/ws`,
+  },
+
+  /**
    * Job monitoring and execution endpoints
    */
   job: {
@@ -151,24 +157,40 @@ export const API_ENDPOINTS = {
     list: `${API_PREFIX}/run/list`,
     /** GET - Get status of a single execution (query: run_id) */
     get: `${API_PREFIX}/run/get`,
+    /** GET - Get task-level compilation detail (query: run_id, block_id?) */
+    compilationDetail: `${API_PREFIX}/run/getCompilationDetail`,
     /** POST - Restart an execution (body: { run_id, attempt_count }) */
     restart: `${API_PREFIX}/run/restart`,
-    /** GET - Get job result data by task ID (query: run_id, dataset_id) */
+    /** GET - Get a single output's content (query: run_id, dataset_id) */
     outputContent: `${API_PREFIX}/run/outputContent`,
+    /** GET - Fetchable output folder as ZIP (query: run_id, dataset_id) */
+    outputZipped: `${API_PREFIX}/run/outputZipped`,
     /** GET - Download job logs as ZIP (query: run_id) */
     logs: `${API_PREFIX}/run/logs`,
     /** POST - Delete an execution (body: { run_id, attempt_count }) */
     delete: `${API_PREFIX}/run/delete`,
+    /** POST - Stop an active run (body: { run_id, attempt_count }) */
+    stop: `${API_PREFIX}/run/stop`,
   },
 
   /**
-   * Gateway endpoints
+   * Lens (inspection-tool launcher) endpoints. Lenses run on dynamic ports
+   * and are addressed via a server-side instance id.
    */
-  gateway: {
-    /** GET - Get gateway status */
-    status: `${API_PREFIX}/gateway/status`,
-    /** GET - Stream gateway logs (SSE) */
-    logs: `${API_PREFIX}/gateway/logs`,
+  lens: {
+    /** POST - Start a SkinnyWMS lens (query: local_path) */
+    startSkinnyWms: `${API_PREFIX}/lens/start/skinnyWMS`,
+    /** GET - Get lens instance status (query: lens_instance_id) */
+    status: `${API_PREFIX}/lens/status`,
+    /** DELETE - Stop and remove an instance (query: lens_instance_id) */
+    stop: `${API_PREFIX}/lens/stop`,
+    /** GET - List all active lens instances */
+    list: `${API_PREFIX}/lens/list`,
+    /** GET - List supported lens types */
+    supported: `${API_PREFIX}/lens/supported`,
+    /** ANY - Proxy base; the running lens is reached at
+     *  `${proxyBase}/<lens_instance_id>/<upstream path>` */
+    proxyBase: `${API_PREFIX}/lens/proxy`,
   },
 
   /**
@@ -191,47 +213,10 @@ export const API_ENDPOINTS = {
     nextRun: `${API_PREFIX}/experiment/runs/next`,
     /** GET - Get the scheduler's current time */
     currentTime: `${API_PREFIX}/experiment/operational/scheduler/current_time`,
-    /** POST - Restart the scheduler thread */
-    restart: `${API_PREFIX}/experiment/operational/scheduler/restart`,
   },
 } as const
 
-/**
- * Path patterns for MSW mock handlers
- *
- * These use `:param` syntax for dynamic route matching.
- * Only needed for endpoints with path parameters.
- *
- * Usage in mock handlers:
- * ```typescript
- * import { API_PATTERNS } from '@/api/endpoints'
- *
- * http.get(API_PATTERNS.artifacts.listModels, async ({ request }) => {
- *   const { jobId } = params
- *   // ...
- * })
- * ```
- */
-export const API_PATTERNS = {
-  /**
-   * Artifacts patterns - all use static paths (IDs in request body)
-   */
-  artifacts: {
-    listModels: `${API_PREFIX}/artifacts/list_models`,
-    modelDetails: `${API_PREFIX}/artifacts/model_details`,
-    downloadModel: `${API_PREFIX}/artifacts/download_model`,
-    deleteModel: `${API_PREFIX}/artifacts/delete_model`,
-  },
-  /**
-   * Plugin patterns - all use static paths now (no path params)
-   * Plugin ID is sent in request body, not URL.
-   */
-  plugin: {
-    status: `${API_PREFIX}/plugin/status`,
-    details: `${API_PREFIX}/plugin/details`,
-    install: `${API_PREFIX}/plugin/install`,
-    uninstall: `${API_PREFIX}/plugin/uninstall`,
-    update: `${API_PREFIX}/plugin/update`,
-    modifyEnabled: `${API_PREFIX}/plugin/modifyEnabled`,
-  },
+/** Static files served next to the app and fetched at runtime. */
+export const STATIC_FILES = {
+  communityNews: '/community-news.json',
 } as const

@@ -8,111 +8,53 @@
  * does it submit to any jurisdiction.
  */
 
-/**
- * ForecastJournal Component
- *
- * Main journal view showing forecast job history
- */
-
-import { useMemo, useState } from 'react'
-import { Search } from 'lucide-react'
+import { ChevronRight } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import { ForecastJournalFilters } from './ForecastJournalFilters'
-import { ForecastJournalItem } from './ForecastJournalItem'
-import type { FilterType } from './ForecastJournalFilters'
-import type { DashboardVariant, PanelShadow } from '@/stores/uiStore'
-import { mockForecastJobs } from '@/features/dashboard/data/mockData'
+import { Link } from '@tanstack/react-router'
+import type { JobExecutionDetail } from '@/api/types/job.types'
+import { useRecentRuns } from '@/api/hooks/useJobs'
+import { useForecastRuns } from '@/features/journal/data/useForecastRuns'
+import { ForecastRunList } from '@/features/journal/components/ForecastRunList'
 import { H2 } from '@/components/base/typography'
-import { Card } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 
-interface ForecastJournalProps {
-  variant?: DashboardVariant
-  shadow?: PanelShadow
-}
+/** Overview shows the latest runs and hands off to Execute for the rest. */
+const RECENT_RUN_COUNT = 5
+const EMPTY_RUNS: ReadonlyArray<JobExecutionDetail> = []
 
-export function ForecastJournal({ variant, shadow }: ForecastJournalProps) {
-  const { t } = useTranslation('dashboard')
-  const [searchQuery, setSearchQuery] = useState('')
-  const [activeFilter, setActiveFilter] = useState<FilterType>('all')
-
-  const filteredJobs = useMemo(() => {
-    let jobs = [...mockForecastJobs]
-
-    // Apply filter
-    if (activeFilter !== 'all') {
-      if (activeFilter === 'bookmarked') {
-        jobs = jobs.filter((job) => job.isBookmarked)
-      } else {
-        jobs = jobs.filter((job) => job.status === activeFilter)
-      }
-    }
-
-    // Apply search
-    if (searchQuery) {
-      const query = searchQuery.toLowerCase()
-      jobs = jobs.filter(
-        (job) =>
-          job.name.toLowerCase().includes(query) ||
-          job.model.toLowerCase().includes(query) ||
-          job.id.toLowerCase().includes(query) ||
-          job.tags.some((tag) => tag.toLowerCase().includes(query)),
-      )
-    }
-
-    return jobs
-  }, [searchQuery, activeFilter])
+export function ForecastJournal() {
+  const { t } = useTranslation('journal')
+  const { data, isLoading } = useRecentRuns(RECENT_RUN_COUNT)
+  const { runs, toggleBookmark } = useForecastRuns(data ?? EMPTY_RUNS)
 
   return (
-    <Card className="overflow-hidden" variant={variant} shadow={shadow}>
-      {/* Header */}
-      <div className="flex flex-col items-start justify-between gap-4 border-b border-border p-6 sm:flex-row sm:items-center">
-        <H2 className="text-xl font-semibold">{t('journal.title')}</H2>
-
-        <div className="flex w-full items-center gap-3 sm:w-auto">
-          {/* Search */}
-          <div className="relative flex-1 sm:flex-initial">
-            <span className="absolute inset-y-0 left-0 flex items-center pl-3 text-muted-foreground">
-              <Search className="h-4 w-4" />
-            </span>
-            <Input
-              type="text"
-              placeholder={t('journal.searchPlaceholder')}
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-10 sm:w-64"
-            />
-          </div>
-
-          {/* Filters */}
-          <ForecastJournalFilters
-            activeFilter={activeFilter}
-            onFilterChange={setActiveFilter}
-          />
+    <ForecastRunList
+      runs={runs}
+      isLoading={isLoading}
+      onToggleBookmark={toggleBookmark}
+      emptyText={t('noRunsYet')}
+      emptyAction={
+        <Button
+          variant="outline"
+          size="sm"
+          nativeButton={false}
+          render={<Link to="/configure" />}
+        >
+          {t('configureForecast')}
+        </Button>
+      }
+      header={
+        <div className="flex items-center justify-between gap-4 px-4 py-4">
+          <H2 className="text-xl font-semibold">{t('title')}</H2>
+          <Link
+            to="/execute"
+            className="hit-target-y inline-flex shrink-0 items-center text-sm font-medium text-primary hover:underline"
+          >
+            {t('viewAll')}
+            <ChevronRight className="ml-0.5 h-3 w-3" />
+          </Link>
         </div>
-      </div>
-
-      {/* Job List */}
-      <div className="divide-y divide-border">
-        {filteredJobs.length > 0 ? (
-          filteredJobs.map((job) => (
-            <ForecastJournalItem key={job.id} job={job} />
-          ))
-        ) : (
-          <div className="p-12 text-center text-muted-foreground">
-            {t('journal.noResults')}
-          </div>
-        )}
-      </div>
-
-      {/* Footer */}
-      {filteredJobs.length > 0 && (
-        <div className="border-t border-border p-4 text-center">
-          <button className="text-sm font-medium text-muted-foreground transition-colors hover:text-primary">
-            {t('journal.loadMore')}
-          </button>
-        </div>
-      )}
-    </Card>
+      }
+    />
   )
 }

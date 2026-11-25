@@ -11,6 +11,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import type { FableBuilderV1 } from '@/api/types/fable.types'
+import { flushDraft } from '@/features/fable-builder/hooks/useDraftPersistence'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
 import {
   decodeFableFromURL,
@@ -35,35 +36,41 @@ export function useURLStateSync({
   const setFable = useFableBuilderStore((state) => state.setFable)
 
   const initializedRef = useRef(false)
-  const lastEncodedRef = useRef<string | null>(encodedState ?? null)
+  const lastEncodedRef = useRef<string | null>(null)
   const timeoutRef = useRef<NodeJS.Timeout | null>(null)
   const isUpdatingURLRef = useRef(false)
 
+  // Apply URL payloads the hook didn't write itself (share links, back/forward).
   useEffect(() => {
-    if (!enabled || initializedRef.current) return
-    if (!encodedState) {
-      initializedRef.current = true
-      return
-    }
-
-    const decoded = decodeFableFromURL(encodedState)
-    if (decoded) {
-      setFable(decoded, null)
-      lastEncodedRef.current = encodedState
+    if (!enabled) return
+    if (encodedState && encodedState !== lastEncodedRef.current) {
+      const decoded = decodeFableFromURL(encodedState)
+      if (decoded) {
+        // An explicit payload replaces unsaved work — bank it first.
+        flushDraft()
+        setFable(decoded, null)
+        lastEncodedRef.current = encodedState
+      }
     }
     initializedRef.current = true
-    // Intentionally only run on mount to sync initial URL state
-  }, [])
+  }, [encodedState, enabled, setFable])
 
   const updateURL = useCallback(
     (newFable: FableBuilderV1) => {
-      const encoded = encodeFableToURL(newFable)
+      // Empty work clears the payload, else a reload restores deleted blocks.
+      const encoded =
+        Object.keys(newFable.blocks).length > 0
+          ? encodeFableToURL(newFable)
+          : null
       if (encoded === lastEncodedRef.current) return
 
       lastEncodedRef.current = encoded
+      // Guard the synchronous `navigate` so the fable-watch effect can't
+      // re-react to a route change this write itself causes. Cleared right
+      // after — `updateURL` only runs once the debounce has already settled.
       isUpdatingURLRef.current = true
 
-      if (isStateTooLarge(encoded)) {
+      if (encoded !== null && isStateTooLarge(encoded)) {
         log.warn('Configuration is large. URL may not work in all browsers.', {
           encodedLength: encoded.length,
         })
@@ -71,22 +78,17 @@ export function useURLStateSync({
 
       navigate({
         to: '/configure',
-        search: { state: encoded },
+        search: encoded === null ? {} : { state: encoded },
         replace: true,
       })
 
-      requestAnimationFrame(() => {
-        isUpdatingURLRef.current = false
-      })
+      isUpdatingURLRef.current = false
     },
     [navigate],
   )
 
   useEffect(() => {
     if (!enabled || !initializedRef.current || isUpdatingURLRef.current) return
-
-    const blockCount = Object.keys(fable.blocks).length
-    if (blockCount === 0) return
 
     if (timeoutRef.current) {
       clearTimeout(timeoutRef.current)

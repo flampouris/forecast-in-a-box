@@ -18,10 +18,12 @@
  * - Optional Zod validation for runtime type safety
  */
 
+import i18n from 'i18next'
 import type { ApiError, RequestConfig } from '@/types/api.types'
 import { getBackendBaseUrl } from '@/utils/env'
+import { API_CONSTANTS } from '@/utils/constants'
 import { parseOrThrow } from '@/utils/zod'
-import { STORAGE_KEYS } from '@/lib/storage-keys'
+import { readAnonymousId } from '@/lib/anonymous-id'
 import { createLogger } from '@/lib/logger'
 
 const log = createLogger('ApiClient')
@@ -46,8 +48,11 @@ export class ApiClientError extends Error {
  *
  * API paths include /api/v1/ prefix (e.g., '/api/v1/status').
  * Base URL is either empty (same-origin) or absolute (remote backend).
+ *
+ * Exported so direct-fetch callers (e.g. blob downloads in endpoints/job.ts)
+ * resolve URLs identically to the apiClient.
  */
-function buildUrl(
+export function buildUrl(
   path: string,
   params?: Record<string, string | number | boolean>,
 ): string {
@@ -69,13 +74,56 @@ function buildUrl(
 }
 
 /**
+ * Build an ApiClientError from a failed Response, preferring the FastAPI
+ * `detail` body and falling back to `fallbackMessage`.
+ */
+export async function apiErrorFromResponse(
+  response: Response,
+  fallbackMessage: string,
+): Promise<ApiClientError> {
+  let message = fallbackMessage
+  let details: unknown
+
+  try {
+    const errorData = (await response.json()) as ApiError
+    // FastAPI errors are { detail }; our schema uses { message }.
+    const detail = (errorData as unknown as { detail?: unknown }).detail
+    if (typeof detail === 'string') {
+      message = errorData.message || detail || fallbackMessage
+    } else if (typeof detail === 'object' && detail !== null) {
+      message = errorData.message || fallbackMessage
+      details = detail
+    } else {
+      message = errorData.message || fallbackMessage
+    }
+    if (!details) details = errorData.details
+  } catch {
+    // Body absent or not JSON — keep the fallback message.
+  }
+
+  return new ApiClientError(
+    message,
+    response.status,
+    String(response.status),
+    details,
+  )
+}
+
+/**
  * Make an API request with optional Zod validation
  */
 async function request<T>(
   path: string,
   config: RequestConfig = {},
 ): Promise<T> {
-  const { method = 'GET', headers = {}, body, params, schema } = config
+  const {
+    method = 'GET',
+    headers = {},
+    body,
+    params,
+    schema,
+    timeout = API_CONSTANTS.TIMEOUTS.DEFAULT,
+  } = config
 
   const url = buildUrl(path, params)
 
@@ -85,14 +133,9 @@ async function request<T>(
     ...headers,
   }
 
-  // Add X-Anonymous-ID header if anonymous ID exists in localStorage
-  const anonymousId = localStorage.getItem(STORAGE_KEYS.auth.anonymousId)
-  if (
-    anonymousId &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      anonymousId,
-    )
-  ) {
+  // readAnonymousId yields the stored ID only if it is a valid UUID.
+  const anonymousId = readAnonymousId()
+  if (anonymousId) {
     requestHeaders['X-Anonymous-ID'] = anonymousId
   }
 
@@ -102,38 +145,18 @@ async function request<T>(
       headers: requestHeaders,
       body: body ? JSON.stringify(body) : undefined,
       credentials: 'include', // Include session cookies
+      // Fail closed on 3xx — a cross-origin redirect leaks X-Anonymous-ID.
+      redirect: 'error',
+      // Nothing else bounds the wait; a stalled backend hangs the spinner.
+      signal: AbortSignal.timeout(timeout),
     })
 
     // Handle non-200 responses
     if (!response.ok) {
-      let errorMessage = `HTTP ${response.status}: ${response.statusText}`
-      let errorDetails: unknown
-
-      try {
-        const errorData = (await response.json()) as ApiError
-        // FastAPI returns errors as { detail: "..." } (string or object),
-        // our schema uses { message: "..." }
-        const detail = (errorData as unknown as { detail?: unknown }).detail
-        if (typeof detail === 'string') {
-          errorMessage = errorData.message || detail || errorMessage
-        } else if (typeof detail === 'object' && detail !== null) {
-          errorMessage = errorData.message || `HTTP ${response.status}`
-          errorDetails = detail
-        } else {
-          errorMessage = errorData.message || errorMessage
-        }
-        if (!errorDetails) errorDetails = errorData.details
-      } catch {
-        // If response is not JSON, use the status text
-      }
-
-      // Return early with error
       return Promise.reject(
-        new ApiClientError(
-          errorMessage,
-          response.status,
-          String(response.status),
-          errorDetails,
+        await apiErrorFromResponse(
+          response,
+          `HTTP ${response.status}: ${response.statusText}`,
         ),
       )
     }
@@ -172,10 +195,22 @@ async function request<T>(
       throw error
     }
 
+    // Only ours: a caller's abort raises AbortError and must pass through.
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
+      throw new ApiClientError(
+        i18n.t('errors:network.timeout', {
+          seconds: Math.round(timeout / 1000),
+        }),
+        undefined,
+        'TIMEOUT_ERROR',
+        error,
+      )
+    }
+
     // Handle network errors
     if (error instanceof TypeError) {
       throw new ApiClientError(
-        'Network error: Unable to reach the API server',
+        i18n.t('errors:network.apiUnreachable'),
         undefined,
         'NETWORK_ERROR',
         error,
@@ -184,7 +219,7 @@ async function request<T>(
 
     // Handle other errors
     throw new ApiClientError(
-      error instanceof Error ? error.message : 'An unknown error occurred',
+      error instanceof Error ? error.message : i18n.t('errors:unknown'),
       undefined,
       'UNKNOWN_ERROR',
       error,

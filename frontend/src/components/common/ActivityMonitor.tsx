@@ -9,7 +9,7 @@
  */
 
 /**
- * Notification Center
+ * ActivityMonitor
  *
  * Header icon with badge showing active long-running tasks. Click to open a
  * popover with a filterable list split into Ongoing and Completed sections.
@@ -26,6 +26,7 @@ import {
   BrushCleaning,
   Check,
   ChevronRight,
+  CircleStop,
   Download,
   HelpCircle,
   Play,
@@ -171,7 +172,7 @@ export function ActivityMonitor() {
                       type="button"
                       aria-label={t('activity.clearAll')}
                       onClick={clearAll}
-                      className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                      className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
                     />
                   }
                 >
@@ -184,7 +185,7 @@ export function ActivityMonitor() {
             )}
             <PopoverClose
               aria-label={t('close')}
-              className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+              className="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
             >
               <X className="h-3.5 w-3.5" />
             </PopoverClose>
@@ -273,7 +274,7 @@ export function ActivityMonitor() {
         {/* Footer */}
         <div className="border-t border-border px-4 py-2">
           <Link
-            to="/executions"
+            to="/execute"
             className="flex items-center justify-between text-sm text-muted-foreground hover:text-foreground"
           >
             {t('activity.viewAll')}
@@ -293,7 +294,7 @@ function SectionHeader({
   action?: React.ReactNode
 }) {
   return (
-    <div className="flex items-center justify-between bg-muted/30 px-4 py-1.5">
+    <div className="flex items-center justify-between bg-muted/30 px-4 py-1">
       <P className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
         {title}
       </P>
@@ -321,7 +322,7 @@ function ActivityTaskRow({
   const body = (
     <div
       className={cn(
-        'group flex items-center gap-3 px-4 py-3 transition-colors',
+        'group flex items-center gap-2.5 px-4 py-2 transition-colors',
         task.navigateTo && 'hover:bg-muted/50',
         task.status !== 'active' && 'opacity-75',
       )}
@@ -329,18 +330,22 @@ function ActivityTaskRow({
       {/* Type/status icon */}
       <div
         className={cn(
-          'flex h-8 w-8 shrink-0 items-center justify-center rounded-full',
+          'flex h-7 w-7 shrink-0 items-center justify-center rounded-full',
           statusColor,
         )}
       >
-        <StatusIcon className="h-4 w-4 text-white" />
+        <StatusIcon className="h-3.5 w-3.5 text-white" />
       </div>
 
       {/* Content */}
       <div className="min-w-0 flex-1">
         <P className="truncate text-sm font-medium">{task.label}</P>
         <div className="flex items-center gap-2">
-          <P className="truncate text-sm text-muted-foreground">
+          {/* Failure descriptions carry the backend reason and outrun the row. */}
+          <P
+            className="truncate text-xs text-muted-foreground"
+            title={task.description}
+          >
             {task.description}
           </P>
         </div>
@@ -348,7 +353,7 @@ function ActivityTaskRow({
         {task.type === 'download' &&
           task.status === 'active' &&
           task.progress != null && (
-            <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+            <div className="mt-1 h-1 w-full overflow-hidden rounded-full bg-muted">
               <div
                 className="h-full rounded-full bg-foreground/70 transition-all duration-300"
                 style={{ width: `${task.progress}%` }}
@@ -356,7 +361,7 @@ function ActivityTaskRow({
             </div>
           )}
         {/* Time */}
-        <P className="mt-0.5 text-sm text-muted-foreground/60">{timeAgo}</P>
+        <P className="mt-0.5 text-xs text-muted-foreground/60">{timeAgo}</P>
       </div>
 
       {/* Trailing actions: dismiss X (completed) or nav chevron (active + navigateTo) */}
@@ -369,7 +374,7 @@ function ActivityTaskRow({
             e.stopPropagation()
             onDismiss()
           }}
-          className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-muted-foreground/60 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100"
+          className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground/60 opacity-0 transition-opacity group-hover:opacity-100 hover:bg-muted hover:text-foreground focus-visible:opacity-100"
         >
           <X className="h-3.5 w-3.5" />
         </button>
@@ -393,11 +398,13 @@ function ActivityTaskRow({
 function getStatusIcon(task: ActivityTask) {
   if (task.status === 'completed') return Check
   if (task.status === 'failed') return AlertCircle
+  if (task.status === 'stopped') return CircleStop
   return TYPE_CONFIG[task.type].icon
 }
 
 function getStatusColor(task: ActivityTask): string {
-  if (task.status === 'completed') return 'bg-muted-foreground/50'
+  if (task.status === 'completed' || task.status === 'stopped')
+    return 'bg-muted-foreground/50'
   // Failed is conveyed by the AlertCircle icon, not a red pill.
   if (task.status === 'failed') return NEUTRAL_BADGE_BG
   return TYPE_CONFIG[task.type].badgeColor

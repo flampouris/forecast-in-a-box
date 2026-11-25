@@ -1,0 +1,177 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * Feature guide + shortcut reference for the compare viewer (page help
+ * button or `H`); also the guided tour's second launch surface. Content
+ * lives in the `visualise` i18n namespace under `help.*`.
+ */
+
+import { GraduationCap } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { COMPARE_KEYS, keyLabel } from './useGeoShortcuts'
+import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { P } from '@/components/base/typography'
+import { useTutorialsStore } from '@/stores/tutorialsStore'
+
+const SECTIONS = ['modes', 'layers', 'time', 'tools', 'export'] as const
+
+type ShortcutId =
+  | 'sidebars'
+  | 'modes'
+  | 'pan'
+  | 'zoom'
+  | 'play'
+  | 'step'
+  | 'annotate'
+  | 'fit'
+  | 'projection'
+  | 'copy'
+  | 'export'
+  | 'flicker'
+  | 'loupe'
+  | 'swipe'
+  | 'help'
+  | 'badges'
+
+const SHORTCUTS: ReadonlyArray<{
+  keys: ReadonlyArray<string>
+  id: ShortcutId
+}> = [
+  { keys: [keyLabel(COMPARE_KEYS.sidebars)], id: 'sidebars' },
+  {
+    keys: [
+      keyLabel(COMPARE_KEYS.modes[0]),
+      '…',
+      keyLabel(COMPARE_KEYS.modes[4]),
+    ],
+    id: 'modes',
+  },
+  { keys: COMPARE_KEYS.pan.map(keyLabel), id: 'pan' },
+  { keys: COMPARE_KEYS.zoom, id: 'zoom' },
+  { keys: [keyLabel(COMPARE_KEYS.play)], id: 'play' },
+  { keys: COMPARE_KEYS.step, id: 'step' },
+  { keys: [keyLabel(COMPARE_KEYS.annotate)], id: 'annotate' },
+  { keys: [keyLabel(COMPARE_KEYS.fit)], id: 'fit' },
+  { keys: [keyLabel(COMPARE_KEYS.projection)], id: 'projection' },
+  { keys: [keyLabel(COMPARE_KEYS.copy)], id: 'copy' },
+  { keys: [keyLabel(COMPARE_KEYS.export)], id: 'export' },
+  { keys: [keyLabel('Space')], id: 'flicker' },
+  { keys: ['Z'], id: 'loupe' },
+  { keys: [keyLabel('ArrowLeft'), keyLabel('ArrowRight')], id: 'swipe' },
+  { keys: [keyLabel(COMPARE_KEYS.help)], id: 'help' },
+  { keys: [COMPARE_KEYS.badges], id: 'badges' },
+]
+
+export function CompareHelpDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const { t } = useTranslation('visualise')
+  const { t: tTut } = useTranslation('tutorials')
+  const tourStatus = useTutorialsStore((s) => s.statuses['visualise-first-map'])
+  const startTour = () => {
+    onOpenChange(false)
+    useTutorialsStore.getState().start('visualise-first-map')
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>{t('help.title')}</DialogTitle>
+          <DialogDescription>{t('help.intro')}</DialogDescription>
+        </DialogHeader>
+
+        {/* Two-column flow: five feature sections + the shortcut table
+            as the sixth block — keeps the dialog page-shaped instead of
+            a scroll tunnel. */}
+        <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+          {SECTIONS.map((id) => (
+            <section key={id}>
+              <P className="text-sm font-semibold">
+                {t(`help.sections.${id}.title`)}
+              </P>
+              <P className="mt-0.5 text-sm text-muted-foreground">
+                {t(`help.sections.${id}.body`)}
+              </P>
+            </section>
+          ))}
+
+          <section>
+            <P className="text-sm font-semibold">
+              {tTut('launch.sectionTitle')}
+            </P>
+            <P className="mt-0.5 text-sm text-muted-foreground">
+              {tTut('firstMap.title')} — {tTut('firstMap.description')}
+              {tourStatus === 'completed' && (
+                <span className="ml-1 text-xs">
+                  · {tTut('launch.completed')}
+                </span>
+              )}
+            </P>
+            <Button
+              size="sm"
+              variant="outline"
+              className="mt-2 gap-1.5"
+              onClick={startTour}
+            >
+              <GraduationCap className="h-3.5 w-3.5" />
+              {tTut('launch.take')}
+            </Button>
+          </section>
+
+          <section>
+            <P className="text-sm font-semibold">{t('help.shortcuts.title')}</P>
+            <table className="mt-1 w-full text-sm">
+              <tbody>
+                {SHORTCUTS.map(({ keys, id }) => (
+                  <tr key={id} className="border-b border-border/60">
+                    <td className="w-16 py-1 pr-3 whitespace-nowrap">
+                      {keys.map((k, i) => (
+                        <span key={i}>
+                          {i > 0 && k !== '…' && keys[i - 1] !== '…' && (
+                            <span className="text-muted-foreground"> </span>
+                          )}
+                          {k === '…' ? (
+                            <span className="px-0.5 text-muted-foreground">
+                              …
+                            </span>
+                          ) : (
+                            <kbd className="rounded-md border border-border bg-muted px-1.5 py-0.5 font-mono text-xs">
+                              {k}
+                            </kbd>
+                          )}
+                        </span>
+                      ))}
+                    </td>
+                    <td className="py-1 text-muted-foreground">
+                      {t(`help.shortcuts.${id}`)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </section>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}

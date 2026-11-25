@@ -8,28 +8,28 @@
  * does it submit to any jurisdiction.
  */
 
-/**
- * AuthenticatedHeader Component
- *
- * Header for authenticated pages with system status,
- * help button, and settings dropdown menu
- */
+/** Header for authenticated pages: system status, help, and settings menu. */
 
-import { Link } from '@tanstack/react-router'
+import { useState } from 'react'
+import { Link, useNavigate } from '@tanstack/react-router'
+import { useTranslation } from 'react-i18next'
 import {
   Blocks,
+  CalendarClock,
   Cloud,
   FileText,
+  Globe,
   HelpCircle,
-  Layout,
+  KeyRound,
   LogOut,
-  Maximize2,
-  Minimize2,
   Monitor,
   Moon,
+  Search,
   Settings,
+  Sparkles,
   Sun,
   User,
+  Variable,
 } from 'lucide-react'
 import { P } from '@/components/base/typography'
 import { Button } from '@/components/ui/button'
@@ -48,16 +48,31 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Logo } from '@/components/common/Logo'
 import { ActivityMonitor } from '@/components/common/ActivityMonitor'
+import { TimeZoneSelect } from '@/components/common/TimeZoneSelect'
+import { EcmwfKeyDialog } from '@/features/visualise/components/sources/EcmwfKeyDialog'
+import { useEcmwfKeyStore } from '@/stores/ecmwfKeyStore'
 import { NavToggle } from '@/components/layout/NavToggle'
 import { StatusDetailsPopover } from '@/components/common/StatusDetailsPopover'
+import { LensServersSection } from '@/features/visualise/components/LensServersSection'
 import { StatusIndicator } from '@/components/common/StatusIndicator'
 import { useAuth } from '@/features/auth/AuthContext'
 import { cn } from '@/lib/utils'
+import { PAGE_WIDTH_CLASS } from '@/lib/page-width'
 import { useUser } from '@/hooks/useUser'
 import { useStatus } from '@/api/hooks/useStatus'
 import { useUiStore } from '@/stores/uiStore'
+import { useCommandStore } from '@/stores/commandStore'
+import { useOnboardingStore } from '@/stores/onboardingStore'
+import { timeZoneOffsetLabel, useAppTimeZone } from '@/lib/datetime'
 
 export function AuthenticatedHeader() {
   const { data: user } = useUser()
@@ -65,10 +80,14 @@ export function AuthenticatedHeader() {
   const { authType, signOut } = useAuth()
   const theme = useUiStore((state) => state.theme)
   const setTheme = useUiStore((state) => state.setTheme)
-  const layoutMode = useUiStore((state) => state.layoutMode)
-  const setLayoutMode = useUiStore((state) => state.setLayoutMode)
-  const dashboardVariant = useUiStore((state) => state.dashboardVariant)
-  const setDashboardVariant = useUiStore((state) => state.setDashboardVariant)
+  const setTimeZone = useUiStore((state) => state.setTimeZone)
+  const timeZone = useAppTimeZone()
+  const [tzDialogOpen, setTzDialogOpen] = useState(false)
+  const hasEcmwfKey = useEcmwfKeyStore((s) => s.key !== null)
+  const openEcmwfKeyDialog = useEcmwfKeyStore((s) => s.openDialog)
+  const { t } = useTranslation('common')
+  const setCommandOpen = useCommandStore((state) => state.setOpen)
+  const navigate = useNavigate()
 
   const isAuthenticated = authType === 'authenticated'
   const isSuperuser = user?.is_superuser ?? false
@@ -79,37 +98,43 @@ export function AuthenticatedHeader() {
     await signOut()
   }
 
+  // Non-destructive replay of the welcome tour: status and progress persist.
+  const handleOpenWelcomeTour = () => {
+    useOnboardingStore.getState().openWelcome()
+    void navigate({ to: '/overview' })
+  }
+
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-card">
       <div
         className={cn(
-          'relative flex h-16 items-center justify-between px-4 sm:px-6 lg:px-8',
-          layoutMode === 'boxed' && 'mx-auto max-w-7xl',
+          PAGE_WIDTH_CLASS,
+          'flex h-16 items-center gap-2 px-4 sm:gap-4 sm:px-6 lg:px-8',
         )}
       >
-        {/* Logo */}
-        <div className="flex items-center gap-3">
+        {/* Logo — flex-1 balances the actions so the nav stays centred. */}
+        <div className="flex min-w-0 flex-1 items-center">
           <Link
-            to="/dashboard"
-            className="flex items-center gap-2 sm:gap-3"
-            aria-label="Dashboard"
+            to="/overview"
+            className="flex min-w-0 items-center gap-2 sm:gap-3"
+            aria-label={t('userMenu.dashboard')}
           >
             <Logo />
-            <span className="hidden text-base font-semibold tracking-tight md:inline md:text-xl">
-              Forecast-in-a-Box
+            <span className="hidden truncate text-base font-semibold tracking-tight md:block md:text-xl">
+              {t('appName')}
             </span>
           </Link>
         </div>
 
-        {/* NavToggle (center) - hidden on mobile */}
-        <div className="absolute top-1/2 left-1/2 hidden -translate-x-1/2 -translate-y-1/2 md:flex">
+        {/* Section nav, lg+ — shrinkable; the breadcrumb yields before clipping. */}
+        <div className="hidden min-w-0 lg:flex">
           <NavToggle />
         </div>
 
         {/* Right side - Status, Help, Settings */}
-        <div className="flex items-center gap-3 text-muted-foreground">
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-3 text-muted-foreground">
           {/* System Status Badge - only show label when there's an issue */}
-          <StatusDetailsPopover>
+          <StatusDetailsPopover extra={<LensServersSection />}>
             <StatusIndicator
               status={trafficLightStatus}
               variant="badge"
@@ -122,12 +147,25 @@ export function AuthenticatedHeader() {
           {/* Activity Monitor */}
           <ActivityMonitor />
 
+          {/* Command palette (also ⌘K / Ctrl+K) */}
+          <Button
+            variant="ghost"
+            size="icon"
+            className="hidden text-muted-foreground sm:inline-flex"
+            aria-label={t('commandPalette.open')}
+            title={t('commandPalette.open')}
+            onClick={() => setCommandOpen(true)}
+          >
+            <Search className="h-5 w-5" />
+          </Button>
+
           {/* Help Button */}
           <Button
             variant="ghost"
             size="icon"
             className="text-muted-foreground"
-            aria-label="Help"
+            aria-label={t('userMenu.help')}
+            onClick={handleOpenWelcomeTour}
           >
             <HelpCircle className="h-5 w-5" />
           </Button>
@@ -140,7 +178,7 @@ export function AuthenticatedHeader() {
                   variant="ghost"
                   size="icon"
                   className="text-muted-foreground"
-                  aria-label="Settings"
+                  aria-label={t('userMenu.settings')}
                 />
               }
             >
@@ -154,7 +192,8 @@ export function AuthenticatedHeader() {
                     <DropdownMenuLabel className="font-normal">
                       <div className="flex flex-col space-y-1">
                         <P className="leading-none font-medium">
-                          {user.email.split('@')[0] || 'User'}
+                          {user.email.split('@')[0] ||
+                            t('userMenu.userFallback')}
                         </P>
                         <P className="leading-none text-muted-foreground">
                           {user.email}
@@ -168,28 +207,11 @@ export function AuthenticatedHeader() {
 
               {/* View Group */}
               <DropdownMenuGroup>
-                <DropdownMenuLabel>View</DropdownMenuLabel>
-                <DropdownMenuItem
-                  onClick={() =>
-                    setLayoutMode(layoutMode === 'boxed' ? 'fluid' : 'boxed')
-                  }
-                >
-                  {layoutMode === 'boxed' ? (
-                    <>
-                      <Maximize2 className="mr-2 h-4 w-4" />
-                      Fluid Layout
-                    </>
-                  ) : (
-                    <>
-                      <Minimize2 className="mr-2 h-4 w-4" />
-                      Boxed Layout
-                    </>
-                  )}
-                </DropdownMenuItem>
+                <DropdownMenuLabel>{t('userMenu.view')}</DropdownMenuLabel>
                 <DropdownMenuSub>
                   <DropdownMenuSubTrigger>
                     <Sun className="mr-2 h-4 w-4" />
-                    Theme
+                    {t('userMenu.theme')}
                   </DropdownMenuSubTrigger>
                   <DropdownMenuPortal>
                     <DropdownMenuSubContent>
@@ -201,64 +223,53 @@ export function AuthenticatedHeader() {
                       >
                         <DropdownMenuRadioItem value="light">
                           <Sun className="mr-2 h-4 w-4" />
-                          Light
+                          {t('userMenu.themeLight')}
                         </DropdownMenuRadioItem>
                         <DropdownMenuRadioItem value="dark">
                           <Moon className="mr-2 h-4 w-4" />
-                          Dark
+                          {t('userMenu.themeDark')}
                         </DropdownMenuRadioItem>
                         <DropdownMenuRadioItem value="system">
                           <Monitor className="mr-2 h-4 w-4" />
-                          System
+                          {t('userMenu.themeSystem')}
                         </DropdownMenuRadioItem>
                       </DropdownMenuRadioGroup>
                     </DropdownMenuSubContent>
                   </DropdownMenuPortal>
                 </DropdownMenuSub>
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <Layout className="mr-2 h-4 w-4" />
-                    Card Style
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuPortal>
-                    <DropdownMenuSubContent>
-                      <DropdownMenuRadioGroup
-                        value={dashboardVariant}
-                        onValueChange={(value) =>
-                          setDashboardVariant(
-                            value as 'default' | 'flat' | 'modern' | 'gradient',
-                          )
-                        }
-                      >
-                        <DropdownMenuRadioItem value="default">
-                          Default
-                        </DropdownMenuRadioItem>
-                        <DropdownMenuRadioItem value="flat">
-                          Flat
-                        </DropdownMenuRadioItem>
-                        <DropdownMenuRadioItem value="modern">
-                          Modern
-                        </DropdownMenuRadioItem>
-                        <DropdownMenuRadioItem value="gradient">
-                          Gradient
-                        </DropdownMenuRadioItem>
-                      </DropdownMenuRadioGroup>
-                    </DropdownMenuSubContent>
-                  </DropdownMenuPortal>
-                </DropdownMenuSub>
+                <DropdownMenuItem onClick={() => setTzDialogOpen(true)}>
+                  <Globe className="mr-2 h-4 w-4" />
+                  {t('userMenu.timezone')}
+                  <span className="ml-auto text-xs text-muted-foreground">
+                    {timeZoneOffsetLabel(timeZone, new Date())}
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={openEcmwfKeyDialog}>
+                  <KeyRound className="mr-2 h-4 w-4" />
+                  {t('userMenu.ecmwfKey')}
+                  {hasEcmwfKey && (
+                    <span className="ml-auto text-xs text-muted-foreground">
+                      {t('userMenu.ecmwfKeySet')}
+                    </span>
+                  )}
+                </DropdownMenuItem>
               </DropdownMenuGroup>
 
               <DropdownMenuSeparator />
 
               {/* Help & Documentation */}
               <DropdownMenuGroup>
+                <DropdownMenuItem onClick={handleOpenWelcomeTour}>
+                  <Sparkles className="mr-2 h-4 w-4" />
+                  {t('userMenu.welcomeTour')}
+                </DropdownMenuItem>
                 <DropdownMenuItem>
                   <HelpCircle className="mr-2 h-4 w-4" />
-                  Help & Support
+                  {t('userMenu.helpSupport')}
                 </DropdownMenuItem>
                 <DropdownMenuItem>
                   <FileText className="mr-2 h-4 w-4" />
-                  Documentation
+                  {t('userMenu.documentation')}
                 </DropdownMenuItem>
               </DropdownMenuGroup>
 
@@ -267,14 +278,16 @@ export function AuthenticatedHeader() {
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>
-                    <DropdownMenuLabel>Account</DropdownMenuLabel>
+                    <DropdownMenuLabel>
+                      {t('userMenu.account')}
+                    </DropdownMenuLabel>
                     <DropdownMenuItem>
                       <User className="mr-2 h-4 w-4" />
-                      Profile
+                      {t('userMenu.profile')}
                     </DropdownMenuItem>
                     <DropdownMenuItem>
                       <Settings className="mr-2 h-4 w-4" />
-                      Settings
+                      {t('userMenu.settings')}
                     </DropdownMenuItem>
                   </DropdownMenuGroup>
                 </>
@@ -285,38 +298,73 @@ export function AuthenticatedHeader() {
                 <>
                   <DropdownMenuSeparator />
                   <DropdownMenuGroup>
-                    <DropdownMenuLabel>Administration</DropdownMenuLabel>
+                    <DropdownMenuLabel>
+                      {t('userMenu.administration')}
+                    </DropdownMenuLabel>
+                    <DropdownMenuItem render={<Link to="/schedules" />}>
+                      <CalendarClock className="mr-2 h-4 w-4" />
+                      {t('userMenu.schedules')}
+                    </DropdownMenuItem>
                     <DropdownMenuItem render={<Link to="/admin/plugins" />}>
                       <Blocks className="mr-2 h-4 w-4" />
-                      Plugins
+                      {t('userMenu.plugins')}
                     </DropdownMenuItem>
                     <DropdownMenuItem render={<Link to="/admin/artifacts" />}>
                       <Cloud className="mr-2 h-4 w-4" />
-                      Artifacts
+                      {t('userMenu.artifacts')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem render={<Link to="/admin/variables" />}>
+                      <Variable className="mr-2 h-4 w-4" />
+                      {t('userMenu.globalVariables')}
                     </DropdownMenuItem>
                   </DropdownMenuGroup>
                 </>
               )}
 
-              {/* Sign Out */}
-              <DropdownMenuSeparator />
-              <DropdownMenuGroup>
-                <DropdownMenuItem
-                  onClick={handleSignOut}
-                  className="text-destructive focus:text-destructive"
-                >
-                  <LogOut className="mr-2 h-4 w-4" />
-                  Sign Out
-                </DropdownMenuItem>
-              </DropdownMenuGroup>
+              {/* Passthrough mode has no session to end. */}
+              {isAuthenticated && (
+                <>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuGroup>
+                    <DropdownMenuItem
+                      onClick={handleSignOut}
+                      className="text-danger focus:text-danger"
+                    >
+                      <LogOut className="mr-2 h-4 w-4" />
+                      {t('userMenu.signOut')}
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
+
+          <Dialog open={tzDialogOpen} onOpenChange={setTzDialogOpen}>
+            <DialogContent className="sm:max-w-md">
+              <DialogHeader>
+                <DialogTitle>{t('userMenu.timezoneDialogTitle')}</DialogTitle>
+                <DialogDescription>
+                  {t('userMenu.timezoneDialogDescription')}
+                </DialogDescription>
+              </DialogHeader>
+              <TimeZoneSelect
+                value={timeZone}
+                onChange={(tz) => {
+                  setTimeZone(tz)
+                  setTzDialogOpen(false)
+                }}
+              />
+            </DialogContent>
+          </Dialog>
+          <EcmwfKeyDialog />
         </div>
       </div>
 
-      {/* NavToggle strip - visible only on mobile */}
-      <div className="flex justify-center border-t border-border py-1.5 md:hidden">
-        <NavToggle />
+      {/* Nav strip — shown below the bar until the centred nav fits (lg+); scrolls when cramped. */}
+      <div className="overflow-x-auto border-t border-border lg:hidden">
+        <div className="flex w-fit min-w-full justify-center px-4 py-1.5">
+          <NavToggle />
+        </div>
       </div>
     </header>
   )

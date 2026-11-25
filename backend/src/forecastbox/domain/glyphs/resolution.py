@@ -9,14 +9,24 @@
 
 """Core parsing and resolution of ${glyph} interpolation in BlockInstance configuration values."""
 
+# TODO this module is not exactly coherent in terms of architecture -- its coupling
+# to validate_expand and to compile is rather high and ad-hoc-ish. It would be better
+# to expose a smaller set of functions, ideally one for expr2value and one for glyphs2glyph
+# (maybe each in its module), with a better contract, eg a dataclass with
+# (resolution, error, missing), etc
+
 import datetime as dt
+import logging
+import re
 from dataclasses import dataclass
 
 from cascade.low.func import Either
-from fiab_core.fable import BlockInstance
+from fiab_core.fable import BlockInstance, ConfigurationOptionId
 
 from forecastbox.domain.glyphs.exceptions import GlyphCircularReferenceError
 from forecastbox.domain.glyphs.jinja_interpolation import extract_glyph_names, render_expression
+
+logger = logging.getLogger(__name__)
 
 PINNED_INTRINSIC_KEYS: frozenset[str] = frozenset({"startDatetime", "attemptCount"})
 """Intrinsic glyph keys that are always forced to their fresh intrinsic value in each attempt,
@@ -28,16 +38,8 @@ so that restarts always reflect the new attempt's own start time and attempt cou
 class ExtractedGlyphs:
     glyphs: set[str]
     """All glyph names referenced across all configuration_values."""
-    glyphed_options: set[str]
+    glyphed_options: set[ConfigurationOptionId]
     """Keys from configuration_values that contain at least one glyph reference."""
-
-
-def value_dt2str(value: dt.datetime) -> str:
-    """Convert a datetime to the canonical string format used for all runtime glyphs.
-
-    To ensure that all runtime glyphs are stringified the same way.
-    """
-    return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def extract_glyphs(blockInstance: BlockInstance) -> Either[ExtractedGlyphs, list[str]]:  # type: ignore[invalid-argument]
@@ -48,9 +50,12 @@ def extract_glyphs(blockInstance: BlockInstance) -> Either[ExtractedGlyphs, list
     list of error messages if any configuration value contains a malformed expression.
     """
     glyphs: set[str] = set()
-    glyphed_options: set[str] = set()
+    glyphed_options: set[ConfigurationOptionId] = set()
     errors: list[str] = []
     for key, value in blockInstance.configuration_values.items():
+        if value is None:
+            # An explicit null carries no glyphs and needs no interpolation.
+            continue
         result = extract_glyph_names(value)
         if result.e is not None:
             errors.append(f"{key!r}: {result.e}")
@@ -67,14 +72,38 @@ def extract_glyphs(blockInstance: BlockInstance) -> Either[ExtractedGlyphs, list
     return Either.ok(ExtractedGlyphs(glyphs=glyphs, glyphed_options=glyphed_options))
 
 
+def extract_glyphs_per_option(blockInstance: BlockInstance) -> dict[ConfigurationOptionId, set[str]]:
+    """Return a mapping from each option id to the set of glyph names it references.
+
+    Only includes options that contain at least one glyph reference.
+    Options with an explicit null value are skipped, as they carry no glyphs.
+    Malformed expressions are silently skipped; use ``extract_glyphs`` for error detection.
+    """
+    result: dict[ConfigurationOptionId, set[str]] = {}
+    for key, value in blockInstance.configuration_values.items():
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise TypeError(f"expected {key=}'s value to be a string, gotten {type(value)}")
+        r = extract_glyph_names(value)
+        if r.t is not None:
+            result[key] = r.t
+        else:
+            raise ValueError(f"not expected glyph parsing to fail at this time, {r.e}")
+    return result
+
+
 def resolve_configurations(blockInstance: BlockInstance, glyph_values: dict[str, str]) -> None:
     """Mutate blockInstance's configuration_values, evaluating ${...} expressions against glyph_values.
 
     Supports the full Jinja2 expression language with custom date/string filters.
     All glyphs referenced must be present in glyph_values. Call extract_glyphs
     and validate the set against available glyphs before invoking this function.
+    Options with an explicit null value are left untouched.
     """
     for key, value in blockInstance.configuration_values.items():
+        if value is None:
+            continue
         blockInstance.configuration_values[key] = render_expression(value, glyph_values)
 
 
@@ -178,3 +207,54 @@ def expand_glyph_values(glyph_values: dict[str, str], roots: set[str] | None = N
             _expand(key, frozenset())
 
     return dict(memo) if roots is not None else {k: memo[k] for k in source}
+
+
+_EXPR_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def remap_glyph_names(value: str, mapping: dict[str, str]) -> str:
+    """Rewrite glyph identifier names referenced inside ``${...}`` expressions.
+
+    ``mapping`` is a flat old-name -> new-name dict.  Only names reported by
+    ``extract_glyph_names`` (AST-level variable identifiers, excluding filter
+    and global names) are candidates for renaming.  Names absent from
+    ``mapping`` are left untouched.
+
+    The substitution is a single non-recursive pass: every ``${...}``
+    expression in ``value`` is processed once and the result is not
+    re-scanned.  This means that if ``mapping`` contains ``{"a": "b",
+    "b": "c"}``, an expression ``${a}`` is rewritten to ``${b}`` -- never
+    to ``${c}`` -- guaranteeing no double-application.
+
+    Identifiers are matched at word boundaries so that, for example, renaming
+    ``root`` does not affect ``rootDir``.  Filter and global names (e.g.
+    ``floor_day``, ``timedelta``) are excluded by ``extract_glyph_names`` and
+    are therefore never touched.
+
+    Returns ``value`` unchanged when ``mapping`` is empty, when ``value``
+    contains no ``${...}`` expressions, or when no referenced name is a key
+    in ``mapping``.  Malformed expressions are also returned unchanged.
+    """
+    if not mapping or "${" not in value:
+        return value
+
+    names_result = extract_glyph_names(value)
+    if names_result.e is not None:
+        return value
+
+    referenced: set[str] = names_result.t  # type: ignore[assignment]
+    to_rename = {n: mapping[n] for n in referenced if n in mapping}
+    if not to_rename:
+        return value
+
+    # Build a pattern that matches any of the names to rename as whole words,
+    # sorted longest-first to avoid prefix-match ambiguity in alternation.
+    sorted_names: list[str] = sorted(to_rename.keys(), key=lambda n: len(n), reverse=True)
+    names_pattern = "|".join(re.escape(n) for n in sorted_names)
+    ident_re = re.compile(rf"\b({names_pattern})\b")
+
+    def _replace_in_expr(m: re.Match) -> str:  # type: ignore[type-arg]
+        renamed_body = ident_re.sub(lambda nm: to_rename[nm.group(0)], m.group(1))
+        return "${" + renamed_body + "}"
+
+    return _EXPR_RE.sub(_replace_in_expr, value)

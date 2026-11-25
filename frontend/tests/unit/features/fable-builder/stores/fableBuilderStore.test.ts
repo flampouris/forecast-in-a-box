@@ -10,12 +10,14 @@
 
 import { beforeEach, describe, expect, it } from 'vitest'
 import { act, renderHook } from '@testing-library/react'
-import type { BlockFactory, FableBuilderV1 } from '@/api/types/fable.types'
+import type {
+  BlockFactory,
+  FableBuilderV1,
+  FableValidationState,
+} from '@/api/types/fable.types'
 import {
-  useBlockCount,
   useFableBuilderStore,
   useHasBlocks,
-  useIsValid,
 } from '@/features/fable-builder/stores/fableBuilderStore'
 import { createEmptyFable } from '@/api/types/fable.types'
 
@@ -54,6 +56,19 @@ const mockFable: FableBuilderV1 = {
   },
 }
 
+function makeValidationState(
+  blockStates: FableValidationState['blockStates'] = {},
+): FableValidationState {
+  return {
+    isValid: true,
+    globalErrors: [],
+    blockStates,
+    possibleSources: [],
+    resolvedConfigurationOptions: {},
+    blockOutputQubes: {},
+  }
+}
+
 describe('useFableBuilderStore', () => {
   beforeEach(() => {
     act(() => useFableBuilderStore.getState().reset())
@@ -69,14 +84,9 @@ describe('useFableBuilderStore', () => {
       expect(useFableBuilderStore.getState().fableId).toBeNull()
     })
 
-    it('has default fableName', () => {
-      expect(useFableBuilderStore.getState().fableName).toBe(
-        'Untitled Configuration',
-      )
-    })
-
-    it('has graph mode by default', () => {
-      expect(useFableBuilderStore.getState().mode).toBe('graph')
+    it('has an empty default fableName', () => {
+      // Blank by default; the UI renders a translated placeholder instead.
+      expect(useFableBuilderStore.getState().fableName).toBe('')
     })
 
     it('has edit step by default', () => {
@@ -89,6 +99,32 @@ describe('useFableBuilderStore', () => {
 
     it('is not dirty initially', () => {
       expect(useFableBuilderStore.getState().isDirty).toBe(false)
+    })
+
+    it('has no hovered edge initially', () => {
+      expect(useFableBuilderStore.getState().hoveredEdgeId).toBeNull()
+    })
+  })
+
+  describe('setHoveredEdge', () => {
+    it('sets and clears the hovered edge', () => {
+      act(() => useFableBuilderStore.getState().setHoveredEdge('a-b-dataset'))
+      expect(useFableBuilderStore.getState().hoveredEdgeId).toBe('a-b-dataset')
+      act(() => useFableBuilderStore.getState().setHoveredEdge(null))
+      expect(useFableBuilderStore.getState().hoveredEdgeId).toBeNull()
+    })
+
+    it('is pure ephemeral UI: no effect on selection, dirty flag or validation', () => {
+      act(() =>
+        useFableBuilderStore
+          .getState()
+          .setValidationState(makeValidationState()),
+      )
+      act(() => useFableBuilderStore.getState().setHoveredEdge('a-b-dataset'))
+      const state = useFableBuilderStore.getState()
+      expect(state.selectedBlockId).toBeNull()
+      expect(state.isDirty).toBe(false)
+      expect(state.validationState).not.toBeNull()
     })
   })
 
@@ -119,6 +155,7 @@ describe('useFableBuilderStore', () => {
           blockStates: {},
           possibleSources: [],
           resolvedConfigurationOptions: {},
+          blockOutputQubes: {},
         }),
       )
       act(() => useFableBuilderStore.getState().setFable(mockFable))
@@ -126,7 +163,7 @@ describe('useFableBuilderStore', () => {
     })
 
     it('resets isDirty to false', () => {
-      act(() => useFableBuilderStore.getState().markDirty())
+      act(() => useFableBuilderStore.setState({ isDirty: true }))
       act(() => useFableBuilderStore.getState().setFable(mockFable))
       expect(useFableBuilderStore.getState().isDirty).toBe(false)
     })
@@ -149,12 +186,6 @@ describe('useFableBuilderStore', () => {
       act(() => useFableBuilderStore.getState().setFable(mockFable))
       act(() => useFableBuilderStore.getState().newFable())
       expect(useFableBuilderStore.getState().fable).toEqual(createEmptyFable())
-    })
-
-    it('preserves mode setting', () => {
-      act(() => useFableBuilderStore.getState().setMode('form'))
-      act(() => useFableBuilderStore.getState().newFable())
-      expect(useFableBuilderStore.getState().mode).toBe('form')
     })
   })
 
@@ -644,6 +675,97 @@ describe('useFableBuilderStore', () => {
           .new_input,
       ).toBe('block-1')
     })
+
+    it('replaces stale restrictions when reconnecting to an unrestricted source', () => {
+      const fable: FableBuilderV1 = {
+        blocks: {
+          restricted: {
+            factory_id: {
+              plugin: { store: 'ecmwf', local: 'test' },
+              factory: 'source',
+            },
+            configuration_values: {},
+            input_ids: {},
+          },
+          unrestricted: {
+            factory_id: {
+              plugin: { store: 'ecmwf', local: 'test' },
+              factory: 'source',
+            },
+            configuration_values: {},
+            input_ids: {},
+          },
+          target: {
+            factory_id: {
+              plugin: { store: 'ecmwf', local: 'test' },
+              factory: 'transform',
+            },
+            configuration_values: {},
+            input_ids: {},
+          },
+        },
+      }
+
+      act(() => useFableBuilderStore.getState().setFable(fable))
+      act(() =>
+        useFableBuilderStore.getState().setValidationState(
+          makeValidationState({
+            restricted: {
+              errors: [],
+              hasErrors: false,
+              possibleExpansions: [],
+              possibleExpansionRestrictions: {
+                'ecmwf/test:transform': {
+                  param: 'list[enumClosed[str](2t,msl)]',
+                },
+              },
+              configurationRestrictions: {},
+              missingGlyphs: {},
+            },
+            unrestricted: {
+              errors: [],
+              hasErrors: false,
+              possibleExpansions: [],
+              possibleExpansionRestrictions: {},
+              configurationRestrictions: {},
+              missingGlyphs: {},
+            },
+          }),
+        ),
+      )
+      act(() =>
+        useFableBuilderStore
+          .getState()
+          .connectBlocks('target', 'input', 'restricted'),
+      )
+      expect(
+        useFableBuilderStore.getState().blockConfigurationRestrictions.target,
+      ).toEqual({ param: 'list[enumClosed[str](2t,msl)]' })
+
+      act(() =>
+        useFableBuilderStore.getState().setValidationState(
+          makeValidationState({
+            unrestricted: {
+              errors: [],
+              hasErrors: false,
+              possibleExpansions: [],
+              possibleExpansionRestrictions: {},
+              configurationRestrictions: {},
+              missingGlyphs: {},
+            },
+          }),
+        ),
+      )
+      act(() =>
+        useFableBuilderStore
+          .getState()
+          .connectBlocks('target', 'input', 'unrestricted'),
+      )
+
+      expect(
+        useFableBuilderStore.getState().blockConfigurationRestrictions.target,
+      ).toBeUndefined()
+    })
   })
 
   describe('disconnectBlock', () => {
@@ -682,12 +804,7 @@ describe('useFableBuilderStore', () => {
     })
   })
 
-  describe('mode controls', () => {
-    it('sets mode', () => {
-      act(() => useFableBuilderStore.getState().setMode('form'))
-      expect(useFableBuilderStore.getState().mode).toBe('form')
-    })
-
+  describe('step controls', () => {
     it('sets step', () => {
       act(() => useFableBuilderStore.getState().setStep('review'))
       expect(useFableBuilderStore.getState().step).toBe('review')
@@ -708,13 +825,9 @@ describe('useFableBuilderStore', () => {
 
   describe('validation', () => {
     it('sets validation state', () => {
-      const validationState = {
-        isValid: false,
-        globalErrors: ['Missing required block'],
-        blockStates: {},
-        possibleSources: [],
-        resolvedConfigurationOptions: {},
-      }
+      const validationState = makeValidationState()
+      validationState.isValid = false
+      validationState.globalErrors = ['Missing required block']
       act(() =>
         useFableBuilderStore.getState().setValidationState(validationState),
       )
@@ -726,18 +839,34 @@ describe('useFableBuilderStore', () => {
     it('sets lastValidatedAt when setting validation state', () => {
       const before = Date.now()
       act(() =>
-        useFableBuilderStore.getState().setValidationState({
-          isValid: true,
-          globalErrors: [],
-          blockStates: {},
-          possibleSources: [],
-          resolvedConfigurationOptions: {},
-        }),
+        useFableBuilderStore
+          .getState()
+          .setValidationState(makeValidationState()),
       )
       const after = Date.now()
       const lastValidatedAt = useFableBuilderStore.getState().lastValidatedAt
       expect(lastValidatedAt).toBeGreaterThanOrEqual(before)
       expect(lastValidatedAt).toBeLessThanOrEqual(after)
+    })
+
+    it('clears pending configuration restrictions when fresh validation arrives', () => {
+      act(() =>
+        useFableBuilderStore
+          .getState()
+          .setBlockConfigurationRestrictions('block-2', {
+            param: 'list[enumClosed[str](2t,msl)]',
+          }),
+      )
+
+      act(() =>
+        useFableBuilderStore
+          .getState()
+          .setValidationState(makeValidationState()),
+      )
+
+      expect(
+        useFableBuilderStore.getState().blockConfigurationRestrictions,
+      ).toEqual({})
     })
 
     it('sets isValidating', () => {
@@ -748,16 +877,11 @@ describe('useFableBuilderStore', () => {
 
   describe('save state', () => {
     it('markSaved sets fableId, fableVersion, and isDirty', () => {
-      act(() => useFableBuilderStore.getState().markDirty())
+      act(() => useFableBuilderStore.setState({ isDirty: true }))
       act(() => useFableBuilderStore.getState().markSaved('saved-id-123', 1))
       expect(useFableBuilderStore.getState().fableId).toBe('saved-id-123')
       expect(useFableBuilderStore.getState().fableVersion).toBe(1)
       expect(useFableBuilderStore.getState().isDirty).toBe(false)
-    })
-
-    it('markDirty sets isDirty', () => {
-      act(() => useFableBuilderStore.getState().markDirty())
-      expect(useFableBuilderStore.getState().isDirty).toBe(true)
     })
 
     it('markSubmitted clears isDirty and bumps lastSavedAt without touching fableId/version', () => {
@@ -785,34 +909,180 @@ describe('useFableBuilderStore', () => {
       act(() =>
         useFableBuilderStore.getState().setFable(mockFable, 'fable-123'),
       )
-      act(() => useFableBuilderStore.getState().setMode('form'))
       act(() => useFableBuilderStore.getState().reset())
 
       const state = useFableBuilderStore.getState()
       expect(state.fable).toEqual(createEmptyFable())
       expect(state.fableId).toBeNull()
-      expect(state.mode).toBe('graph')
       expect(state.isDirty).toBe(false)
     })
+  })
+})
+
+describe('undo/redo', () => {
+  beforeEach(() => {
+    act(() => useFableBuilderStore.getState().reset())
+  })
+
+  const factoryId = {
+    plugin: { store: 'ecmwf', local: 'test' },
+    factory: 'source',
+  }
+
+  it('starts with empty history', () => {
+    const s = useFableBuilderStore.getState()
+    expect(s.past).toEqual([])
+    expect(s.future).toEqual([])
+  })
+
+  it('undo restores the pre-mutation fable', () => {
+    const before = useFableBuilderStore.getState().fable
+    act(() => {
+      useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    act(() => useFableBuilderStore.getState().undo())
+    expect(useFableBuilderStore.getState().fable).toEqual(before)
+  })
+
+  it('redo replays the undone mutation', () => {
+    let added = ''
+    act(() => {
+      added = useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    const afterAdd = useFableBuilderStore.getState().fable
+    act(() => useFableBuilderStore.getState().undo())
+    act(() => useFableBuilderStore.getState().redo())
+    expect(useFableBuilderStore.getState().fable).toEqual(afterAdd)
+    expect(useFableBuilderStore.getState().fable.blocks[added]).toBeDefined()
+  })
+
+  it('clears future on a fresh edit after undo', () => {
+    act(() => {
+      useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    act(() => useFableBuilderStore.getState().undo())
+    expect(useFableBuilderStore.getState().future.length).toBe(1)
+    act(() => {
+      useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    expect(useFableBuilderStore.getState().future).toEqual([])
+  })
+
+  it('coalesces same-key config edits into a single undo step', () => {
+    let blockId = ''
+    act(() => {
+      blockId = useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    // The addBlock push leaves past.length === 1. Subsequent same-key typing
+    // should not grow past — it collapses into the original snapshot.
+    const pastAfterAdd = useFableBuilderStore.getState().past.length
+    act(() => {
+      useFableBuilderStore.getState().updateBlockConfig(blockId, 'param1', 'a')
+    })
+    act(() => {
+      useFableBuilderStore.getState().updateBlockConfig(blockId, 'param1', 'ab')
+    })
+    act(() => {
+      useFableBuilderStore
+        .getState()
+        .updateBlockConfig(blockId, 'param1', 'abc')
+    })
+    // First typing keystroke pushes once; the next two coalesce.
+    expect(useFableBuilderStore.getState().past.length).toBe(pastAfterAdd + 1)
+    // Undoing returns to the empty-value state (the snapshot taken before
+    // the first keystroke), not to the in-between values.
+    act(() => useFableBuilderStore.getState().undo())
+    expect(
+      useFableBuilderStore.getState().fable.blocks[blockId].configuration_values
+        .param1,
+    ).toBe('')
+  })
+
+  it('does not coalesce edits to different keys', () => {
+    let blockId = ''
+    act(() => {
+      blockId = useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    const base = useFableBuilderStore.getState().past.length
+    act(() => {
+      useFableBuilderStore.getState().updateBlockConfig(blockId, 'param1', 'x')
+    })
+    act(() => {
+      useFableBuilderStore.getState().updateBlockConfig(blockId, 'param2', 'y')
+    })
+    // Different coalesce keys → both push.
+    expect(useFableBuilderStore.getState().past.length).toBe(base + 2)
+  })
+
+  it('bounds the history at MAX_HISTORY entries', () => {
+    // MAX_HISTORY is 100 in the store; push 120 distinct edits and confirm
+    // the stack stays capped while preserving the most recent snapshots.
+    for (let i = 0; i < 120; i++) {
+      act(() => {
+        useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+      })
+    }
+    expect(useFableBuilderStore.getState().past.length).toBe(100)
+  })
+
+  it('setFable clears the entire history', () => {
+    act(() => {
+      useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    act(() => useFableBuilderStore.getState().undo())
+    expect(useFableBuilderStore.getState().future.length).toBe(1)
+    act(() => useFableBuilderStore.getState().setFable(mockFable))
+    expect(useFableBuilderStore.getState().past).toEqual([])
+    expect(useFableBuilderStore.getState().future).toEqual([])
+  })
+
+  it('undo with an empty past is a no-op', () => {
+    const before = useFableBuilderStore.getState().fable
+    act(() => useFableBuilderStore.getState().undo())
+    expect(useFableBuilderStore.getState().fable).toBe(before)
+  })
+
+  it('redo with an empty future is a no-op', () => {
+    act(() => {
+      useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    const after = useFableBuilderStore.getState().fable
+    act(() => useFableBuilderStore.getState().redo())
+    expect(useFableBuilderStore.getState().fable).toBe(after)
+  })
+
+  it('history transactions collapse a multi-action UI flow to one undo step', () => {
+    let blockId = ''
+    // Mirror what a drag-drop or popover-add does: add + connect inside one
+    // transaction. Both pushHistory calls coalesce; only one snapshot lands.
+    act(() => {
+      useFableBuilderStore.getState().beginHistoryTransaction()
+      blockId = useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+      useFableBuilderStore.getState().connectBlocks(blockId, 'in', blockId)
+      useFableBuilderStore.getState().endHistoryTransaction()
+    })
+    expect(useFableBuilderStore.getState().past.length).toBe(1)
+    act(() => useFableBuilderStore.getState().undo())
+    // One undo wipes the whole transaction — no orphaned node, no stray edges.
+    expect(
+      useFableBuilderStore.getState().fable.blocks[blockId],
+    ).toBeUndefined()
+  })
+
+  it('clears selectedBlockId on undo when the selected block disappears', () => {
+    let blockId = ''
+    act(() => {
+      blockId = useFableBuilderStore.getState().addBlock(factoryId, mockFactory)
+    })
+    expect(useFableBuilderStore.getState().selectedBlockId).toBe(blockId)
+    act(() => useFableBuilderStore.getState().undo())
+    expect(useFableBuilderStore.getState().selectedBlockId).toBeNull()
   })
 })
 
 describe('selector hooks', () => {
   beforeEach(() => {
     act(() => useFableBuilderStore.getState().reset())
-  })
-
-  describe('useBlockCount', () => {
-    it('returns 0 for empty fable', () => {
-      const { result } = renderHook(() => useBlockCount())
-      expect(result.current).toBe(0)
-    })
-
-    it('returns correct count', () => {
-      act(() => useFableBuilderStore.getState().setFable(mockFable))
-      const { result } = renderHook(() => useBlockCount())
-      expect(result.current).toBe(2)
-    })
   })
 
   describe('useHasBlocks', () => {
@@ -825,41 +1095,6 @@ describe('selector hooks', () => {
       act(() => useFableBuilderStore.getState().setFable(mockFable))
       const { result } = renderHook(() => useHasBlocks())
       expect(result.current).toBe(true)
-    })
-  })
-
-  describe('useIsValid', () => {
-    it('returns false when no validation state', () => {
-      const { result } = renderHook(() => useIsValid())
-      expect(result.current).toBe(false)
-    })
-
-    it('returns true when valid', () => {
-      act(() =>
-        useFableBuilderStore.getState().setValidationState({
-          isValid: true,
-          globalErrors: [],
-          blockStates: {},
-          possibleSources: [],
-          resolvedConfigurationOptions: {},
-        }),
-      )
-      const { result } = renderHook(() => useIsValid())
-      expect(result.current).toBe(true)
-    })
-
-    it('returns false when invalid', () => {
-      act(() =>
-        useFableBuilderStore.getState().setValidationState({
-          isValid: false,
-          globalErrors: ['Error'],
-          blockStates: {},
-          possibleSources: [],
-          resolvedConfigurationOptions: {},
-        }),
-      )
-      const { result } = renderHook(() => useIsValid())
-      expect(result.current).toBe(false)
     })
   })
 })

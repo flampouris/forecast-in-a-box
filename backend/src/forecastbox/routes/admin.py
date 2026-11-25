@@ -10,7 +10,7 @@
 """
 Admin routes — /admin/*. Corresponds to the `domain.admin` submodule.
 
-Contains many varied utility routes related to user management, releases, versioning.
+Contains many varied utility routes related to user management, releases, versioning, and triggering the periodic database maintenance.
 """
 
 import logging
@@ -25,11 +25,13 @@ from pydantic import UUID4
 from forecastbox.domain.admin import Release, get_local_release, get_most_recent_release, get_pylock, mark_release, save_pylock
 from forecastbox.domain.auth.db import delete_user_by_id, get_user_by_id, list_users, patch_user_by_id, update_user_by_id
 from forecastbox.domain.auth.users import UserRead, UserUpdate, current_active_user
-from forecastbox.utility.config import BackendAPISettings, CascadeSettings, ProductSettings, config
+from forecastbox.domain.maintenance.exceptions import CleanupNotRunning
+from forecastbox.domain.maintenance.garbage_collector import trigger_cleanup
+from forecastbox.utility.config import ROUTE_PREFIX, BackendSettings, CascadeSettings, ExternalServicesSettings, config
 from forecastbox.utility.pydantic import FiabBaseModel
 from forecastbox.utility.rsjf import ExportedSchemas, FormDefinition, from_pydantic
 
-PREFIX = "/api/v1/admin"
+PREFIX = f"{ROUTE_PREFIX}/admin"
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +54,9 @@ router = APIRouter(
 class ExposedSettings(FiabBaseModel):
     """Exposed settings for modification"""
 
-    product: ProductSettings = config.product
+    external: ExternalServicesSettings = config.external
 
-    api: BackendAPISettings = config.api
+    backend: BackendSettings = config.backend
     cascade: CascadeSettings = config.cascade
 
     def to_rjsf(self) -> FormDefinition:
@@ -93,9 +95,10 @@ async def get_release_status(admin: UserRead | None = Depends(get_admin_user)) -
     )
 
 
-@router.post("/release", response_model=UpdateReleaseResponse)
+# TODO rework to rely solely on `fiab.sh upgrade` -- this neither replaces the launcher nor checks the upgrade scope
+@router.post("/release", response_model=UpdateReleaseResponse, deprecated=True)
 async def update_release(tag: str | None = None, admin: UserRead | None = Depends(get_admin_user)) -> UpdateReleaseResponse:
-    """Update release"""
+    """Update release. Deprecated, use `fiab.sh upgrade` instead"""
     if tag:
         release = Release.from_string(tag)
     else:
@@ -126,8 +129,8 @@ async def update_settings(settings: ExposedSettings, admin: UserRead | None = De
             setattr(old, key, val)
 
     try:
-        update(config.api, settings.api)
-        update(config.product, settings.product)
+        update(config.backend, settings.backend)
+        update(config.external, settings.external)
         update(config.cascade, settings.cascade)
     except Exception as e:
         return HTMLResponse(content=str(e), status_code=500)
@@ -176,9 +179,13 @@ async def update_user(user_id: UUID4, user_data: UserUpdate, admin: UserRead | N
 
 
 @router.patch("/users/{user_id}", response_class=HTMLResponse)
-async def patch_user(user_id: UUID4, update_dict: dict, admin: UserRead = Depends(get_admin_user)) -> HTMLResponse:
-    """Patch a user by ID"""
-    await patch_user_by_id(user_id, update_dict)
+async def patch_user(user_id: UUID4, user_data: UserUpdate, admin: UserRead = Depends(get_admin_user)) -> HTMLResponse:
+    """Patch a user by ID. Only the fields of `UserUpdate` that are set are applied."""
+    update_dict = user_data.model_dump(exclude_unset=True, exclude_none=True)
+    if "password" in update_dict:
+        raise HTTPException(status_code=404, detail="Password update not supported")
+    if update_dict:
+        await patch_user_by_id(user_id, update_dict)
     return HTMLResponse(content="User updated successfully", status_code=200)
 
 
@@ -200,3 +207,14 @@ config_response = ConfigResponse(
 async def get_ui_config() -> ConfigResponse:
     """Config for the frontend to properly configure itself. Contains no internal or sensitive data"""
     return config_response
+
+
+@router.post("/triggerCleanup")
+async def trigger_cleanup_endpoint(admin: UserRead | None = Depends(get_admin_user)) -> None:
+    """Wake the periodic database maintenance thread to run now. Returns once the run is
+    requested, not when it completes; observe completion in GET /status under
+    concurrency.threads.database-garbage-collector. Requires admin access."""
+    try:
+        trigger_cleanup()
+    except CleanupNotRunning as e:
+        raise HTTPException(status_code=409, detail=str(e))

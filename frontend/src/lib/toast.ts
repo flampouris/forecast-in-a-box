@@ -9,9 +9,11 @@
  */
 
 import { toast } from 'sonner'
+import i18n from 'i18next'
 
 /**
- * Toast notification utilities for user-facing messages.
+ * Toast notification utilities for user-facing messages; an `id` replaces
+ * rather than stacks a toast with the same id.
  *
  * Usage:
  * ```ts
@@ -26,37 +28,46 @@ export const showToast = {
   /**
    * Show a success toast notification.
    */
-  success: (message: string, description?: string) =>
-    toast.success(message, { description }),
+  success: (message: string, description?: string, id?: string) =>
+    toast.success(message, { description, id }),
+
+  /**
+   * Show a success toast with one action button, e.g. Undo.
+   */
+  successWithAction: (
+    message: string,
+    description: string | undefined,
+    action: { label: string; onClick: () => void },
+  ) => toast.success(message, { description, action }),
 
   /**
    * Show an error toast notification.
    */
-  error: (message: string, description?: string) =>
-    toast.error(message, { description }),
+  error: (message: string, description?: string, id?: string) =>
+    toast.error(message, { description, id }),
 
   /**
    * Show a warning toast notification.
    */
-  warning: (message: string, description?: string) =>
-    toast.warning(message, { description }),
+  warning: (message: string, description?: string, id?: string) =>
+    toast.warning(message, { description, id }),
 
   /**
    * Show an info toast notification.
    */
-  info: (message: string, description?: string) =>
-    toast.info(message, { description }),
+  info: (message: string, description?: string, id?: string) =>
+    toast.info(message, { description, id }),
 
   /**
    * Show an API error toast with optional retry action.
    * Extracts message from Error object and optionally provides a retry button.
    */
   apiError: (error: Error, options?: { retry?: () => void }) => {
-    const message = error.message || 'An error occurred'
+    const message = error.message || i18n.t('errors:occurred')
     if (options?.retry) {
       toast.error(message, {
         action: {
-          label: 'Retry',
+          label: i18n.t('common:retry'),
           onClick: options.retry,
         },
       })

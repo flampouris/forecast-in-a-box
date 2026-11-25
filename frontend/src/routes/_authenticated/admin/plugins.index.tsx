@@ -8,42 +8,55 @@
  * does it submit to any jurisdiction.
  */
 
-/**
- * Plugins List Page Route
- *
- * Plugin Store page for browsing, installing, and managing FIAB plugins.
- */
+/** One plugin catalogue; status is a filter, so items never move. */
 
 import { useMemo, useState } from 'react'
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { AlertCircle } from 'lucide-react'
+import { AlertCircle, Puzzle, RefreshCw } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
-import type { PluginCompositeId, PluginInfo } from '@/api/types/plugins.types'
 import type {
-  CapabilityFilter,
-  StatusFilter,
-} from '@/features/plugins/components/PluginsFilters'
+  PluginBadgeKind,
+  PluginCapability,
+  PluginCompositeId,
+  PluginInfo,
+} from '@/api/types/plugins.types'
+import type { SortOption } from '@/components/common/catalogue/useStableOrder'
 import { useBlockCatalogue } from '@/api/hooks/useFable'
 import {
   useDisablePlugin,
   useEnablePlugin,
   useInstallPlugin,
+  usePluginOperations,
   usePlugins,
   useRefreshPlugins,
   useUninstallPlugin,
   useUpdatePlugin,
 } from '@/api/hooks/usePlugins'
 import { useStatus } from '@/api/hooks/useStatus'
-import { encodePluginId } from '@/api/types/plugins.types'
-import { H3 } from '@/components/base/typography'
+import { encodePluginId, pluginBadgeKind } from '@/api/types/plugins.types'
+import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/common/EmptyState'
+import { ListPageContainer } from '@/components/common/ListPageContainer'
 import { LoadingSpinner } from '@/components/common/LoadingSpinner'
+import { PageHeader } from '@/components/common/PageHeader'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { PluginsFilters } from '@/features/plugins/components/PluginsFilters'
-import { PluginsList } from '@/features/plugins/components/PluginsList'
-import { PluginsPageHeader } from '@/features/plugins/components/PluginsPageHeader'
-import { UninstalledPluginsSection } from '@/features/plugins/components/UninstalledPluginsSection'
-import { UpdatesAvailableSection } from '@/features/plugins/components/UpdatesAvailableSection'
-import { cn } from '@/lib/utils'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { CatalogueToolbar } from '@/components/common/catalogue/CatalogueToolbar'
+import { CatalogueView } from '@/components/common/catalogue/CatalogueView'
+import { useHeldKeys } from '@/components/common/catalogue/useHeldKeys'
+import {
+  resolveCatalogueSort,
+  useStableOrder,
+} from '@/components/common/catalogue/useStableOrder'
+import { PluginCard } from '@/features/plugins/components/PluginCard'
+import { PluginRow } from '@/features/plugins/components/PluginRow'
+import { pluginFailureDescription } from '@/features/plugins/utils/plugin-activity'
 import { useActivityStore } from '@/stores/activityStore'
 import { useUiStore } from '@/stores/uiStore'
 import { getPluginStatusError } from '@/types/status.types'
@@ -52,124 +65,131 @@ export const Route = createFileRoute('/_authenticated/admin/plugins/')({
   component: PluginsPage,
 })
 
-function PluginsPage() {
-  const { t } = useTranslation('plugins')
-  const navigate = useNavigate()
-  const layoutMode = useUiStore((state) => state.layoutMode)
-  const dashboardVariant = useUiStore((state) => state.dashboardVariant)
-  const panelShadow = useUiStore((state) => state.panelShadow)
-  const pluginsViewMode = useUiStore((state) => state.pluginsViewMode)
+type PluginFilter = 'all' | 'installed' | 'updates' | 'available'
+type CapabilityFilter = 'all' | PluginCapability
 
-  // Filter state
+const CAPABILITIES: Array<PluginCapability> = [
+  'source',
+  'transform',
+  'product',
+  'sink',
+]
+
+const GRID =
+  'sm:grid-cols-[minmax(0,1fr)_9rem_15rem] lg:grid-cols-[minmax(0,1fr)_8rem_9rem_15rem] xl:grid-cols-[minmax(0,1fr)_8rem_9rem_19rem]'
+
+const pluginKey = (p: PluginInfo) => `${p.id.store}/${p.id.local}`
+
+function matchesFilter(plugin: PluginInfo, filter: PluginFilter) {
+  switch (filter) {
+    case 'all':
+      return true
+    case 'installed':
+      return plugin.isInstalled
+    case 'updates':
+      return plugin.hasUpdate
+    case 'available':
+      return !plugin.isInstalled
+  }
+}
+
+const byName = (a: PluginInfo, b: PluginInfo) => a.name.localeCompare(b.name)
+
+// Needs attention first when sorting by status.
+const STATUS_RANK: Record<PluginBadgeKind, number> = {
+  errored: 0,
+  warning: 1,
+  update: 2,
+  loaded: 3,
+  disabled: 4,
+  available: 5,
+}
+
+const updatedTime = (p: PluginInfo) =>
+  p.updatedAt ? new Date(p.updatedAt).getTime() : 0
+
+function PluginsPage() {
+  const { t } = useTranslation(['plugins', 'common'])
+  const navigate = useNavigate()
+  const viewMode = useUiStore((state) => state.pluginsViewMode)
+  const setViewMode = useUiStore((state) => state.setPluginsViewMode)
+  const storedSort = useUiStore((state) => state.pluginsSort)
+  const setStoredSort = useUiStore((state) => state.setPluginsSort)
+
   const [searchQuery, setSearchQuery] = useState('')
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [filter, setFilter] = useState<PluginFilter>('all')
   const [capabilityFilter, setCapabilityFilter] =
     useState<CapabilityFilter>('all')
 
-  // Check plugin system status for errors
   const { status: systemStatus } = useStatus()
   const pluginStatusError = systemStatus
     ? getPluginStatusError(systemStatus.plugins)
     : null
 
-  // Fetch catalogue to derive capabilities
   const { data: catalogue } = useBlockCatalogue()
-
-  // Queries - pass catalogue to derive capabilities
   const { plugins, isLoading } = usePlugins(catalogue)
 
-  // Mutations
   const installPlugin = useInstallPlugin()
   const uninstallPlugin = useUninstallPlugin()
   const enablePlugin = useEnablePlugin()
   const disablePlugin = useDisablePlugin()
   const updatePlugin = useUpdatePlugin()
   const refreshPlugins = useRefreshPlugins()
+  const operations = usePluginOperations()
 
-  // Separate plugins by status
-  const {
-    pluginsWithUpdates,
-    installedPlugins,
-    availablePlugins,
-    showAvailableOnly,
-  } = useMemo(() => {
-    if (plugins.length === 0) {
-      return {
-        pluginsWithUpdates: [],
-        installedPlugins: [],
-        availablePlugins: [],
-        showAvailableOnly: false,
-      }
-    }
-
-    // Shared filters applied to both available and installed lists
-    const matchesCapability = (p: PluginInfo) =>
-      capabilityFilter === 'all' || p.capabilities.includes(capabilityFilter)
-
+  const searched = useMemo(() => {
     const query = searchQuery.trim().toLowerCase()
-    const matchesSearch = (p: PluginInfo) =>
-      !query ||
-      p.name.toLowerCase().includes(query) ||
-      p.displayId.toLowerCase().includes(query) ||
-      p.author.toLowerCase().includes(query) ||
-      p.description.toLowerCase().includes(query)
+    return plugins
+      .filter(
+        (p) =>
+          capabilityFilter === 'all' ||
+          p.capabilities.includes(capabilityFilter),
+      )
+      .filter(
+        (p) =>
+          !query ||
+          p.name.toLowerCase().includes(query) ||
+          p.displayId.toLowerCase().includes(query) ||
+          p.author.toLowerCase().includes(query) ||
+          p.description.toLowerCase().includes(query),
+      )
+  }, [plugins, searchQuery, capabilityFilter])
 
-    // Check if filtering for available only
-    const filteringAvailable = statusFilter === 'available'
+  const sortOptions: Array<SortOption<PluginInfo>> = [
+    { key: 'name', label: t('table.headers.plugin'), compare: byName },
+    {
+      key: 'updated',
+      label: t('table.headers.updated'),
+      compare: (a, b) => updatedTime(a) - updatedTime(b),
+      defaultDir: 'desc',
+    },
+    {
+      key: 'status',
+      label: t('table.headers.status'),
+      compare: (a, b) =>
+        STATUS_RANK[pluginBadgeKind(a)] - STATUS_RANK[pluginBadgeKind(b)],
+    },
+  ]
+  const sorting = resolveCatalogueSort(
+    sortOptions,
+    storedSort,
+    setStoredSort,
+    byName,
+  )
 
-    // Get available plugins (not installed)
-    const available = plugins
-      .filter((p) => p.status === 'available')
-      .filter(matchesCapability)
-      .filter(matchesSearch)
+  // Only user actions re-sort or release held items.
+  const viewKey = `${filter}|${capabilityFilter}|${searchQuery}|${sorting.sort.key}|${sorting.sort.dir}`
+  const held = useHeldKeys([...operations.keys()], viewKey)
+  const visible = useStableOrder(
+    searched.filter((p) => matchesFilter(p, filter) || held.has(pluginKey(p))),
+    pluginKey,
+    sorting.compare,
+    viewKey,
+  )
+  const count = (f: PluginFilter) =>
+    searched.filter((p) => matchesFilter(p, f)).length
 
-    let filteredPlugins = plugins.filter((p) => p.isInstalled)
-
-    // Apply status filter (for installed plugins only)
-    if (statusFilter !== 'all' && statusFilter !== 'available') {
-      if (statusFilter === 'hasUpdate') {
-        filteredPlugins = filteredPlugins.filter((p) => p.hasUpdate)
-      } else {
-        filteredPlugins = filteredPlugins.filter(
-          (p) => p.status === statusFilter,
-        )
-      }
-    }
-
-    filteredPlugins = filteredPlugins
-      .filter(matchesCapability)
-      .filter(matchesSearch)
-
-    // Separate updates
-    const withUpdates = filteredPlugins.filter((p) => p.hasUpdate)
-    const installed = filteredPlugins.filter((p) => !p.hasUpdate)
-
-    // Sort: loaded first, then by name
-    installed.sort((a, b) => {
-      if (a.isEnabled !== b.isEnabled) {
-        return a.isEnabled ? -1 : 1
-      }
-      return a.name.localeCompare(b.name)
-    })
-
-    return {
-      pluginsWithUpdates: filteringAvailable ? [] : withUpdates,
-      installedPlugins: filteringAvailable ? [] : installed,
-      availablePlugins: available,
-      showAvailableOnly: filteringAvailable,
-    }
-  }, [plugins, searchQuery, statusFilter, capabilityFilter])
-
-  // Activity tracking for long-running plugin ops
   const addActivity = useActivityStore((state) => state.addTask)
-
-  function getPluginName(compositeId: PluginCompositeId): string {
-    const match = plugins.find(
-      (p) =>
-        p.id.store === compositeId.store && p.id.local === compositeId.local,
-    )
-    return match?.name ?? `${compositeId.store}/${compositeId.local}`
-  }
 
   function trackPluginOp(
     compositeId: PluginCompositeId,
@@ -177,7 +197,11 @@ function PluginsPage() {
     mutation: { mutateAsync: (id: PluginCompositeId) => Promise<void> },
   ) {
     const id = `plugin:${compositeId.store}/${compositeId.local}:${labels.active}`
-    const name = getPluginName(compositeId)
+    const name =
+      plugins.find(
+        (p) =>
+          p.id.store === compositeId.store && p.id.local === compositeId.local,
+      )?.name ?? `${compositeId.store}/${compositeId.local}`
     addActivity({
       id,
       type: 'plugin',
@@ -195,66 +219,54 @@ function PluginsPage() {
           completedAt: Date.now(),
         })
       },
-      () => {
+      (error: unknown) => {
         useActivityStore.getState().updateTask(id, {
           status: 'failed',
-          description: labels.failure,
+          description: pluginFailureDescription(error, labels.failure),
           completedAt: Date.now(),
         })
       },
     )
   }
 
-  // Handlers
-  const handleToggle = (compositeId: PluginCompositeId, enabled: boolean) => {
-    if (enabled) {
-      enablePlugin.mutate(compositeId)
-    } else {
-      disablePlugin.mutate(compositeId)
-    }
-  }
-
-  const handleInstall = (compositeId: PluginCompositeId) => {
-    trackPluginOp(
-      compositeId,
-      {
-        active: 'Installing',
-        success: 'Installed',
-        failure: 'Install failed',
-      },
-      installPlugin,
-    )
-  }
-
-  const handleUninstall = (compositeId: PluginCompositeId) => {
-    trackPluginOp(
-      compositeId,
-      {
-        active: 'Uninstalling',
-        success: 'Uninstalled',
-        failure: 'Uninstall failed',
-      },
-      uninstallPlugin,
-    )
-  }
-
-  const handleUpdate = (compositeId: PluginCompositeId) => {
-    trackPluginOp(
-      compositeId,
-      { active: 'Updating', success: 'Updated', failure: 'Update failed' },
-      updatePlugin,
-    )
-  }
-
-  const handleRefresh = () => {
-    refreshPlugins.mutate()
-  }
-
-  const handleViewDetails = (plugin: PluginInfo) => {
-    navigate({
-      to: '/admin/plugins/$pluginId',
-      params: { pluginId: encodePluginId(plugin.id) },
-    })
+  const handlers = {
+    onToggle: (compositeId: PluginCompositeId, enabled: boolean) =>
+      (enabled ? enablePlugin : disablePlugin).mutate(compositeId),
+    onInstall: (compositeId: PluginCompositeId) =>
+      trackPluginOp(
+        compositeId,
+        {
+          active: t('activity.installing'),
+          success: t('activity.installed'),
+          failure: t('activity.installFailed'),
+        },
+        installPlugin,
+      ),
+    onUninstall: (compositeId: PluginCompositeId) =>
+      trackPluginOp(
+        compositeId,
+        {
+          active: t('activity.uninstalling'),
+          success: t('activity.uninstalled'),
+          failure: t('activity.uninstallFailed'),
+        },
+        uninstallPlugin,
+      ),
+    onUpdate: (compositeId: PluginCompositeId) =>
+      trackPluginOp(
+        compositeId,
+        {
+          active: t('activity.updating'),
+          success: t('activity.updated'),
+          failure: t('activity.updateFailed'),
+        },
+        updatePlugin,
+      ),
+    onViewDetails: (plugin: PluginInfo) =>
+      navigate({
+        to: '/admin/plugins/$pluginId',
+        params: { pluginId: encodePluginId(plugin.id) },
+      }),
   }
 
   if (isLoading) {
@@ -265,20 +277,36 @@ function PluginsPage() {
     )
   }
 
+  const capabilityItems = [
+    { value: 'all', label: t('filters.capability.all') },
+    ...CAPABILITIES.map((c) => ({
+      value: c,
+      label: t(`filters.capability.${c}`),
+    })),
+  ]
+
+  const isFiltered =
+    filter !== 'all' || capabilityFilter !== 'all' || searchQuery.trim() !== ''
+
   return (
-    <div
-      className={cn(
-        'mx-auto space-y-8 px-4 py-8 sm:px-6 lg:px-8',
-        layoutMode === 'boxed' ? 'max-w-7xl' : 'max-w-none',
-      )}
-    >
-      {/* Page Header */}
-      <PluginsPageHeader
-        onCheckUpdates={handleRefresh}
-        isCheckingUpdates={refreshPlugins.isPending}
+    <ListPageContainer>
+      <PageHeader
+        title={t('title')}
+        description={t('subtitle')}
+        actions={
+          <Button
+            variant="outline"
+            onClick={() => refreshPlugins.mutate()}
+            disabled={refreshPlugins.isPending}
+          >
+            <RefreshCw
+              className={`mr-2 h-4 w-4 ${refreshPlugins.isPending ? 'animate-spin' : ''}`}
+            />
+            {t('actions.checkUpdates')}
+          </Button>
+        }
       />
 
-      {/* Plugin System Error Banner */}
       {pluginStatusError && (
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
@@ -287,61 +315,124 @@ function PluginsPage() {
         </Alert>
       )}
 
-      {/* Search & Filters */}
-      <PluginsFilters
-        searchQuery={searchQuery}
-        onSearchChange={setSearchQuery}
-        statusFilter={statusFilter}
-        onStatusFilterChange={setStatusFilter}
-        capabilityFilter={capabilityFilter}
-        onCapabilityFilterChange={setCapabilityFilter}
-      />
+      <div className="flex flex-col gap-4">
+        <CatalogueToolbar
+          segments={[
+            { value: 'all', label: t('filters.all'), count: count('all') },
+            {
+              value: 'installed',
+              label: t('filters.installed'),
+              count: count('installed'),
+            },
+            {
+              value: 'updates',
+              label: t('filters.updates'),
+              count: count('updates'),
+              attention: true,
+            },
+            {
+              value: 'available',
+              label: t('filters.available'),
+              count: count('available'),
+            },
+          ]}
+          segment={filter}
+          onSegmentChange={setFilter}
+          segmentsLabel={t('filters.statusLabel')}
+          searchQuery={searchQuery}
+          onSearchChange={setSearchQuery}
+          searchPlaceholder={t('filters.searchPlaceholder')}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+          sortOptions={sortOptions}
+          sort={sorting.sort}
+          onSortChange={sorting.onSortSelect}
+          onSortDirToggle={sorting.onSortDirToggle}
+        >
+          <Select
+            value={capabilityFilter}
+            onValueChange={(value) =>
+              setCapabilityFilter(value as CapabilityFilter)
+            }
+            items={capabilityItems}
+          >
+            <SelectTrigger
+              className="min-w-40"
+              aria-label={t('filters.capabilityLabel')}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {capabilityItems.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </CatalogueToolbar>
 
-      {/* Updates Available Section */}
-      {!showAvailableOnly && pluginsWithUpdates.length > 0 && (
-        <UpdatesAvailableSection
-          plugins={pluginsWithUpdates}
-          onUpdate={handleUpdate}
+        <CatalogueView
+          items={visible}
+          getKey={pluginKey}
+          viewMode={viewMode}
+          gridClassName={GRID}
+          sort={sorting.sort}
+          onSortChange={sorting.onSortChange}
+          columns={[
+            { label: t('table.headers.plugin'), sortKey: 'name' },
+            {
+              label: t('table.headers.updated'),
+              className: 'hidden lg:block',
+              sortKey: 'updated',
+            },
+            { label: t('table.headers.status'), sortKey: 'status' },
+            { label: t('table.headers.actions'), className: 'text-right' },
+          ]}
+          isHeld={(p) => !matchesFilter(p, filter)}
+          renderCard={(plugin) => (
+            <PluginCard
+              plugin={plugin}
+              operation={operations.get(pluginKey(plugin))}
+              {...handlers}
+            />
+          )}
+          renderRow={(plugin) => (
+            <PluginRow
+              plugin={plugin}
+              operation={operations.get(pluginKey(plugin))}
+              {...handlers}
+            />
+          )}
+          empty={
+            isFiltered ? (
+              <EmptyState
+                icon={Puzzle}
+                title={t('common:catalogue.noMatches')}
+                description={t('common:catalogue.noMatchesHint')}
+                action={
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setFilter('all')
+                      setCapabilityFilter('all')
+                      setSearchQuery('')
+                    }}
+                  >
+                    {t('common:catalogue.clearFilters')}
+                  </Button>
+                }
+              />
+            ) : (
+              <EmptyState
+                icon={Puzzle}
+                title={t('emptyState.noPlugins')}
+                description={t('emptyState.noPluginsDescription')}
+              />
+            )
+          }
         />
-      )}
-
-      {/* Installed Plugins Section */}
-      {!showAvailableOnly && (
-        <div className="flex flex-col gap-4">
-          <div className="flex items-center justify-between px-1">
-            <H3 className="text-sm font-semibold tracking-wider text-muted-foreground uppercase">
-              {t('installedSection.title')}
-            </H3>
-            <span className="font-mono text-sm text-muted-foreground">
-              {t('installedSection.total', { count: installedPlugins.length })}
-            </span>
-          </div>
-
-          <PluginsList
-            plugins={installedPlugins}
-            viewMode={pluginsViewMode}
-            onToggle={handleToggle}
-            onInstall={handleInstall}
-            onUninstall={handleUninstall}
-            onUpdate={handleUpdate}
-            onViewDetails={handleViewDetails}
-            variant={dashboardVariant}
-            shadow={panelShadow}
-          />
-        </div>
-      )}
-
-      {/* Available Plugins Section */}
-      <UninstalledPluginsSection
-        plugins={availablePlugins}
-        onInstall={handleInstall}
-        onViewDetails={handleViewDetails}
-        installingId={
-          installPlugin.isPending ? installPlugin.variables : undefined
-        }
-        variant={dashboardVariant}
-        shadow={panelShadow}
-      />
-    </div>
+      </div>
+    </ListPageContainer>
   )
 }

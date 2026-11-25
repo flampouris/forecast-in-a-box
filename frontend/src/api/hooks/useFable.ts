@@ -25,21 +25,24 @@ import type {
   FableValidationExpansion,
   GlobalGlyphPostRequest,
   GlobalGlyphResponse,
-  GlyphDetail,
   GlyphFunctionsResponse,
   GlyphListResponse,
+  IntrinsicGlyphItem,
   PluginBlockFactoryId,
+  ResolveDisplayResponse,
 } from '@/api/types/fable.types'
+import type { BlueprintListFilters } from '@/api/endpoints/fable'
 import {
   createGlobalGlyph,
   deleteBlueprint,
+  deleteGlobalGlyph,
   expandFable,
   getAvailableGlyphs,
   getCatalogue,
-  getGlobalGlyph,
   listBlueprints,
   listGlobalGlyphs,
   listGlyphFunctions,
+  resolveDisplay,
   retrieveFable,
   updateBlueprint,
   upsertFable,
@@ -51,8 +54,10 @@ import { QUERY_CONSTANTS } from '@/utils/constants'
 export const fableKeys = {
   all: ['fable'] as const,
   catalogue: () => [...fableKeys.all, 'catalogue'] as const,
-  blueprints: (page?: number, pageSize?: number) =>
-    [...fableKeys.all, 'blueprints', page, pageSize] as const,
+  // Prefix shared by every paginated blueprint-list query — invalidate to refresh all of them.
+  blueprintsBase: () => [...fableKeys.all, 'blueprints'] as const,
+  blueprints: (page?: number, pageSize?: number, filters?: object) =>
+    [...fableKeys.all, 'blueprints', page, pageSize, filters ?? null] as const,
   detail: (id: string) => [...fableKeys.all, 'detail', id] as const,
   validation: (fable: FableBuilderV1) =>
     [...fableKeys.all, 'validation', JSON.stringify(fable)] as const,
@@ -62,6 +67,8 @@ export const fableKeys = {
   globalGlyphs: (page?: number, pageSize?: number) =>
     [...fableKeys.all, 'globalGlyphs', page, pageSize] as const,
   globalGlyph: (id: string) => [...fableKeys.all, 'globalGlyph', id] as const,
+  paramLabels: (ids: ReadonlyArray<string>) =>
+    [...fableKeys.all, 'paramLabels', ids.join(',')] as const,
 }
 
 export function useBlockCatalogue(language?: string) {
@@ -91,42 +98,48 @@ export function useBlockCatalogue(language?: string) {
   })
 }
 
-export function useFable(fableId: string | null | undefined) {
-  return useQuery<FableBuilderV1>({
-    queryKey: fableKeys.detail(fableId ?? ''),
-    queryFn: async () => {
-      const response = await retrieveFable(fableId!)
-      return response.builder
-    },
-    enabled: !!fableId,
-    staleTime: 30 * 1000, // 30 seconds
-    // Don't retry 4xx errors (e.g. 404 not found) — only retry server errors
-    retry: (failureCount, error) => {
-      if (error instanceof ApiClientError && error.status && error.status < 500)
-        return false
-      return failureCount < QUERY_CONSTANTS.RETRY.MINIMAL
-    },
-  })
+/** Query key shared by useFable and useFableRetrieve — one request per fable. */
+const fableRetrieveKey = (
+  fableId: string | null | undefined,
+  version?: number,
+) =>
+  version === undefined
+    ? ([...fableKeys.detail(fableId ?? ''), 'full'] as const)
+    : ([...fableKeys.detail(fableId ?? ''), 'full', version] as const)
+
+/** Don't retry 4xx (e.g. 404 not found) — only retry server errors. */
+function retryRetrieve(failureCount: number, error: Error): boolean {
+  if (error instanceof ApiClientError && error.status && error.status < 500)
+    return false
+  return failureCount < QUERY_CONSTANTS.RETRY.MINIMAL
 }
 
-export function useFableRetrieve(fableId: string | null | undefined) {
-  return useQuery<FableRetrieveResponse>({
-    queryKey: [...fableKeys.detail(fableId ?? ''), 'full'],
+/**
+ * Retrieve a fable's builder. Shares one query (and one network request) with
+ * useFableRetrieve via a common query key + `select`.
+ */
+export function useFable(fableId: string | null | undefined) {
+  return useQuery<FableRetrieveResponse, Error, FableBuilderV1>({
+    queryKey: fableRetrieveKey(fableId),
     queryFn: () => retrieveFable(fableId!),
+    select: (response) => response.builder,
     enabled: !!fableId,
     staleTime: Infinity,
-    // Don't retry 4xx errors (e.g. 404 not found) — only retry server errors
-    retry: (failureCount, error) => {
-      if (error instanceof ApiClientError && error.status && error.status < 500)
-        return false
-      return failureCount < QUERY_CONSTANTS.RETRY.MINIMAL
-    },
+    retry: retryRetrieve,
   })
 }
 
-export function useExpandFable() {
-  return useMutation<FableValidationExpansion, Error, FableBuilderV1>({
-    mutationFn: expandFable,
+/** Blueprint at `version`, else latest. */
+export function useFableRetrieve(
+  fableId: string | null | undefined,
+  version?: number,
+) {
+  return useQuery<FableRetrieveResponse>({
+    queryKey: fableRetrieveKey(fableId, version),
+    queryFn: () => retrieveFable(fableId!, version),
+    enabled: !!fableId,
+    staleTime: Infinity,
+    retry: retryRetrieve,
   })
 }
 
@@ -134,10 +147,7 @@ export function useFableValidation(
   fable: FableBuilderV1 | null,
   enabled: boolean = true,
 ) {
-  const stableFable = useMemo(
-    () => fable ?? ({ blocks: {} } as FableBuilderV1),
-    [fable],
-  )
+  const stableFable = useMemo(() => fable ?? { blocks: {} }, [fable])
 
   const hasBlocks = fable !== null && Object.keys(fable.blocks).length > 0
 
@@ -163,10 +173,54 @@ export function useFableValidation(
   })
 }
 
-export function useListBlueprints(page: number = 1, pageSize: number = 50) {
+/** Only numeric GRIB param ids resolve. */
+const PARAM_ID = /^\d+$/
+
+const NO_LABELS: ReadonlyMap<string, string> = new Map()
+
+function toLabelMap(
+  response: ResolveDisplayResponse,
+): ReadonlyMap<string, string> {
+  const labels = new Map<string, string>()
+  for (const { value, display } of response.elements) {
+    if (display) labels.set(value, display)
+  }
+  return labels
+}
+
+/** Backend display strings for param ids; unresolved ids are absent. */
+export function useParamLabels(
+  values: ReadonlyArray<string>,
+): ReadonlyMap<string, string> {
+  const ids = useMemo(
+    () => [...new Set(values.filter((v) => PARAM_ID.test(v)))].sort(),
+    [values],
+  )
+  const { data } = useQuery({
+    queryKey: fableKeys.paramLabels(ids),
+    queryFn: () =>
+      resolveDisplay(ids.map((value) => ({ typeName: 'param', value }))),
+    select: toLabelMap,
+    enabled: ids.length > 0,
+    // Param ids never change meaning.
+    staleTime: Infinity,
+    gcTime: 60 * 60 * 1000,
+    placeholderData: keepPreviousData,
+    retry: retryRetrieve,
+    // Older backends lack the route; ids then show raw.
+    meta: { expectedErrorStatuses: [404] },
+  })
+  return data ?? NO_LABELS
+}
+
+export function useListBlueprints(
+  page: number = 1,
+  pageSize: number = 50,
+  filters?: BlueprintListFilters,
+) {
   return useQuery<BlueprintListResponse>({
-    queryKey: fableKeys.blueprints(page, pageSize),
-    queryFn: () => listBlueprints(page, pageSize),
+    queryKey: fableKeys.blueprints(page, pageSize, filters),
+    queryFn: () => listBlueprints(page, pageSize, filters),
     staleTime: QUERY_CONSTANTS.STALE_TIMES.DEFAULT,
   })
 }
@@ -196,7 +250,8 @@ export function useUpsertFable() {
       display_description,
       tags,
     }) => {
-      // Update existing blueprint when we have both ID and version
+      // Update when we have ID + version. parent_id is re-sent — the
+      // backend replaces the metadata row and omitting it wipes lineage.
       if (fableId && fableVersion != null) {
         return updateBlueprint({
           blueprint_id: fableId,
@@ -205,6 +260,7 @@ export function useUpsertFable() {
           display_name,
           display_description,
           tags: tags ?? [],
+          parent_id: parentId ?? null,
         })
       }
       // Create new blueprint (parentId tracks "forked from" lineage)
@@ -226,7 +282,7 @@ export function useUpsertFable() {
         queryKey: fableKeys.detail(result.blueprint_id),
       })
       queryClient.invalidateQueries({
-        queryKey: fableKeys.blueprints(),
+        queryKey: fableKeys.blueprintsBase(),
       })
     },
   })
@@ -237,12 +293,12 @@ export function useDeleteBlueprint() {
 
   return useMutation<void, Error, BlueprintDeleteRequest>({
     mutationFn: deleteBlueprint,
-    onSuccess: (_data, variables) => {
+    onSuccess: () => {
+      // Only refresh lists. Invalidating the deleted blueprint's detail
+      // would refetch a 404 from still-mounted rows and toast an error;
+      // the stale cache entry is unreachable once the lists update.
       queryClient.invalidateQueries({
-        queryKey: fableKeys.detail(variables.blueprint_id),
-      })
-      queryClient.invalidateQueries({
-        queryKey: fableKeys.blueprints(),
+        queryKey: fableKeys.blueprintsBase(),
       })
     },
   })
@@ -253,7 +309,7 @@ export function useDeleteBlueprint() {
  * Intrinsic glyphs are static (e.g., runId, submitDatetime), so we cache aggressively.
  */
 export function useAvailableGlyphs() {
-  return useQuery<Array<GlyphDetail>>({
+  return useQuery<Array<IntrinsicGlyphItem>>({
     queryKey: fableKeys.glyphs(),
     queryFn: getAvailableGlyphs,
     staleTime: 30 * 60 * 1000, // 30 minutes — intrinsic glyphs change rarely
@@ -286,17 +342,6 @@ export function useListGlobalGlyphs(page: number = 1, pageSize: number = 50) {
 }
 
 /**
- * Get a single global glyph by ID
- */
-export function useGlobalGlyph(globalGlyphId: string | null | undefined) {
-  return useQuery<GlobalGlyphResponse>({
-    queryKey: fableKeys.globalGlyph(globalGlyphId ?? ''),
-    queryFn: () => getGlobalGlyph(globalGlyphId!),
-    enabled: !!globalGlyphId,
-  })
-}
-
-/**
  * Create or update a global glyph
  */
 export function useCreateGlobalGlyph() {
@@ -308,6 +353,20 @@ export function useCreateGlobalGlyph() {
       queryClient.invalidateQueries({
         queryKey: fableKeys.globalGlyphsBase(),
       })
+    },
+  })
+}
+
+/**
+ * Delete a global glyph by ID
+ */
+export function useDeleteGlobalGlyph() {
+  const queryClient = useQueryClient()
+
+  return useMutation<void, Error, string>({
+    mutationFn: deleteGlobalGlyph,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: fableKeys.globalGlyphsBase() })
     },
   })
 }

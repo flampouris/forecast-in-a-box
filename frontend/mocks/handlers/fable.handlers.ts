@@ -12,6 +12,7 @@ import { HttpResponse, delay, http } from 'msw'
 import {
   calculateExpansion,
   mockCatalogue,
+  mockParamDisplays,
   mockSavedFables,
 } from '../data/fable.data'
 import { consumeCatalogueUnavailable } from './plugins.handlers'
@@ -19,9 +20,15 @@ import type {
   BlueprintUpdateRequest,
   FableBuilderV1,
   FableUpsertRequest,
+  ResolvableValue,
 } from '@/api/types/fable.types'
-import { getFactory } from '@/api/types/fable.types'
+import {
+  FableBuilderV1Schema,
+  getFactory,
+  serializeFable,
+} from '@/api/types/fable.types'
 import { API_ENDPOINTS } from '@/api/endpoints'
+import { parseFableType } from '@/components/base/fields/fable-type'
 
 interface SavedFableEntry {
   fable: FableBuilderV1
@@ -32,23 +39,93 @@ interface SavedFableEntry {
   user_id: string
   created_at: string
   updated_at: string
+  /** Blueprint source; plugin templates use 'plugin_template' */
+  source?: string | null
+  /** Forked-from lineage (e.g. the template a preset was created from) */
+  parent_id?: string | null
 }
 
 function seedSavedFables(): Record<string, SavedFableEntry | undefined> {
-  return Object.fromEntries(
-    Object.entries(mockSavedFables).map(([id, entry]) => [
-      id,
-      {
-        ...entry,
-        display_name: entry.name,
-        display_description: '',
+  const seeded: Record<string, SavedFableEntry | undefined> =
+    Object.fromEntries(
+      Object.entries(mockSavedFables).map(([id, entry]) => [
+        id,
+        {
+          ...entry,
+          display_name: entry.name,
+          display_description: '',
+        },
+      ]),
+    )
+
+  // Four ecmwf-base templates, so the dashboard's cap-at-three is exercised.
+  const templateBase = Object.values(mockSavedFables)[0]
+  seeded['template-basic-map'] = {
+    ...templateBase,
+    display_name: 'testBasic',
+    display_description: 'Ready-made starting point shipped by a plugin',
+    tags: ['IFS Open Data', 'Ensemble Mean', 'PNG Maps'],
+    user_id: 'ecmwf:ecmwf-base',
+    source: 'plugin_template',
+  }
+
+  // Required glyphs with type hints; examples served by plugins.handlers.ts
+  const [baseBlockId, baseBlock] = Object.entries(templateBase.fable.blocks)[0]
+  seeded['template-typed-inputs'] = {
+    ...templateBase,
+    fable: {
+      blocks: {
+        [baseBlockId]: {
+          ...baseBlock,
+          configuration_values: {
+            ...baseBlock.configuration_values,
+            forecast: '${format}',
+            base_time: '${count} ${area}',
+          },
+        },
       },
-    ]),
-  )
+      local_glyphs: {},
+    },
+    display_name: 'testTyped',
+    display_description: 'Template with typed example glyphs',
+    tags: ['AIFS', '72 h', 'GRIB'],
+    user_id: 'ecmwf:ecmwf-base',
+    source: 'plugin_template',
+  }
+
+  seeded['template-third'] = {
+    ...templateBase,
+    display_name: 'testThird',
+    display_description: 'Third plugin template',
+    tags: ['Open Data', 'GRIB'],
+    user_id: 'ecmwf:ecmwf-base',
+    source: 'plugin_template',
+  }
+
+  seeded['template-fourth'] = {
+    ...templateBase,
+    display_name: 'testFourth',
+    display_description: 'Fourth plugin template, beyond the dashboard cap',
+    tags: ['Open Data'],
+    user_id: 'ecmwf:ecmwf-base',
+    source: 'plugin_template',
+  }
+
+  return seeded
 }
 
+const TEMPLATE_IDS = [
+  'template-basic-map',
+  'template-typed-inputs',
+  'template-third',
+  'template-fourth',
+]
+
 function seedFableVersions(): Record<string, number> {
-  return Object.fromEntries(Object.keys(mockSavedFables).map((id) => [id, 1]))
+  return {
+    ...Object.fromEntries(Object.keys(mockSavedFables).map((id) => [id, 1])),
+    ...Object.fromEntries(TEMPLATE_IDS.map((id) => [id, 1])),
+  }
 }
 
 let savedFablesState: Record<string, SavedFableEntry | undefined> =
@@ -133,7 +210,7 @@ export const fableHandlers = [
 
     let fable: FableBuilderV1
     try {
-      fable = (await request.json()) as FableBuilderV1
+      fable = FableBuilderV1Schema.parse(await request.json())
     } catch {
       return HttpResponse.json(
         { message: 'Invalid request body' },
@@ -159,7 +236,21 @@ export const fableHandlers = [
       )
     }
 
-    const { builder, display_name, display_description, tags, parent_id } = body
+    const {
+      builder: rawBuilder,
+      display_name,
+      display_description,
+      tags,
+      parent_id,
+    } = body
+
+    // Parse API-format builder (list of routable blocks) to internal format.
+    const builder = FableBuilderV1Schema.parse(rawBuilder)
+
+    // Tags are now sent as {key, value} objects; extract the key for internal storage.
+    const storedTags = (tags as Array<string | { key: string }>).map((t) =>
+      typeof t === 'string' ? t : t.key,
+    )
 
     for (const instance of Object.values(builder.blocks)) {
       const factory = getFactory(mockCatalogue, instance.factory_id)
@@ -174,35 +265,12 @@ export const fableHandlers = [
       }
     }
 
-    const now = new Date().toISOString()
+    const now = new Date()
+      .toISOString()
+      .replace('T', ' ')
+      .replace(/\.\d{3}Z$/, '+00:00')
 
-    if (parent_id) {
-      const existing = savedFablesState[parent_id]
-      if (!existing) {
-        return HttpResponse.json(
-          { message: 'Fable not found' },
-          { status: 404 },
-        )
-      }
-
-      const newVersion = (fableVersions[parent_id] ?? 1) + 1
-      fableVersions[parent_id] = newVersion
-
-      savedFablesState[parent_id] = {
-        ...existing,
-        fable: builder,
-        display_name,
-        display_description,
-        tags: tags.length > 0 ? tags : existing.tags,
-        updated_at: now,
-      }
-
-      return HttpResponse.json({
-        blueprint_id: parent_id,
-        version: newVersion,
-      })
-    }
-
+    // Real-backend semantics: create mints a new blueprint; parent_id is lineage only
     const newId = `fable-${String(fableIdCounter++).padStart(3, '0')}`
     fableVersions[newId] = 1
 
@@ -211,10 +279,11 @@ export const fableHandlers = [
       name: display_name ?? '',
       display_name,
       display_description,
-      tags,
+      tags: storedTags,
       user_id: 'mock-user-123',
       created_at: now,
       updated_at: now,
+      parent_id: parent_id ?? null,
     }
 
     return HttpResponse.json({ blueprint_id: newId, version: 1 })
@@ -251,11 +320,17 @@ export const fableHandlers = [
 
     savedFablesState[body.blueprint_id] = {
       ...existing,
-      fable: body.builder,
+      fable: FableBuilderV1Schema.parse(body.builder),
       display_name: body.display_name ?? existing.display_name,
       display_description:
         body.display_description ?? existing.display_description,
-      tags: body.tags ?? existing.tags,
+      tags: body.tags
+        ? (body.tags as Array<string | { key: string }>).map((t) =>
+            typeof t === 'string' ? t : t.key,
+          )
+        : existing.tags,
+      // Real-backend semantics: omitted parent_id wipes lineage
+      parent_id: body.parent_id ?? null,
       updated_at: new Date().toISOString(),
     }
 
@@ -265,21 +340,48 @@ export const fableHandlers = [
     })
   }),
 
-  http.get(API_ENDPOINTS.fable.list, async () => {
+  http.post(API_ENDPOINTS.fable.delete, async ({ request }) => {
     await delay(200)
+    const body = (await request.json()) as {
+      blueprint_id: string
+      version: number
+    }
+    if (!savedFablesState[body.blueprint_id]) {
+      return HttpResponse.json(
+        { detail: `Blueprint '${body.blueprint_id}' not found` },
+        { status: 404 },
+      )
+    }
+    delete savedFablesState[body.blueprint_id]
+    delete fableVersions[body.blueprint_id]
+    return HttpResponse.json({ success: true })
+  }),
+
+  http.get(API_ENDPOINTS.fable.list, async ({ request }) => {
+    await delay(200)
+
+    const url = new URL(request.url)
+    const sourceFilter = url.searchParams.get('source')
+    const createdByFilter = url.searchParams.get('created_by')
 
     const blueprints = Object.entries(savedFablesState)
       .filter(
         (pair): pair is [string, SavedFableEntry] => pair[1] !== undefined,
+      )
+      .filter(
+        ([, entry]) => !sourceFilter || (entry.source ?? null) === sourceFilter,
+      )
+      .filter(
+        ([, entry]) => !createdByFilter || entry.user_id === createdByFilter,
       )
       .map(([id, entry]) => ({
         blueprint_id: id,
         version: fableVersions[id] ?? 1,
         display_name: entry.display_name,
         display_description: entry.display_description,
-        tags: entry.tags,
-        source: null,
-        created_by: entry.user_id,
+        tags: entry.tags.map((k) => ({ key: k, value: '' })),
+        source: entry.source ?? null,
+        user: entry.user_id,
       }))
 
     return HttpResponse.json({
@@ -342,30 +444,43 @@ export const fableHandlers = [
   http.get(API_ENDPOINTS.fable.glyphsList, async ({ request }) => {
     await delay(200)
     const url = new URL(request.url)
-    const glyphType = url.searchParams.get('glyph_type') ?? 'intrinsic'
-
-    if (glyphType === 'intrinsic') {
-      return HttpResponse.json({
-        glyphs: mockIntrinsicGlyphs,
-        total: mockIntrinsicGlyphs.length,
-        page: 1,
-        page_size: mockIntrinsicGlyphs.length,
-      })
-    }
-
-    // global
+    const glyphType = url.searchParams.get('glyph_type')
+    const glyphKey = url.searchParams.get('glyph_key')
     const page = Number(url.searchParams.get('page') ?? '1')
     const pageSize = Number(url.searchParams.get('page_size') ?? '50')
+
+    const intrinsicItems = mockIntrinsicGlyphs.map((g) => ({
+      glyph_type: 'intrinsic' as const,
+      ...g,
+    }))
+
+    const globalItems = mockGlobalGlyphs.map((g) => ({
+      glyph_type: 'global' as const,
+      ...g,
+    }))
+
+    let combined: Array<(typeof intrinsicItems)[0] | (typeof globalItems)[0]> =
+      []
+
+    if (!glyphType || glyphType === 'intrinsic') {
+      combined = [...combined, ...intrinsicItems]
+    }
+    if (!glyphType || glyphType === 'global') {
+      combined = [...combined, ...globalItems]
+    }
+
+    if (glyphKey) {
+      combined = combined.filter((g) =>
+        g.glyph_type === 'intrinsic' ? g.name === glyphKey : g.key === glyphKey,
+      )
+    }
+
     const start = (page - 1) * pageSize
-    const slice = mockGlobalGlyphs.slice(start, start + pageSize)
+    const slice = combined.slice(start, start + pageSize)
+
     return HttpResponse.json({
-      glyphs: slice.map((g) => ({
-        name: g.key,
-        display_name: g.key,
-        valueExample: g.value,
-        created_by: g.created_by,
-      })),
-      total: mockGlobalGlyphs.length,
+      glyphs: slice,
+      total: combined.length,
       page,
       page_size: pageSize,
     })
@@ -405,13 +520,16 @@ export const fableHandlers = [
     }
 
     const existing = mockGlobalGlyphs.find((g) => g.key === body.key)
-    const now = new Date().toISOString()
+    const now = new Date()
+      .toISOString()
+      .replace('T', ' ')
+      .replace(/\.\d{3}Z$/, '+00:00')
     if (existing) {
       existing.value = body.value
       existing.public = isPublic
       existing.overriddable = overriddable
       existing.updated_at = now
-      return HttpResponse.json(existing)
+      return HttpResponse.json({ glyph_type: 'global', ...existing })
     }
 
     const newGlyph: MockGlobalGlyph = {
@@ -425,21 +543,44 @@ export const fableHandlers = [
       updated_at: now,
     }
     mockGlobalGlyphs.push(newGlyph)
-    return HttpResponse.json(newGlyph)
+    return HttpResponse.json({ glyph_type: 'global', ...newGlyph })
   }),
 
-  http.get(API_ENDPOINTS.fable.glyphsGlobalGet, async ({ request }) => {
+  http.post(API_ENDPOINTS.fable.glyphsGlobalDelete, async ({ request }) => {
     await delay(200)
-    const url = new URL(request.url)
-    const id = url.searchParams.get('global_glyph_id')
-    const glyph = mockGlobalGlyphs.find((g) => g.global_glyph_id === id)
-    if (!glyph) {
+    const body = (await request.json()) as { global_glyph_id: string }
+    const index = mockGlobalGlyphs.findIndex(
+      (g) => g.global_glyph_id === body.global_glyph_id,
+    )
+    if (index === -1) {
       return HttpResponse.json(
-        { detail: `GlobalGlyph '${id}' not found.` },
+        { detail: `GlobalGlyph '${body.global_glyph_id}' not found.` },
         { status: 404 },
       )
     }
-    return HttpResponse.json(glyph)
+    mockGlobalGlyphs.splice(index, 1)
+    return new HttpResponse(null, { status: 204 })
+  }),
+
+  http.post(API_ENDPOINTS.fable.resolveDisplay, async ({ request }) => {
+    await delay(150)
+    const { elements } = (await request.json()) as {
+      elements: Array<ResolvableValue>
+    }
+    const invalid = elements.find((e) => parseFableType(e.typeName) === null)
+    if (invalid) {
+      return HttpResponse.json(
+        { detail: `Invalid type expression '${invalid.typeName}'` },
+        { status: 404 },
+      )
+    }
+    return HttpResponse.json({
+      elements: elements.map((e) => ({
+        ...e,
+        display:
+          e.typeName === 'param' ? (mockParamDisplays[e.value] ?? null) : null,
+      })),
+    })
   }),
 
   http.get(API_ENDPOINTS.fable.get, async ({ request }) => {
@@ -463,10 +604,11 @@ export const fableHandlers = [
     return HttpResponse.json({
       blueprint_id: fableId,
       version: fableVersions[fableId] ?? 1,
-      builder: saved.fable,
+      builder: serializeFable(saved.fable),
       display_name: saved.display_name,
       display_description: saved.display_description,
-      tags: saved.tags,
+      tags: saved.tags.map((k) => ({ key: k, value: '' })),
+      parent_id: saved.parent_id ?? null,
       created_at: saved.created_at,
       updated_at: saved.updated_at,
     })

@@ -15,28 +15,37 @@
  */
 
 import { useMemo } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useMutationState,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import type { BlockFactoryCatalogue, BlockKind } from '@/api/types/fable.types'
 import type {
   PluginCapability,
   PluginCompositeId,
   PluginInfo,
   PluginListing,
-  PluginsStatus,
+  PluginSettingsUpdate,
 } from '@/api/types/plugins.types'
 import {
   disablePlugin,
   enablePlugin,
-  getPluginDetails,
-  getPluginStatus,
+  getPluginList,
+  getTemplateExampleValues,
   installPlugin,
-  modifyPluginEnabled,
   uninstallPlugin,
   updatePlugin,
+  updatePluginSettings,
 } from '@/api/endpoints/plugins'
+import {
+  parsePluginIdString,
+  toPluginInfoList,
+} from '@/api/types/plugins.types'
 import { getCatalogue } from '@/api/endpoints/fable'
-import { toPluginInfoList } from '@/api/types/plugins.types'
 import { fableKeys } from '@/api/hooks/useFable'
+import { pollIntervals } from '@/api/pollIntervals'
 import { createLogger } from '@/lib/logger'
 
 const log = createLogger('usePlugins')
@@ -44,29 +53,24 @@ const log = createLogger('usePlugins')
 /** Query keys for plugins */
 export const pluginKeys = {
   all: ['plugin'] as const,
-  status: () => [...pluginKeys.all, 'status'] as const,
-  details: (forceRefresh?: boolean) =>
-    [...pluginKeys.all, 'details', { forceRefresh }] as const,
+  list: () => [...pluginKeys.all, 'list'] as const,
+  /** Mutation key — lets notification dispatch skip what this tab started. */
+  mutation: () => [...pluginKeys.all, 'mutation'] as const,
+  /** Per-kind key under `mutation()`, to tell operations apart. */
+  operation: (kind: PluginOperation) =>
+    [...pluginKeys.mutation(), kind] as const,
 }
 
-/**
- * Hook to get plugin system status
- */
-export function usePluginStatus() {
-  return useQuery<PluginsStatus>({
-    queryKey: pluginKeys.status(),
-    queryFn: getPluginStatus,
-    staleTime: 30 * 1000, // 30 seconds
-  })
-}
+export type PluginOperation =
+  'install' | 'uninstall' | 'enable' | 'disable' | 'update' | 'settings'
 
 /**
  * Hook to get all plugin details (raw backend response)
  */
-export function usePluginDetails(forceRefresh?: boolean) {
+export function usePluginList() {
   return useQuery<PluginListing>({
-    queryKey: pluginKeys.details(forceRefresh),
-    queryFn: () => getPluginDetails(forceRefresh),
+    queryKey: pluginKeys.list(),
+    queryFn: getPluginList,
     staleTime: 60 * 1000, // 1 minute
   })
 }
@@ -108,7 +112,10 @@ export function deriveCapabilitiesFromCatalogue(
  * 3. Transforms to UI-friendly format
  */
 export function usePlugins(catalogue?: BlockFactoryCatalogue) {
-  const { data: listing, ...rest } = usePluginDetails()
+  // Forward fields by explicit access, not rest/spread — Query tracks per-field
+  // reads, so spreading re-renders on every field.
+  const query = usePluginList()
+  const listing = query.data
 
   const plugins = useMemo<Array<PluginInfo>>(() => {
     if (!listing) return []
@@ -118,9 +125,12 @@ export function usePlugins(catalogue?: BlockFactoryCatalogue) {
   }, [listing, catalogue])
 
   return {
-    ...rest,
     data: listing ? { plugins } : undefined,
     plugins,
+    isLoading: query.isLoading,
+    isError: query.isError,
+    error: query.error,
+    refetch: query.refetch,
   }
 }
 
@@ -133,7 +143,6 @@ export function usePlugins(catalogue?: BlockFactoryCatalogue) {
  * relying on TanStack Query's retry budget, which is too small for
  * large plugins.
  */
-const CATALOGUE_POLL_INTERVAL_MS = 2000
 const CATALOGUE_POLL_TIMEOUT_MS = 60_000
 
 async function waitForCatalogue(): Promise<void> {
@@ -144,7 +153,7 @@ async function waitForCatalogue(): Promise<void> {
       return
     } catch {
       log.debug('Catalogue not ready yet, retrying...')
-      await new Promise((r) => setTimeout(r, CATALOGUE_POLL_INTERVAL_MS))
+      await new Promise((r) => setTimeout(r, pollIntervals.pluginCatalogue))
     }
   }
   log.warn('Catalogue poll timed out — proceeding with details refresh')
@@ -158,64 +167,115 @@ async function waitForCatalogue(): Promise<void> {
  * the catalogue is available again and details are refreshed.
  */
 function usePluginMutation<TVariables>(
+  kind: PluginOperation,
   action: (variables: TVariables) => Promise<void>,
 ) {
   const queryClient = useQueryClient()
 
   return useMutation({
+    mutationKey: pluginKeys.operation(kind),
     mutationFn: async (variables: TVariables) => {
       await action(variables)
       // Poll until the catalogue is available again (plugins finished reloading)
       await waitForCatalogue()
-      // Now refresh both caches — catalogue is ready so these will succeed
+      // Blueprints too: plugin templates are ingested as blueprint rows.
       await queryClient.invalidateQueries({ queryKey: fableKeys.catalogue() })
-      await queryClient.invalidateQueries({ queryKey: pluginKeys.details() })
+      await queryClient.invalidateQueries({ queryKey: pluginKeys.list() })
+      await queryClient.invalidateQueries({
+        queryKey: fableKeys.blueprintsBase(),
+      })
     },
   })
 }
 
 export function useInstallPlugin() {
-  return usePluginMutation(installPlugin)
+  return usePluginMutation('install', installPlugin)
 }
 
 export function useUninstallPlugin() {
-  return usePluginMutation(uninstallPlugin)
+  return usePluginMutation('uninstall', uninstallPlugin)
 }
 
 export function useEnablePlugin() {
-  return usePluginMutation(enablePlugin)
+  return usePluginMutation('enable', enablePlugin)
 }
 
 export function useDisablePlugin() {
-  return usePluginMutation(disablePlugin)
+  return usePluginMutation('disable', disablePlugin)
 }
 
 export function useUpdatePlugin() {
-  return usePluginMutation(updatePlugin)
+  return usePluginMutation('update', updatePlugin)
 }
 
-export function useModifyPluginEnabled() {
+export function useUpdatePluginSettings() {
   return usePluginMutation(
+    'settings',
     ({
       compositeId,
-      isEnabled,
+      settings,
     }: {
       compositeId: PluginCompositeId
-      isEnabled: boolean
-    }) => modifyPluginEnabled(compositeId, isEnabled),
+      settings: PluginSettingsUpdate
+    }) => updatePluginSettings(compositeId, settings),
+  )
+}
+
+/** In-flight operation per plugin, keyed `store/local`. */
+export function usePluginOperations(): Map<string, PluginOperation> {
+  const pending = useMutationState({
+    filters: { mutationKey: pluginKeys.mutation(), status: 'pending' },
+    select: (mutation) => ({
+      kind: mutation.options.mutationKey?.[2] as PluginOperation,
+      id: mutation.state.variables as PluginCompositeId,
+    }),
+  })
+  return useMemo(
+    () =>
+      new Map(
+        pending
+          .filter((p) => p.kind !== 'settings')
+          .map((p) => [`${p.id.store}/${p.id.local}`, p.kind]),
+      ),
+    [pending],
   )
 }
 
 /**
- * Hook to refresh plugin details (force refresh from backend)
+ * Example values/glyphs for a blueprint template.
+ * @param pluginId - "store:local" composite string (blueprint `created_by` format)
+ * @param displayName - The template's display name within the plugin
+ */
+export function useTemplateExampleValues(
+  pluginId: string | undefined,
+  displayName: string | undefined,
+) {
+  return useQuery({
+    queryKey: [
+      ...pluginKeys.all,
+      'templateExampleValues',
+      pluginId,
+      displayName,
+    ],
+    queryFn: () =>
+      getTemplateExampleValues(parsePluginIdString(pluginId!), displayName!),
+    enabled: !!pluginId && !!displayName,
+    staleTime: Infinity,
+    // 403 (excluded) / 404 (plugin unloaded) are terminal — don't retry
+    retry: false,
+  })
+}
+
+/**
+ * Hook to refresh plugin list from backend
  */
 export function useRefreshPlugins() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: () => getPluginDetails(true),
+    mutationFn: () => getPluginList(),
     onSuccess: (data) => {
-      queryClient.setQueryData(pluginKeys.details(), data)
+      queryClient.setQueryData(pluginKeys.list(), data)
     },
   })
 }

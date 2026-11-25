@@ -1,20 +1,20 @@
 {
-  "title": "Plugin Store",
-  "subtitle": "Manage installed AI models, data connectors, and processing extensions. Browse the ECMWF Plugin Store to expand your capabilities.",
+  "title": "Plugins",
+  "subtitle": "Manage installed AI models, data connectors, and processing extensions. Browse the ECMWF plugin store to expand your capabilities.",
   "actions": {
-    "checkUpdates": "Check Updates",
+    "checkUpdates": "Check updates",
     "install": "Install",
-    "installing": "Installing...",
     "uninstall": "Uninstall",
     "enable": "Enable",
     "disable": "Disable",
     "update": "Update",
-    "updateNow": "Update Now",
-    "viewDetails": "View Details",
+    "viewDetails": "View details",
     "viewDocs": "Documentation",
     "viewOnPyPI": "View on PyPI",
-    "reportIssue": "Report Issue",
-    "releaseNotes": "Release Notes"
+    "reportIssue": "Report issue",
+    "releaseNotes": "Release notes",
+    "details": "Details",
+    "pypi": "PyPI"
   },
   "stats": {
     "installed": "Installed",
@@ -27,19 +27,15 @@
     "errored": "Errored"
   },
   "filters": {
-    "searchPlaceholder": "Search installed plugins by name, ID or author...",
-    "status": {
-      "all": "All Statuses",
-      "active": "Active",
-      "loaded": "Loaded",
-      "disabled": "Disabled",
-      "updates": "Updates Available",
-      "uninstalled": "Uninstalled",
-      "available": "Available",
-      "errored": "Errored"
-    },
+    "searchPlaceholder": "Search plugins",
+    "statusLabel": "Filter by status",
+    "capabilityLabel": "Filter by capability",
+    "all": "All",
+    "installed": "Installed",
+    "updates": "Updates",
+    "available": "Available",
     "capability": {
-      "all": "All Capabilities",
+      "all": "All capabilities",
       "source": "Source",
       "transform": "Transform",
       "product": "Product",
@@ -48,8 +44,8 @@
   },
   "table": {
     "headers": {
-      "plugin": "Plugin Details",
-      "author": "Author",
+      "plugin": "Plugin",
+      "updated": "Updated",
       "status": "Status",
       "actions": "Actions"
     }
@@ -61,39 +57,40 @@
     "uninstalled": "Uninstalled",
     "available": "Available",
     "errored": "Errored",
-    "updateAvailable": "Update Available",
+    "warning": "Warning",
+    "updateAvailable": "Update available",
     "incompatible": "Incompatible",
-    "error": "Plugin System Error"
+    "error": "Plugin system error"
   },
-  "updatesSection": {
-    "title": "Updates Available",
-    "description": "The following plugins have updates available.",
-    "updateAll": "Update All",
-    "currentVersion": "Current: v{{version}}"
+  "statusHint": {
+    "loaded": "Enabled. Its blocks are in the block palette.",
+    "disabled": "Its blocks stay out of the block palette until you enable it.",
+    "errored": "The plugin failed to load. See its details page.",
+    "update": "Version {{version}} is available.",
+    "updateUnknown": "A newer version is available.",
+    "available": "Not installed yet."
   },
-  "installedSection": {
-    "title": "Installed plugins",
-    "total": "Total: {{count}}"
-  },
-  "uninstalledSection": {
-    "title": "Available plugins",
-    "description": "Browse and install plugins from the ECMWF Plugin Store.",
-    "total": "Total: {{count}}",
-    "searchPlaceholder": "Search available plugins...",
-    "incompatibleMessage": "This plugin requires FIAB {{version}} or higher",
-    "releasedAgo": "Released {{time}}",
-    "new": "New"
+  "diagnostics": {
+    "seeDetails": "See the details page for the full text",
+    "moreAndSeeDetails_one": "+{{count}} more — see the details page for the full text",
+    "moreAndSeeDetails_other": "+{{count}} more — see the details page for the full text",
+    "source": {
+      "install": "Installation",
+      "load": "Plugin load",
+      "template_ingest": "Template ingestion"
+    },
+    "severity": {
+      "warning": "Warning",
+      "error": "Error",
+      "critical": "Critical"
+    }
   },
   "emptyState": {
-    "title": "No plugins found",
-    "description": "Try adjusting your search or filter criteria.",
-    "noInstalled": "No plugins installed",
-    "noInstalledDescription": "Browse the available plugins to discover and install plugins.",
-    "noUninstalled": "No available plugins",
-    "noUninstalledDescription": "All plugins are already installed."
+    "noPlugins": "No plugins in the store",
+    "noPluginsDescription": "The plugin store did not return any plugins."
   },
   "confirmRemove": {
-    "title": "Remove Plugin",
+    "title": "Remove plugin",
     "description": "Are you sure you want to remove {{name}}? This action cannot be undone.",
     "confirm": "Remove",
     "cancel": "Cancel"
@@ -102,21 +99,58 @@
     "version": "v{{version}}",
     "installedAgo": "Installed {{time}}"
   },
-  "pagination": {
-    "showing": "Showing {{start}}-{{end}} of {{total}} plugins",
-    "previous": "Previous",
-    "next": "Next"
-  },
   "blockFactory": {
-    "useInConfig": "Use {{kind}} in Configuration",
-    "sourceOnlyTooltip": "Configurations must start with a source block"
+    "useInConfig": "Use {{kind}} in a workflow",
+    "sourceOnlyTooltip": "Workflows must start with a source block",
+    "configOptions_one": "{{count}} config option",
+    "configOptions_other": "{{count}} config options",
+    "inputs_one": "{{count}} input",
+    "inputs_other": "{{count}} inputs",
+    "noConfigRequired": "No configuration required"
   },
   "detail": {
-    "backToPlugins": "Back to Plugins",
-    "useAllBlocks": "Use All Blocks ({{count}})",
-    "blockFactories": "Block Factories",
+    "backToPlugins": "Back to plugins",
+    "useAllBlocks": "Use all blocks ({{count}})",
+    "blockFactories": "Block factories",
     "searchBlocks": "Search blocks...",
     "noMatchingBlocks": "No blocks match your search.",
-    "noBlocks": "This plugin does not provide any block factories."
+    "noBlocks": "This plugin does not provide any block factories.",
+    "loadingBlockFactories": "Loading block factories...",
+    "enableToViewBlockFactories": "Enable this plugin to view block factories.",
+    "installToViewBlockFactories": "Install this plugin to view block factories.",
+    "notFound": "Plugin not found: {{id}}"
+  },
+  "card": {
+    "version": "Version",
+    "updatedAgo": "Updated {{time}}",
+    "versionArrow": "→ v{{version}}"
+  },
+  "row": {
+    "moreOptions": "More options",
+    "byline": "{{author}} · {{description}}"
+  },
+  "activity": {
+    "installing": "Installing",
+    "installed": "Installed",
+    "installFailed": "Install failed",
+    "uninstalling": "Uninstalling",
+    "uninstalled": "Uninstalled",
+    "uninstallFailed": "Uninstall failed",
+    "updating": "Updating",
+    "updated": "Updated",
+    "updateFailed": "Update failed",
+    "failedWithReason": "{{label}}: {{reason}}"
+  },
+  "notifications": {
+    "installed": "Plugin {{plugin}} installed",
+    "updated": "Plugin {{plugin}} updated",
+    "settingsApplied": "Plugin {{plugin}} settings applied",
+    "unloaded": "Plugin {{plugin}} disabled",
+    "uninstalled": "Plugin {{plugin}} uninstalled",
+    "globalError": "{{trigger}} failed",
+    "globalErrorGeneric": "A plugin operation failed"
+  },
+  "admin": {
+    "verifyAccessError": "Could not verify admin access. Please try again."
   }
 }

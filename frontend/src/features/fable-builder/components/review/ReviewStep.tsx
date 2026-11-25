@@ -9,19 +9,12 @@
  */
 
 import { useMemo } from 'react'
-import {
-  AlertCircle,
-  ArrowLeft,
-  CheckCircle2,
-  Loader2,
-  Play,
-} from 'lucide-react'
+import { AlertCircle, CheckCircle2, Loader2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 import { ConfigSummaryCard } from './ConfigSummaryCard'
 import type { BlockFactoryCatalogue, BlockKind } from '@/api/types/fable.types'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
-import { SubmitJobDialog } from '@/features/executions/components/SubmitJobDialog'
 import { H2, P } from '@/components/base/typography'
-import { Button } from '@/components/ui/button'
 import {
   Card,
   CardContent,
@@ -43,18 +36,10 @@ interface ReviewStepProps {
 }
 
 export function ReviewStep({ catalogue }: ReviewStepProps) {
+  const { t } = useTranslation('configure')
   const fable = useFableBuilderStore((state) => state.fable)
-  const fableName = useFableBuilderStore((state) => state.fableName)
-  const fableId = useFableBuilderStore((state) => state.fableId)
   const validationState = useFableBuilderStore((state) => state.validationState)
   const isValidating = useFableBuilderStore((state) => state.isValidating)
-  const setStep = useFableBuilderStore((state) => state.setStep)
-  const submitDialogOpen = useFableBuilderStore(
-    (state) => state.submitDialogOpen,
-  )
-  const setSubmitDialogOpen = useFableBuilderStore(
-    (state) => state.setSubmitDialogOpen,
-  )
 
   const blocksByKind = useMemo(() => {
     const groups: Record<
@@ -96,43 +81,30 @@ export function ReviewStep({ catalogue }: ReviewStepProps) {
     }
   }, [validationState])
 
-  function handleSubmit(): void {
-    setSubmitDialogOpen(true)
-  }
-
-  function handleBackToEdit(): void {
-    setStep('edit')
-  }
-
   const blockCount = Object.keys(fable.blocks).length
-  const canSubmit = validationSummary?.isValid && !isValidating
 
   return (
     <div className="h-full flex-1 overflow-y-auto bg-muted/30">
       <div className="mx-auto max-w-3xl space-y-6 px-4 py-6">
         <div>
-          <H2 className="text-2xl font-semibold">Review Configuration</H2>
-          <P className="mt-1 text-muted-foreground">
-            Review your forecast configuration before submitting.
-          </P>
+          <H2 className="text-2xl font-semibold">{t('review.title')}</H2>
+          <P className="mt-1 text-muted-foreground">{t('review.subtitle')}</P>
         </div>
 
         {isValidating ? (
           <Alert>
             <Loader2 className="h-4 w-4 animate-spin" />
-            <AlertTitle>Validating Configuration</AlertTitle>
+            <AlertTitle>{t('review.validatingTitle')}</AlertTitle>
             <AlertDescription>
-              Please wait while we validate your configuration...
+              {t('review.validatingDescription')}
             </AlertDescription>
           </Alert>
         ) : validationSummary && !validationSummary.isValid ? (
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Configuration Has Errors</AlertTitle>
+            <AlertTitle>{t('review.hasErrorsTitle')}</AlertTitle>
             <AlertDescription>
-              <P className="mb-2">
-                Please fix the following issues before submitting:
-              </P>
+              <P className="mb-2">{t('review.fixIssues')}</P>
               {validationSummary.globalErrors.length > 0 && (
                 <ul className="list-disc space-y-1 pl-4">
                   {validationSummary.globalErrors.map((error, index) => (
@@ -142,9 +114,9 @@ export function ReviewStep({ catalogue }: ReviewStepProps) {
               )}
               {validationSummary.blockErrorCount > 0 && (
                 <P className="mt-2">
-                  {validationSummary.blockErrorCount} block-level{' '}
-                  {validationSummary.blockErrorCount === 1 ? 'error' : 'errors'}{' '}
-                  found.
+                  {t('review.blockLevelErrors', {
+                    count: validationSummary.blockErrorCount,
+                  })}
                 </P>
               )}
             </AlertDescription>
@@ -152,44 +124,23 @@ export function ReviewStep({ catalogue }: ReviewStepProps) {
         ) : validationSummary?.isValid ? (
           <Alert className="border-green-200 bg-green-50 dark:border-green-800 dark:bg-green-950">
             <CheckCircle2 className="h-4 w-4 text-green-600" />
-            <AlertTitle className="text-green-600">Ready to Submit</AlertTitle>
+            <AlertTitle className="text-green-600">
+              {t('review.readyTitle')}
+            </AlertTitle>
             <AlertDescription className="text-green-600/80">
-              Your configuration is valid and ready to be submitted.
+              {t('review.readyDescription')}
             </AlertDescription>
           </Alert>
         ) : null}
 
         <Card>
           <CardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle>Configuration Summary</CardTitle>
-                <CardDescription>
-                  {blockCount} {blockCount === 1 ? 'block' : 'blocks'}{' '}
-                  configured
-                </CardDescription>
-              </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleBackToEdit}
-                  className="gap-2"
-                >
-                  <ArrowLeft className="h-4 w-4" />
-                  Back to Edit
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={handleSubmit}
-                  disabled={!canSubmit}
-                  className="gap-2"
-                >
-                  <Play className="h-4 w-4" />
-                  Submit Job
-                </Button>
-              </div>
-            </div>
+            {/* Back-to-edit / submit live in the sticky header (always visible);
+                the panel just summarises the config to avoid duplicate actions. */}
+            <CardTitle>{t('review.summaryTitle')}</CardTitle>
+            <CardDescription>
+              {t('review.summaryDescription', { count: blockCount })}
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
             {BLOCK_KIND_ORDER.map((kind) => {
@@ -202,13 +153,15 @@ export function ReviewStep({ catalogue }: ReviewStepProps) {
               return (
                 <div key={kind}>
                   <div className="mb-3 flex items-center gap-2">
-                    <div className={cn('rounded p-1.5', metadata.bgColor)}>
+                    <div className={cn('rounded-md p-1.5', metadata.bgColor)}>
                       <IconComponent
                         className={cn('h-4 w-4', metadata.color)}
                       />
                     </div>
-                    <span className="font-medium">{metadata.label}s</span>
-                    <span className="rounded border border-border bg-muted px-2 py-0.5 text-sm font-medium text-muted-foreground">
+                    <span className="font-medium">
+                      {t('review.kindHeading', { label: metadata.label })}
+                    </span>
+                    <span className="rounded-md border border-border bg-muted px-2 py-0.5 text-sm font-medium text-muted-foreground">
                       {blocks.length}
                     </span>
                   </div>
@@ -226,14 +179,6 @@ export function ReviewStep({ catalogue }: ReviewStepProps) {
             })}
           </CardContent>
         </Card>
-
-        <SubmitJobDialog
-          open={submitDialogOpen}
-          onOpenChange={setSubmitDialogOpen}
-          fable={fable}
-          fableName={fableName}
-          fableId={fableId}
-        />
       </div>
     </div>
   )

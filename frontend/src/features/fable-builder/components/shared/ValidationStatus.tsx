@@ -8,124 +8,203 @@
  * does it submit to any jurisdiction.
  */
 
-import { useMemo } from 'react'
+/**
+ * Header validation badge. Issues render as a counted badge whose popover
+ * lists them; clicking an issue selects the offending block.
+ */
+
+import { useMemo, useState } from 'react'
 import { AlertCircle, CheckCircle2, Loader2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import type { BlockFactoryCatalogue } from '@/api/types/fable.types'
+import { blockDisplayNames } from '@/features/fable-builder/utils/block-names'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
+import { TOUR, tourAttr } from '@/features/tutorials/anchors'
 import { cn } from '@/lib/utils'
 
-interface ValidationStatusProps {
-  compact?: boolean
-  className?: string
+const anchor = tourAttr(TOUR.configure.validation)
+
+interface Issue {
+  blockId: string | null
+  label: string
+  message: string
+  /** Next step for the error shapes we recognise. */
+  hint: string | null
 }
 
-export function ValidationStatusBadge({ className }: { className?: string }) {
+type HintKey = 'invalidValue' | 'missingConfig' | 'noOutput'
+
+/** Recognised error shapes → the hint that fixes them. */
+function hintKeyFor(message: string): HintKey | null {
+  if (/^Invalid value for configuration option/.test(message)) {
+    return 'invalidValue'
+  }
+  if (/missing config/i.test(message)) return 'missingConfig'
+  if (/no (sink|output)/i.test(message)) return 'noOutput'
+  return null
+}
+
+export function ValidationStatusBadge({
+  className,
+  catalogue,
+  failure = null,
+}: {
+  className?: string
+  catalogue?: BlockFactoryCatalogue
+  /** Why the validation request itself failed; outranks any earlier result. */
+  failure?: string | null
+}) {
+  const { t } = useTranslation('configure')
   const validationState = useFableBuilderStore((state) => state.validationState)
   const isValidating = useFableBuilderStore((state) => state.isValidating)
+  const fable = useFableBuilderStore((state) => state.fable)
+  const selectBlock = useFableBuilderStore((state) => state.selectBlock)
+  const [open, setOpen] = useState(false)
 
-  if (isValidating) {
+  const issues = useMemo<Array<Issue>>(() => {
+    if (!validationState) return []
+    const hintFrom = (message: string): string | null => {
+      const key = hintKeyFor(message)
+      return key ? t(`validationStatus.hints.${key}`) : null
+    }
+    const list: Array<Issue> = []
+    const blockNames = blockDisplayNames(fable, catalogue)
+    for (const message of validationState.globalErrors) {
+      list.push({
+        blockId: null,
+        label: t('validationStatus.globalIssueLabel'),
+        message,
+        hint: hintFrom(message),
+      })
+    }
+    for (const [blockId, state] of Object.entries(
+      validationState.blockStates,
+    )) {
+      if (!state.hasErrors) continue
+      // `in` guard, not `?.`: index access is typed non-nullable here.
+      const label = blockId in blockNames ? blockNames[blockId] : blockId
+      for (const message of state.errors) {
+        list.push({ blockId, label, message, hint: hintFrom(message) })
+      }
+      for (const names of Object.values(state.missingGlyphs)) {
+        for (const name of names) {
+          list.push({
+            blockId,
+            label,
+            message: t('fieldErrors.unknownGlyph', { glyph: `\${${name}}` }),
+            hint: t('validationStatus.hints.unknownGlyph'),
+          })
+        }
+      }
+    }
+    return list
+  }, [validationState, fable, catalogue, t])
+
+  const validatingBadge = (
+    <Badge variant="secondary" className={cn('gap-1', className)} {...anchor}>
+      <Loader2 className="h-3 w-3 animate-spin" />
+      {t('validationStatus.validating')}
+    </Badge>
+  )
+
+  if (isValidating) return validatingBadge
+
+  if (failure !== null) {
     return (
-      <Badge variant="secondary" className={cn('gap-1', className)}>
-        <Loader2 className="h-3 w-3 animate-spin" />
-        Validating
-      </Badge>
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger
+          render={
+            <Badge
+              variant="destructive"
+              render={<button type="button" />}
+              className={cn('cursor-pointer gap-1', className)}
+              {...anchor}
+            />
+          }
+        >
+          <AlertCircle className="h-3 w-3" />
+          {t('validationStatus.failed')}
+        </PopoverTrigger>
+        <PopoverContent align="start" className="w-80 p-3 text-sm">
+          <p className="text-danger">{failure}</p>
+          <p className="mt-1.5 text-xs text-muted-foreground">
+            {t('validationStatus.hints.failed')}
+          </p>
+        </PopoverContent>
+      </Popover>
     )
   }
 
-  if (!validationState) {
-    return null
-  }
+  // Cleared between an edit and the next check.
+  if (!validationState) return validatingBadge
 
-  const hasGlobalErrors = validationState.globalErrors.length > 0
-  const hasBlockErrors = Object.values(validationState.blockStates).some(
-    (state) => state.hasErrors,
-  )
-
-  if (!hasGlobalErrors && !hasBlockErrors) {
+  if (issues.length === 0) {
     return (
       <Badge
         variant="outline"
         className={cn('gap-1 border-green-200 text-green-600', className)}
+        {...anchor}
       >
         <CheckCircle2 className="h-3 w-3" />
-        Valid
+        {t('validationStatus.valid')}
       </Badge>
     )
   }
 
   return (
-    <Badge variant="destructive" className={cn('gap-1', className)}>
-      <AlertCircle className="h-3 w-3" />
-      Has errors
-    </Badge>
-  )
-}
-
-export function ValidationStatus({
-  compact = false,
-  className,
-}: ValidationStatusProps) {
-  const validationState = useFableBuilderStore((state) => state.validationState)
-  const isValidating = useFableBuilderStore((state) => state.isValidating)
-
-  const errorSummary = useMemo(() => {
-    if (!validationState) return null
-
-    const globalErrors = validationState.globalErrors
-    const blocksWithErrors = Object.entries(validationState.blockStates).filter(
-      ([, state]) => state.hasErrors && state.errors.length > 0,
-    )
-
-    return {
-      globalErrors,
-      blocksWithErrors,
-      isValid: globalErrors.length === 0 && blocksWithErrors.length === 0,
-    }
-  }, [validationState])
-
-  if (isValidating) {
-    return (
-      <div
-        className={cn(
-          'flex items-center gap-2 text-muted-foreground',
-          className,
-        )}
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger
+        render={
+          <Badge
+            variant="destructive"
+            render={<button type="button" />}
+            className={cn('cursor-pointer gap-1', className)}
+            {...anchor}
+          />
+        }
       >
-        <Loader2 className="h-4 w-4 animate-spin" />
-        <span className="text-sm">Validating configuration...</span>
-      </div>
-    )
-  }
-
-  if (!errorSummary || errorSummary.isValid) {
-    return null
-  }
-
-  if (errorSummary.globalErrors.length === 0) {
-    if (compact) {
-      return (
-        <div className={cn('text-sm text-destructive', className)}>
-          Has errors
-        </div>
-      )
-    }
-    return null
-  }
-
-  return (
-    <Alert variant="destructive" className={className}>
-      <AlertCircle className="h-4 w-4" />
-      <AlertTitle>Configuration Issues</AlertTitle>
-      <AlertDescription>
-        <ul className="mt-2 list-disc space-y-1 pl-4">
-          {errorSummary.globalErrors.map((error, index) => (
-            <li key={`${error}-${index}`} className="text-sm">
-              {error}
-            </li>
+        <AlertCircle className="h-3 w-3" />
+        {t('validationStatus.issues', { count: issues.length })}
+      </PopoverTrigger>
+      <PopoverContent align="start" className="w-80 p-2">
+        <p className="px-2 py-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
+          {t('validationStatus.configurationIssues')}
+        </p>
+        <div className="flex max-h-72 flex-col gap-0.5 overflow-y-auto">
+          {issues.map((issue, index) => (
+            <button
+              key={index}
+              type="button"
+              disabled={issue.blockId === null}
+              onClick={() => {
+                if (issue.blockId === null) return
+                selectBlock(issue.blockId)
+                setOpen(false)
+              }}
+              className="min-w-0 rounded-sm px-2 py-1.5 text-left text-sm hover:bg-muted disabled:cursor-default disabled:hover:bg-transparent"
+            >
+              <span className="block font-medium">{issue.label}</span>
+              <span
+                className="mt-0.5 block truncate text-xs text-muted-foreground"
+                title={issue.message}
+              >
+                {issue.message}
+              </span>
+              {issue.hint && (
+                <span className="mt-0.5 block text-xs text-foreground/80">
+                  {issue.hint}
+                </span>
+              )}
+            </button>
           ))}
-        </ul>
-      </AlertDescription>
-    </Alert>
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }

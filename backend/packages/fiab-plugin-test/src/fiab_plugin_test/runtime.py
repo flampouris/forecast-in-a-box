@@ -14,7 +14,13 @@ def source_sleep(text: str, duration: float) -> str:
     return text
 
 
-def source_text(text: str) -> str:
+DEFAULT_TEXT = "Hic Sunt Leones"
+
+
+def source_text(text: str | None) -> str:
+    """Return the given text, imputing the default when an explicit null was configured."""
+    if text is None:
+        return DEFAULT_TEXT
     return text
 
 
@@ -30,10 +36,19 @@ def source_filesize(path: str) -> str:
     return str(pathlib.Path(path).stat().st_size)
 
 
-def sink_file(data: object, fname: str) -> tuple[bytes, str]:
+def sink_file(data: object, fname: str) -> bytes:
     p = pathlib.Path(fname)
     p.write_text(str(data))
-    return f"file://{p.absolute()}".encode("ascii"), "text/plain"
+    return f"file://{p.absolute()}".encode("ascii")
+
+
+def sink_filetree(data: object, path_root: str, depth: int) -> bytes:
+    """Write the input as content of a single file at `{path_root}/d1/.../d{depth}/file`, return the root path."""
+    root = pathlib.Path(path_root)
+    leaf_dir = root.joinpath(*(f"d{i}" for i in range(1, depth + 1)))
+    leaf_dir.mkdir(parents=True, exist_ok=True)
+    (leaf_dir / "file").write_text(str(data))
+    return str(root.absolute()).encode("ascii")
 
 
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -41,9 +56,9 @@ def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + payload + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
 
 
-def sink_image(data: int) -> tuple[bytes, str]:
-    """Generate a 64x64 grayscale PNG image filled with the given value (mod 256)."""
-    pixel = data % 256
+def sink_image(data: int, idx: int = 0) -> bytes:
+    """Generate a 64x64 grayscale PNG image filled with `data + idx * 10` (mod 256)."""
+    pixel = (data + idx * 10) % 256
     width = height = 64
 
     signature = b"\x89PNG\r\n\x1a\n"
@@ -57,4 +72,4 @@ def sink_image(data: int) -> tuple[bytes, str]:
 
     iend = _png_chunk(b"IEND", b"")
 
-    return signature + ihdr + idat + iend, "image/png"
+    return signature + ihdr + idat + iend

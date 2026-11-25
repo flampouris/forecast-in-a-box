@@ -8,11 +8,11 @@
  * does it submit to any jurisdiction.
  */
 
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Background,
   BackgroundVariant,
-  MiniMap,
+  Controls,
   ReactFlow,
   ReactFlowProvider,
   addEdge,
@@ -23,26 +23,32 @@ import {
 import '@xyflow/react/dist/style.css'
 import { FableEdgeComponent } from './FableEdge'
 import { BlockNode } from './nodes/BlockNode'
-import { InlineBlockNode } from './nodes/InlineBlockNode'
+import { BlockDragPreview } from './BlockDragPreview'
+import { AddSourcePopover } from './AddSourcePopover'
+import { CanvasStatus } from './CanvasStatus'
 import type { BlockFactoryCatalogue } from '@/api/types/fable.types'
-import type {
-  Connection,
-  Edge,
-  EdgeTypes,
-  NodeChange,
-  NodeTypes,
-} from '@xyflow/react'
+import type { Connection, Edge, EdgeTypes, NodeTypes } from '@xyflow/react'
 import type { NodeDimensions } from '@/features/fable-builder/utils/layout-blocks'
 import type { FableNode } from './nodes/BlockNode'
-import {
-  layoutNodes,
-  needsLayout,
-} from '@/features/fable-builder/utils/layout-blocks'
+import { CanvasMiniMap } from '@/components/common/CanvasMiniMap'
+import { withMeasured } from '@/components/common/canvas-measured'
+import { getFactory } from '@/api/types/fable.types'
+import { layoutNodes } from '@/features/fable-builder/utils/layout-blocks'
 import { fableToGraph } from '@/features/fable-builder/utils/fable-to-graph'
 import { useFableBuilderStore } from '@/features/fable-builder/stores/fableBuilderStore'
-import { useDebouncedCallback } from '@/hooks/useDebounce'
+import { useSidebarBlockDrop } from '@/features/fable-builder/hooks/useSidebarBlockDrop'
 import { useMedia } from '@/hooks/useMedia'
-import { useUiStore } from '@/stores/uiStore'
+import { TOUR, tourAttr } from '@/features/tutorials/anchors'
+import { cn } from '@/lib/utils'
+
+/** Debounce for the resize relayout. */
+const RESIZE_RELAYOUT_DELAY_MS = 150
+
+function heightsOf(dims: NodeDimensions): Record<string, number> {
+  return Object.fromEntries(
+    Object.entries(dims).map(([id, { height }]) => [id, height]),
+  )
+}
 
 interface FableGraphCanvasProps {
   catalogue: BlockFactoryCatalogue
@@ -53,10 +59,6 @@ const nodeTypes: NodeTypes = {
   transformBlock: BlockNode,
   productBlock: BlockNode,
   sinkBlock: BlockNode,
-  sourceBlockInline: InlineBlockNode,
-  transformBlockInline: InlineBlockNode,
-  productBlockInline: InlineBlockNode,
-  sinkBlockInline: InlineBlockNode,
 }
 
 const edgeTypes: EdgeTypes = {
@@ -64,86 +66,101 @@ const edgeTypes: EdgeTypes = {
 }
 
 function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
-  const isDesktop = useMedia('(min-width: 768px)')
-  const resolvedTheme = useUiStore((state) => state.resolvedTheme)
-  const isDark = resolvedTheme === 'dark'
+  // Must match FableBuilderPage's layout breakpoint (lg).
+  const isDesktop = useMedia('(min-width: 1024px)')
 
   // Use individual selectors to avoid creating new objects on every render
   const fable = useFableBuilderStore((state) => state.fable)
-  const autoLayout = useFableBuilderStore((state) => state.autoLayout)
+  const layoutTrigger = useFableBuilderStore((state) => state.layoutTrigger)
   const layoutDirection = useFableBuilderStore((state) => state.layoutDirection)
   const nodesLocked = useFableBuilderStore((state) => state.nodesLocked)
   const isMiniMapOpen = useFableBuilderStore((state) => state.isMiniMapOpen)
   const fitViewTrigger = useFableBuilderStore((state) => state.fitViewTrigger)
   const connectBlocks = useFableBuilderStore((state) => state.connectBlocks)
   const selectBlock = useFableBuilderStore((state) => state.selectBlock)
+  const openMobileConfig = useFableBuilderStore(
+    (state) => state.openMobileConfig,
+  )
+  const setHoveredEdge = useFableBuilderStore((state) => state.setHoveredEdge)
+  const selectedBlockId = useFableBuilderStore((state) => state.selectedBlockId)
 
   const { fitView, setViewport, getNodesBounds } = useReactFlow()
+  const { onDragOver, onDrop, dropMode } = useSidebarBlockDrop(catalogue)
 
-  const [nodes, setNodes, onNodesChangeInternal] = useNodesState<FableNode>([])
+  const [nodes, setNodes, onNodesChange] = useNodesState<FableNode>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
 
   const containerRef = useRef<HTMLDivElement>(null)
+  const [sourceAnchor, setSourceAnchor] = useState<HTMLDivElement | null>(null)
+  // Current selection mirrored into a ref so the layout effect can re-apply
+  // it on a block-driven rebuild without depending on it (which would force a
+  // full re-layout on every selection change).
+  const selectedBlockIdRef = useRef(selectedBlockId)
+  selectedBlockIdRef.current = selectedBlockId
   const prevBlocksRef = useRef<typeof fable.blocks | null>(null)
-  const prevAutoLayoutRef = useRef(autoLayout)
+  const prevLayoutTriggerRef = useRef(layoutTrigger)
   const prevLayoutDirectionRef = useRef(layoutDirection)
   const hasInitializedViewportRef = useRef<boolean>(false)
   const lastBlockCountRef = useRef<number>(0)
-  // Nodes whose dimensions have been measured at least once. Used to skip
-  // auto-relayout on subsequent content-driven resizes (e.g. config badges
-  // growing/shrinking while the user types), which would otherwise jostle
-  // the whole graph.
-  const measuredNodesRef = useRef<Set<string>>(new Set())
+  // New nodes lay out at estimated sizes first — relaid out once measured.
+  const [measurePending, setMeasurePending] = useState(false)
+  // Full-graph replacement: additionally hidden until the measured layout.
+  const [settling, setSettling] = useState(false)
+  // Card heights the last layout used.
+  const layoutHeightsRef = useRef<Record<string, number>>({})
 
-  // Debounced re-layout function that uses measured node dimensions
-  const debouncedRelayout = useDebouncedCallback(() => {
-    if (!autoLayout) return
-
-    const dimensions = nodes.reduce<NodeDimensions>((acc, node) => {
-      if (node.measured?.width && node.measured.height) {
-        acc[node.id] = {
-          width: node.measured.width,
-          height: node.measured.height,
-        }
+  // Real node sizes, read from the DOM — neither xyflow's dimension events
+  // nor its internal store deliver measurements in this controlled setup.
+  const measuredDimensions = useCallback((): NodeDimensions => {
+    const dims: NodeDimensions = {}
+    const els =
+      containerRef.current?.querySelectorAll<HTMLElement>('.react-flow__node')
+    for (const el of els ?? []) {
+      const id = el.getAttribute('data-id')
+      if (id && el.offsetHeight > 0) {
+        dims[id] = { width: el.offsetWidth, height: el.offsetHeight }
       }
-      return acc
-    }, {})
+    }
+    return dims
+  }, [])
 
-    const layouted = layoutNodes(
-      nodes,
-      edges,
-      { direction: layoutDirection },
-      dimensions,
-    )
-    setNodes(layouted)
-  }, 300)
-
-  // Trigger re-layout only on a node's FIRST measured dimension (freshly
-  // inserted or after layout direction change). Later resizes — e.g. a
-  // config badge wrap changing rows while the user types — are ignored
-  // so the graph doesn't jostle with every keystroke.
-  const onNodesChange = useCallback(
-    (changes: Array<NodeChange<FableNode>>) => {
-      onNodesChangeInternal(changes)
-
-      let hasFirstMeasurement = false
-      for (const change of changes) {
-        if (change.type === 'remove') {
-          measuredNodesRef.current.delete(change.id)
-          continue
-        }
-        if (change.type !== 'dimensions' || !change.dimensions) continue
-        if (measuredNodesRef.current.has(change.id)) continue
-        measuredNodesRef.current.add(change.id)
-        hasFirstMeasurement = true
+  // Relayout with real DOM sizes once all nodes measure (frame-capped poll).
+  useEffect(() => {
+    if (!measurePending) return
+    let cancelled = false
+    let attempts = 0
+    let frame = 0
+    const measure = () => {
+      if (cancelled) return
+      const dims = measuredDimensions()
+      const ready = nodes.length > 0 && nodes.every((node) => node.id in dims)
+      if (!ready && attempts < 60) {
+        attempts += 1
+        frame = requestAnimationFrame(measure)
+        return
       }
-
-      if (hasFirstMeasurement && autoLayout) {
-        debouncedRelayout()
+      if (ready) {
+        layoutHeightsRef.current = heightsOf(dims)
+        setNodes((current) =>
+          layoutNodes(current, edges, { direction: layoutDirection }, dims),
+        )
       }
-    },
-    [onNodesChangeInternal, autoLayout, debouncedRelayout],
-  )
+      setMeasurePending(false)
+      setSettling(false)
+    }
+    frame = requestAnimationFrame(measure)
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(frame)
+    }
+  }, [
+    measurePending,
+    nodes,
+    edges,
+    layoutDirection,
+    measuredDimensions,
+    setNodes,
+  ])
 
   useEffect(() => {
     // Use reference equality instead of JSON.stringify for change detection.
@@ -151,21 +168,26 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
     // changes if and only if the blocks content changes.
     const blocksChanged = fable.blocks !== prevBlocksRef.current
     const layoutChanged =
-      autoLayout !== prevAutoLayoutRef.current ||
+      layoutTrigger !== prevLayoutTriggerRef.current ||
       layoutDirection !== prevLayoutDirectionRef.current
 
     if (!blocksChanged && !layoutChanged) return
 
     prevBlocksRef.current = fable.blocks
-    prevAutoLayoutRef.current = autoLayout
+    prevLayoutTriggerRef.current = layoutTrigger
     prevLayoutDirectionRef.current = layoutDirection
 
     const { nodes: newNodes, edges: newEdges } = fableToGraph(fable, catalogue)
 
-    const shouldLayout = autoLayout || needsLayout(newNodes)
-    const layouted = shouldLayout
-      ? layoutNodes(newNodes, newEdges, { direction: layoutDirection })
-      : newNodes
+    // Pre-render heights; the resize relayout below corrects them.
+    const dimensions = measuredDimensions()
+    layoutHeightsRef.current = heightsOf(dimensions)
+    const layouted = layoutNodes(
+      newNodes,
+      newEdges,
+      { direction: layoutDirection },
+      dimensions,
+    )
 
     // Detect preset load: going from 0 blocks to multiple blocks
     // In this case, reset the viewport initialization to reposition the graph
@@ -176,9 +198,71 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
     }
     lastBlockCountRef.current = currentBlockCount
 
-    setNodes(layouted)
+    // Unmeasured nodes → post-mount relayout; full replacements also hide.
+    const unmeasured = layouted.filter((node) => !(node.id in dimensions))
+    const anyNew = unmeasured.length > 0
+    setMeasurePending(anyNew)
+    setSettling(anyNew && unmeasured.length === layouted.length)
+
+    // Preserve the current selection — `fableToGraph` builds nodes without a
+    // `selected` flag, so re-apply it here for the same-commit rebuild.
+    setNodes((prev) =>
+      withMeasured(
+        layouted.map((node) =>
+          node.id === selectedBlockIdRef.current
+            ? { ...node, selected: true }
+            : node,
+        ),
+        prev,
+      ),
+    )
     setEdges(newEdges)
-  }, [fable, catalogue, autoLayout, layoutDirection, setNodes, setEdges])
+  }, [
+    fable,
+    catalogue,
+    layoutTrigger,
+    layoutDirection,
+    measuredDimensions,
+    setNodes,
+    setEdges,
+  ])
+
+  // Re-centre cards whose height changed after layout (handles sit mid-height).
+  const nodeIds = nodes.map((node) => node.id).join(',')
+  useEffect(() => {
+    const container = containerRef.current
+    if (!container || measurePending) return
+    let timer = 0
+    const observer = new ResizeObserver(() => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        const dims = measuredDimensions()
+        const drifted = Object.entries(dims).some(([id, { height }]) => {
+          const laidOut = layoutHeightsRef.current[id] as number | undefined
+          return laidOut !== undefined && Math.abs(height - laidOut) > 1
+        })
+        if (!drifted) return
+        layoutHeightsRef.current = heightsOf(dims)
+        setNodes((current) =>
+          layoutNodes(current, edges, { direction: layoutDirection }, dims),
+        )
+      }, RESIZE_RELAYOUT_DELAY_MS)
+    })
+    container
+      .querySelectorAll('.react-flow__node')
+      .forEach((element) => observer.observe(element))
+    return () => {
+      observer.disconnect()
+      window.clearTimeout(timer)
+    }
+  }, [
+    nodeIds,
+    edges,
+    layoutDirection,
+    measurePending,
+    measuredDimensions,
+    setNodes,
+  ])
 
   // Position viewport once on initial load based on layout direction
   // TB: center X on desktop, left-align on mobile, near top Y
@@ -186,6 +270,8 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
   useEffect(() => {
     if (hasInitializedViewportRef.current) return
     if (nodes.length === 0) return
+    // Bounds shift when the measured layout lands — position after it.
+    if (settling) return
 
     const container = containerRef.current
     if (!container) return
@@ -201,13 +287,25 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
     let x: number
     let y: number
 
+    // Mobile centres the ENTRY node — a fanned bbox parks the first cards off-centre.
+    const entry = nodes.reduce((first, node) =>
+      (
+        layoutDirection === 'LR'
+          ? node.position.x < first.position.x
+          : node.position.y < first.position.y
+      )
+        ? node
+        : first,
+    )
+
     if (layoutDirection === 'TB') {
       // Position near top
       y = padding - bounds.y
 
       if (isMobile) {
-        // On mobile: left-align to ensure visibility
-        x = padding - bounds.x
+        x =
+          containerWidth / 2 -
+          (entry.position.x + (entry.measured?.width ?? 0) / 2)
       } else {
         // On desktop: center horizontally
         const graphCenterX = bounds.x + bounds.width / 2
@@ -218,8 +316,9 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
       x = padding - bounds.x
 
       if (isMobile) {
-        // On mobile: top-align to ensure visibility
-        y = padding - bounds.y
+        y =
+          containerHeight / 2 -
+          (entry.position.y + (entry.measured?.height ?? 0) / 2)
       } else {
         // On desktop: center vertically
         const graphCenterY = bounds.y + bounds.height / 2
@@ -229,7 +328,7 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
 
     setViewport({ x, y, zoom: 1 })
     hasInitializedViewportRef.current = true
-  }, [nodes, layoutDirection, setViewport])
+  }, [nodes, layoutDirection, setViewport, settling])
 
   // Respond to fit view trigger from the header
   useEffect(() => {
@@ -237,6 +336,51 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
       fitView({ padding: 0.3, maxZoom: 1 })
     }
   }, [fitViewTrigger, fitView])
+
+  // Refit only on >25% container jumps (rotation/breakpoint) — sidebar drags must not yank the viewport.
+  useEffect(() => {
+    const element = containerRef.current
+    if (!element) return
+    let last: { w: number; h: number } | null = null
+    let timer = 0
+    const observer = new ResizeObserver((entries) => {
+      const { width, height } = entries[entries.length - 1].contentRect
+      if (width === 0 || height === 0) return
+      if (last === null) {
+        last = { w: width, h: height }
+        return
+      }
+      const bigChange =
+        Math.abs(width - last.w) / last.w > 0.25 ||
+        Math.abs(height - last.h) / last.h > 0.25
+      if (!bigChange) return
+      last = { w: width, h: height }
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        fitView({ padding: 0.2, maxZoom: 1, duration: 200 })
+      }, 150)
+    })
+    observer.observe(element)
+    return () => {
+      observer.disconnect()
+      window.clearTimeout(timer)
+    }
+  }, [fitView])
+
+  // Reflect the store's selected block onto React Flow's `selected` node flag.
+  // BlockNode reads only that prop, so a selection change re-renders just the
+  // previously- and newly-selected nodes instead of every node on the canvas.
+  useEffect(() => {
+    setNodes((nds) => {
+      const next = nds.map((node) => {
+        const shouldSelect = node.id === selectedBlockId
+        return node.selected === shouldSelect
+          ? node
+          : { ...node, selected: shouldSelect }
+      })
+      return next.some((node, i) => node !== nds[i]) ? next : nds
+    })
+  }, [selectedBlockId, setNodes])
 
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -247,34 +391,67 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
           connection.source,
         )
 
+        // Label the optimistic edge only for multi-input targets (cf. fableToEdges).
+        const targetFactory = getFactory(
+          catalogue,
+          fable.blocks[connection.target].factory_id,
+        )
+        const showLabel = (targetFactory?.inputs.length ?? 0) > 1
+
         setEdges((eds) =>
           addEdge(
             {
               ...connection,
               type: 'fableEdge',
-              data: { inputName: connection.targetHandle },
+              data: { inputName: connection.targetHandle, showLabel },
             },
             eds,
           ),
         )
       }
     },
-    [connectBlocks, setEdges],
+    [connectBlocks, setEdges, fable, catalogue],
   )
 
   const onNodeClick = useCallback(
     (_: React.MouseEvent, node: FableNode) => {
+      // Sheet layout: tap = configure (no docked panel to reflect selection).
+      if (!isDesktop) {
+        openMobileConfig(node.id)
+        return
+      }
       selectBlock(node.id)
     },
-    [selectBlock],
+    [selectBlock, isDesktop, openMobileConfig],
   )
 
-  // Clicking empty canvas intentionally does NOT deselect the node (Blender
-  // pattern). The sidebar stays with the last-selected node's config. To
+  // Hovering a wire reveals its qube-lens handle (ephemeral UI; see FableEdge).
+  const onEdgeMouseEnter = useCallback(
+    (_: React.MouseEvent, edge: Edge) => setHoveredEdge(edge.id),
+    [setHoveredEdge],
+  )
+  const onEdgeMouseLeave = useCallback(
+    () => setHoveredEdge(null),
+    [setHoveredEdge],
+  )
+
+  // Clicking empty canvas intentionally does NOT deselect the node
+  // The sidebar stays with the last-selected node's config. To
   // deselect, use the X button in the ConfigPanel header.
 
   return (
-    <div ref={containerRef} className="h-full w-full">
+    <div
+      ref={containerRef}
+      className="relative h-full w-full"
+      {...tourAttr(TOUR.configure.canvas)}
+    >
+      {/* Hangs the source picker off the upper third of the canvas. */}
+      <div
+        ref={setSourceAnchor}
+        aria-hidden
+        className="pointer-events-none absolute top-1/3 left-1/2 h-px w-px"
+      />
+      <AddSourcePopover anchor={sourceAnchor} catalogue={catalogue} />
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -282,11 +459,20 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onNodeClick={onNodeClick}
+        onEdgeMouseEnter={onEdgeMouseEnter}
+        onEdgeMouseLeave={onEdgeMouseLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         nodesDraggable={!nodesLocked}
-        className="bg-slate-50 dark:bg-slate-950"
-        proOptions={{ hideAttribution: true }}
+        className={cn(
+          'bg-slate-50 dark:bg-slate-950',
+          // Instant hide while settling; fade in once the layout is final.
+          settling ? 'opacity-0' : 'transition-opacity duration-150',
+        )}
+        // Default 0.5 floor can't fit a wide pipeline into a phone container.
+        minZoom={0.1}
       >
         <Background
           variant={BackgroundVariant.Dots}
@@ -295,18 +481,17 @@ function FableGraphCanvasInner({ catalogue }: FableGraphCanvasProps) {
           color="#cbd5e1"
           className="dark:opacity-30"
         />
-        {isMiniMapOpen && isDesktop && (
-          <MiniMap
-            nodeStrokeWidth={3}
-            pannable
-            zoomable
-            position="bottom-right"
-            className="right-4! bottom-4! rounded-lg border border-border shadow-sm"
-            style={{ backgroundColor: isDark ? '#0f172a' : undefined }}
-            maskColor={isDark ? 'rgba(2, 6, 23, 0.6)' : 'rgba(0, 0, 0, 0.1)'}
-          />
+        <Controls
+          showInteractive={false}
+          position="bottom-left"
+          className="bottom-2! left-2!"
+        />
+        {isDesktop && (
+          <CanvasStatus nodeCount={nodes.length} edgeCount={edges.length} />
         )}
+        {isMiniMapOpen && isDesktop && <CanvasMiniMap />}
       </ReactFlow>
+      <BlockDragPreview mode={dropMode} />
     </div>
   )
 }

@@ -11,6 +11,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render } from 'vitest-browser-react'
 import { ErrorBoundary } from '@/components/common/ErrorBoundary'
+// Initialise i18next so the boundary's t() calls resolve to real strings.
+import '@/lib/i18n'
 
 // Mock logger to suppress expected error output in tests
 vi.mock('@/lib/logger', () => ({
@@ -96,7 +98,7 @@ describe('ErrorBoundary', () => {
         </ErrorBoundary>,
       )
       await expect
-        .element(screen.getByRole('button', { name: 'Try Again' }))
+        .element(screen.getByRole('button', { name: 'Try again' }))
         .toBeVisible()
     })
 
@@ -107,7 +109,7 @@ describe('ErrorBoundary', () => {
         </ErrorBoundary>,
       )
       await expect
-        .element(screen.getByRole('button', { name: 'Refresh Page' }))
+        .element(screen.getByRole('button', { name: 'Refresh page' }))
         .toBeVisible()
     })
   })
@@ -154,7 +156,7 @@ describe('ErrorBoundary', () => {
           <ThrowingComponent shouldThrow={true} />
         </ErrorBoundary>,
       )
-      const button = screen.getByRole('button', { name: 'Try Again' })
+      const button = screen.getByRole('button', { name: 'Try again' })
       await button.click()
       expect(onReset).toHaveBeenCalledTimes(1)
     })

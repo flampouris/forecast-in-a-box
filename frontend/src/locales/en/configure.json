@@ -1,21 +1,340 @@
 {
   "save": {
-    "triggerUpdate": "Update Config",
-    "triggerSave": "Save Config",
-    "titleUpdate": "Update Configuration",
-    "titleSave": "Save Configuration",
+    "triggerUpdate": "Update workflow",
+    "triggerSave": "Save workflow",
+    "titleUpdate": "Update workflow",
+    "titleSave": "Save workflow",
     "titleLabel": "Title",
     "titlePlaceholder": "e.g. European forecast run",
     "commentsLabel": "Comments",
-    "commentsPlaceholder": "Optional notes about this configuration...",
+    "commentsPlaceholder": "Optional notes about this workflow...",
     "tagsLabel": "Tags",
     "tagsPlaceholder": "e.g. production, europe",
-    "defaultTitle": "Forecast Config {{date}} {{time}}",
-    "savedAsNew": "Configuration saved as new",
-    "saved": "Configuration saved",
-    "saveFailed": "Failed to save configuration",
-    "saveAsNew": "Save as New",
+    "defaultTitle": "Workflow {{date}} {{time}}",
+    "savedAsNew": "Workflow saved as new",
+    "saved": "Workflow saved",
+    "saveFailed": "Failed to save workflow",
+    "saveAsNew": "Save as new",
     "update": "Update",
     "save": "Save"
+  },
+  "errors": {
+    "more": "(+{{count}} more)",
+    "expandAriaLabel": "Show all {{count}} errors",
+    "collapseAriaLabel": "Collapse errors"
+  },
+  "fieldErrors": {
+    "unknownConfigKey": "Unknown configuration key",
+    "missingRequiredValue": "Missing required value",
+    "unknownGlyph": "Unknown variable: {{glyph}}",
+    "jinjaReservedReference": "'{{name}}' clashes with a Jinja filter or function and cannot be used as a variable — choose a different name."
+  },
+  "page": {
+    "dropOpen": "Drop to open this workflow",
+    "dropReplace": "Drop to replace the current workflow",
+    "dropSetAside": "Unsaved changes are set aside",
+    "notFoundTitle": "The requested workflow was not found.",
+    "loadFailedTitle": "Failed to load workflow. Please try again later.",
+    "notFoundDescription": "It may have been deleted or the link is no longer valid.",
+    "backToDashboard": "Back to Overview",
+    "catalogueLoadFailed": "Failed to load block catalogue",
+    "noPluginsTitle": "No plugins enabled",
+    "noPluginsDescription": "At least one plugin must be enabled to build workflows.",
+    "managePlugins": "Manage plugins",
+    "validationError422": "Invalid workflow. Please fill in all required fields.",
+    "validationErrorGeneric": "Failed to validate workflow. Please check your block settings.",
+    "validationError5xx": "The server failed while validating this workflow (HTTP {{status}}).",
+    "untitledConfiguration": "Untitled workflow"
+  },
+  "header": {
+    "graph": "Graph",
+    "form": "Form",
+    "exportConfig": "Export workflow",
+    "loadConfig": "Load workflow",
+    "newConfiguration": "New workflow",
+    "exportFailed": "Failed to export workflow",
+    "configLoaded": "Workflow loaded",
+    "fileTooLargeTitle": "File too large",
+    "fileTooLargeDescription": "Workflow files must be smaller than 1 MB.",
+    "invalidConfigTitle": "Invalid workflow file",
+    "invalidConfigDescription": "The file is not a workflow exported from Forecast-in-a-Box.",
+    "parseFailed": "Failed to parse workflow file",
+    "readFailed": "Failed to read file",
+    "readUnknownError": "Unknown read error",
+    "reviewSubmit": "Review & submit",
+    "runOnce": "Run once",
+    "runOnSchedule": "Run on schedule",
+    "submitOptions": "More submit options",
+    "backToEdit": "Back to edit",
+    "submitJob": "Start run",
+    "reviewTooltipNoBlocks": "Add blocks to your workflow",
+    "reviewTooltipNoSink": "Add at least one output block",
+    "reviewTooltipInvalid": "Fix validation errors before submitting",
+    "undo": "Undo",
+    "redo": "Redo",
+    "file": "File",
+    "moreTags": "+{{count}}"
+  },
+  "blockCount_one": "{{count}} block",
+  "blockCount_other": "{{count}} blocks",
+  "blockSummaryBadge_one": "{{count}} {{kind}}",
+  "blockSummaryBadge_other": "{{count}} {{kind}}s",
+  "draft": {
+    "saving": "Saving draft…",
+    "saved": "Draft saved"
+  },
+  "validationStatus": {
+    "validating": "Validating",
+    "valid": "Ready to run",
+    "issues_one": "{{count}} issue to fix",
+    "issues_other": "{{count}} issues to fix",
+    "failed": "Validation failed",
+    "globalIssueLabel": "Workflow",
+    "validatingConfiguration": "Validating workflow...",
+    "configurationIssues": "Workflow issues",
+    "hints": {
+      "invalidValue": "Open the block and pick a valid value for this option.",
+      "missingConfig": "Fill in the required options in the configuration panel.",
+      "noOutput": "Add an output block, for example a GRIB sink or a map plot.",
+      "unknownGlyph": "Define the variable under Variables, or replace it with a value.",
+      "failed": "Running stays disabled until validation succeeds."
+    }
+  },
+  "blockActions": {
+    "more": "More block actions",
+    "duplicate": "Duplicate",
+    "duplicateWithDownstream": "Duplicate with downstream blocks",
+    "deleteBlock": "Delete block",
+    "replaceWith": "Replace with",
+    "checking": "Checking which blocks fit...",
+    "noReplacement": "No other block fits here",
+    "replaced": "Replaced {{from}} with {{to}}",
+    "keptOptions_one": "Kept {{kept}} of {{count}} option",
+    "keptOptions_other": "Kept {{kept}} of {{count}} options",
+    "undoStale": "Can't undo the replace: the block has changed since.",
+    "undoStaleHint": "Use Undo in the header instead."
+  },
+  "layout": {
+    "hideBlockPalette": "Hide block palette",
+    "showBlockPalette": "Show block palette",
+    "hideConfigPanel": "Hide config panel",
+    "showConfigPanel": "Show config panel",
+    "resizeSidebar": "Resize sidebar"
+  },
+  "mobile": {
+    "addBlock": "Add block",
+    "blockConfiguration": "Block configuration"
+  },
+  "configPanel": {
+    "emptyTitle": "Nothing selected",
+    "emptyDescription": "Pick a block on the canvas to configure it, or start here.",
+    "addSource": "Add a source",
+    "startFromPreset": "Open a workflow",
+    "dropHint": "or drop a workflow file here",
+    "inputConnections": "Input connections",
+    "configuration": "Configuration",
+    "noConfigOptions": "No configuration options",
+    "noCompatibleSources": "No compatible sources",
+    "selectSource": "Select source...",
+    "deleteBlock": "Delete block",
+    "deleteConfirm": "Are you sure you want to delete \"{{title}}\"? This action cannot be undone.",
+    "cancel": "Cancel",
+    "delete": "Delete"
+  },
+  "palette": {
+    "title": "Block palette",
+    "searchPlaceholder": "Search blocks...",
+    "noBlocksAvailable": "No {{kind}} blocks available",
+    "notAvailableAtStep": "Not available at this step",
+    "addBlock": "Add {{title}}",
+    "loadingBlocks": "Loading available blocks...",
+    "clickSourceToStart": "Click or drag a source to get started",
+    "clickToAdd": "Click or drag blocks onto the canvas",
+    "usableOnly": "Only usable now",
+    "view": "View",
+    "searchShortcut": "Press / to search",
+    "compact": "Compact rows",
+    "noMatches": "No blocks match",
+    "filter": "Filter blocks",
+    "show": "Show",
+    "plugins": "Plugins",
+    "resetFilters": "Reset filters",
+    "removeFilter": "Remove filter: {{filter}}"
+  },
+  "addBlockNode": {
+    "addKind": "Add {{label}}"
+  },
+  "nodeControls": {
+    "addNew": "Add new {{direction}}",
+    "jumpToExisting": "Jump to existing",
+    "directionUpstream": "upstream",
+    "directionDownstream": "downstream"
+  },
+  "graphOptions": {
+    "view": "View",
+    "tidyUp": "Tidy up workflow",
+    "unlockNodes": "Unlock nodes",
+    "lockNodes": "Lock nodes",
+    "showMinimap": "Show minimap",
+    "layout": "Layout",
+    "direction": "Direction",
+    "topToBottom": "↓ Top to bottom",
+    "leftToRight": "→ Left to right"
+  },
+  "canvasStatus": {
+    "zoom": "{{value}}%",
+    "edgeCount_one": "{{count}} connection",
+    "edgeCount_other": "{{count}} connections"
+  },
+  "addNode": {
+    "searchPlaceholder": "Search blocks...",
+    "noBlocksFound": "No blocks found",
+    "modeBranch": "Branch",
+    "modeInsert": "Insert",
+    "dropBranch": "New branch",
+    "dropInsert": "Slice & insert",
+    "dropConnect": "Connect"
+  },
+  "qubeLens": {
+    "title": "Qube at this edge",
+    "dimensionCount_one": "{{count}}D",
+    "dimensionCount_other": "{{count}}D",
+    "handleLabel": "Inspect the qube on this edge",
+    "statDimensions": "Dimensions",
+    "statFields": "Fields",
+    "narrowedDiff": "narrowed {{from}} → {{to}}",
+    "tabDimensions": "Dimensions",
+    "tabSelection": "Selection",
+    "requestEmpty": "No coordinates.",
+    "searchPlaceholder": "Search axes or values…",
+    "hideFixed": "Hide fixed",
+    "narrowedBadge": "narrowed",
+    "fieldsUnit": "fields",
+    "close": "Close",
+    "barTooltip_one": "{{dimension}} · {{count}} value",
+    "barTooltip_other": "{{dimension}} · {{count}} values"
+  },
+  "blockNode": {
+    "configureBlock": "Configure block",
+    "deleteBlock": "Delete block",
+    "deleteConfirm": "Are you sure you want to delete \"{{title}}\" and all connected downstream blocks? This action cannot be undone.",
+    "cancel": "Cancel",
+    "delete": "Delete",
+    "moreCount": "+{{count}} more",
+    "isDefault": "default",
+    "outputHandle": "Output"
+  },
+  "review": {
+    "title": "Review workflow",
+    "subtitle": "Review your workflow before submitting.",
+    "validatingTitle": "Validating workflow",
+    "validatingDescription": "Please wait while we validate your workflow...",
+    "hasErrorsTitle": "Workflow has errors",
+    "fixIssues": "Please fix the following issues before submitting:",
+    "blockLevelErrors_one": "{{count}} block-level error found.",
+    "blockLevelErrors_other": "{{count}} block-level errors found.",
+    "readyTitle": "Ready to submit",
+    "readyDescription": "Your workflow is valid and ready to be submitted.",
+    "summaryTitle": "Workflow summary",
+    "summaryDescription_one": "{{count}} block configured",
+    "summaryDescription_other": "{{count}} blocks configured",
+    "backToEdit": "Back to edit",
+    "submitJob": "Start run",
+    "kindHeading": "{{label}}s"
+  },
+  "configSummary": {
+    "unknownSource": "Unknown",
+    "defaultConfiguration": "Default configuration"
+  },
+  "blockKind": {
+    "source": {
+      "label": "Source",
+      "description": "Data sources like forecasts and initial conditions"
+    },
+    "transform": {
+      "label": "Transform",
+      "description": "Transform and process data"
+    },
+    "product": {
+      "label": "Product",
+      "description": "Compute derived products from data"
+    },
+    "sink": {
+      "label": "Output",
+      "description": "Store or visualise results"
+    }
+  },
+  "template": {
+    "prefilled": "Example values applied — adjust and save as your own workflow",
+    "examplesUnavailable": "Template examples couldn't be loaded — starting without prefilled values",
+    "applied": "Template parameters applied",
+    "dialog": {
+      "title": "Template parameters",
+      "description": "Provide values for this template's placeholders — everything can still be changed in the builder.",
+      "missingVarsTitle": "Missing variables",
+      "missingVarsDescription": "This workflow references variables that are not defined on this system. Provide values and choose per variable whether it is stored in the workflow (local) or on this system (global).",
+      "usedIn": "Used in {{block}} → {{option}}",
+      "setsOption": "Sets {{option}}",
+      "usedInMore": "+{{count}}",
+      "prefilled": "Prefilled by the template ({{count}})",
+      "apply": "Apply",
+      "skip": "Skip",
+      "missingValue": "Needs a value",
+      "validating": "Validating…",
+      "valid": "Workflow validates",
+      "issues": "{{count}} validation issue",
+      "issues_other": "{{count}} validation issues"
+    }
+  },
+  "shelf": {
+    "title": "Unsaved work set aside",
+    "setAside": "Previous workflow set aside — restore it from the bar above the canvas.",
+    "evicted": "Replaced the workflow that was set aside earlier.",
+    "swapped": "Your work swapped onto the shelf — restore it from the bar above the canvas.",
+    "restore": "Restore",
+    "export": "Export",
+    "discard": "Discard set-aside workflow",
+    "untitled": "Untitled workflow",
+    "blockCount_one": "{{count}} block",
+    "blockCount_other": "{{count}} blocks",
+    "justNow": "just now",
+    "minutesAgo_one": "{{count}} minute ago",
+    "minutesAgo_other": "{{count}} minutes ago",
+    "hoursAgo_one": "{{count}} hour ago",
+    "hoursAgo_other": "{{count}} hours ago",
+    "daysAgo_one": "{{count}} day ago",
+    "daysAgo_other": "{{count}} days ago"
+  },
+  "help": {
+    "open": "Help & shortcuts",
+    "title": "Workflow canvas",
+    "intro": "A workflow is a chain of blocks: data flows from a source through transforms and products into outputs. Build it on the canvas, configure each block on the right, and run it from the header.",
+    "sections": {
+      "canvas": {
+        "title": "Canvas",
+        "body": "Blocks are cards wired left to right. Drag to pan, scroll to zoom, and use the controls in the corner to fit the view. Click a card to select it; its + handle adds a connected block, or drag from the handle to wire by hand."
+      },
+      "palette": {
+        "title": "Block palette",
+        "body": "Every block you can use, grouped by kind: <sourceKind>Source</sourceKind> fetches data, <transformKind>Transform</transformKind> reshapes it, <productKind>Product</productKind> computes something new, <outputKind>Output</outputKind> stores or plots the result. Blocks come from installed plugins — the Plugins page adds more. Greyed rows cannot follow the currently selected block."
+      },
+      "configure": {
+        "title": "Configuring a block",
+        "body": "The panel on the right lists the selected block’s inputs and fields. Fields offer the values the upstream data actually has. Type ${…} to reference a variable — local variables and glyphs resolve at run time."
+      },
+      "validation": {
+        "title": "Validation",
+        "body": "Every edit is checked on the spot. A red ring marks a block with issues; the header badge counts them and lists them — each entry jumps to its block. The pipeline can be run once it reads “Valid”."
+      },
+      "run": {
+        "title": "Running and saving",
+        "body": "Run Once submits the workflow and opens its run page; the caret next to it offers a review step and scheduling. Save Workflow keeps it in My Workflows; the more menu shares, exports, or loads a workflow file. Unsaved work is kept as a draft in this browser."
+      }
+    },
+    "shortcuts": {
+      "title": "Keyboard shortcuts",
+      "undo": "Undo",
+      "redo": "Redo"
+    }
   }
 }

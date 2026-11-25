@@ -1,0 +1,419 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {
+  Background,
+  BackgroundVariant,
+  Controls,
+  Panel,
+  ReactFlow,
+  ReactFlowProvider,
+  useNodesState,
+  useReactFlow,
+} from '@xyflow/react'
+import '@xyflow/react/dist/style.css'
+import { Maximize2, Minimize2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import type {
+  BlockFactoryCatalogue,
+  BlockInstanceId,
+  FableBuilderV1,
+} from '@/api/types/fable.types'
+import type { JobStatus } from '@/api/types/job.types'
+import type { NodeDimensions } from '@/features/fable-builder/utils/layout-blocks'
+import { useFableValidation } from '@/api/hooks/useFable'
+import { useMedia } from '@/hooks/useMedia'
+import { CanvasMiniMap } from '@/components/common/CanvasMiniMap'
+import { withMeasured } from '@/components/common/canvas-measured'
+import {
+  fableToEdges,
+  fableToNodes,
+} from '@/features/fable-builder/utils/fable-to-graph'
+import { layoutNodes } from '@/features/fable-builder/utils/layout-blocks'
+import { BeamEdge } from '@/features/executions/components/BeamEdge'
+import { RunNode } from '@/features/executions/components/RunNode'
+import { useExecutionHoverStore } from '@/features/executions/stores/executionHoverStore'
+import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
+import { cn } from '@/lib/utils'
+
+const ShowConfigContext = createContext(false)
+
+export function useShowConfig() {
+  return useContext(ShowConfigContext)
+}
+
+/** As-run values keyed by block, then option; empty until they resolve. */
+const ResolvedConfigContext = createContext<
+  Record<string, Record<string, string | null>>
+>({})
+
+export function useResolvedConfigFor(
+  blockId: string,
+): Record<string, string | null> | undefined {
+  return useContext(ResolvedConfigContext)[blockId]
+}
+
+const ValueTypesContext = createContext<Record<string, Record<string, string>>>(
+  {},
+)
+
+/** Option types narrowed by validation. */
+export function useValueTypesFor(
+  blockId: string,
+): Record<string, string> | undefined {
+  return useContext(ValueTypesContext)[blockId]
+}
+
+export interface BlockProgressInfo {
+  completedSet: ReadonlySet<BlockInstanceId>
+  plannedSet: ReadonlySet<BlockInstanceId>
+  /** Planned − completed; populated only while overall status is `running`. */
+  runningSet: ReadonlySet<BlockInstanceId>
+}
+
+const EMPTY_PROGRESS: BlockProgressInfo = {
+  completedSet: new Set(),
+  plannedSet: new Set(),
+  runningSet: new Set(),
+}
+
+const BlockProgressContext = createContext<BlockProgressInfo>(EMPTY_PROGRESS)
+
+export function useBlockProgress(): BlockProgressInfo {
+  return useContext(BlockProgressContext)
+}
+
+interface RunCanvasProps {
+  fable: FableBuilderV1
+  catalogue: BlockFactoryCatalogue
+  status?: JobStatus
+  /** Optional + nullable: backend emits only on /run/get and clears on terminal status. */
+  completedBlockIds?: ReadonlyArray<BlockInstanceId> | null
+  plannedBlockIds?: ReadonlyArray<BlockInstanceId> | null
+  /** As-run values by block then option; absent while loading or unrecorded. */
+  resolvedConfig?: Record<string, Record<string, string | null>>
+}
+
+/** Fit never zooms past 1:1 — a tiny graph stays natural-sized, not blown up. */
+const FIT_MAX_ZOOM = 1
+
+/** Stable identity so an absent map does not remount every consumer. */
+const EMPTY_RESOLVED: Record<string, Record<string, string>> = {}
+
+const EMPTY_TYPES: Record<string, Record<string, string>> = {}
+
+const nodeTypes: Record<string, typeof RunNode> = {
+  sourceBlock: RunNode,
+  transformBlock: RunNode,
+  productBlock: RunNode,
+  sinkBlock: RunNode,
+}
+
+const edgeTypes = {
+  beam: BeamEdge,
+}
+
+function RunCanvasInner({
+  fable,
+  catalogue,
+  status,
+  completedBlockIds,
+  plannedBlockIds,
+  resolvedConfig,
+}: RunCanvasProps) {
+  // Primitive selectors (per field) — an object-returning selector would
+  // mint a new reference each render and loop Zustand's Object.is check.
+  const selectedBlockId = useExecutionHoverStore(
+    (state) => state.selectedBlockId,
+  )
+  const setSelectedBlockId = useExecutionHoverStore(
+    (state) => state.setSelectedBlockId,
+  )
+  const { t } = useTranslation('executions')
+  const [showConfig, setShowConfig] = useState(true)
+  const [maximized, setMaximized] = useState(false)
+  const isDesktop = useMedia('(min-width: 1024px)')
+  const isPhone = useMedia('(max-width: 639px)')
+  // Inline needs desktop room; maximized has room on anything but a phone.
+  const showMiniMap = maximized ? !isPhone : isDesktop
+  const { fitView } = useReactFlow()
+  const containerRef = useRef<HTMLDivElement>(null)
+  const isInitialRender = useRef(true)
+
+  useEffect(() => {
+    if (!maximized) return
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMaximized(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [maximized])
+
+  useEffect(() => {
+    if (isInitialRender.current) {
+      isInitialRender.current = false
+      return
+    }
+    // Wait a frame for nodes to re-render at their new size
+    requestAnimationFrame(() => {
+      fitView({ duration: 300, padding: 0.1, maxZoom: FIT_MAX_ZOOM })
+    })
+  }, [showConfig, fitView])
+
+  // React Flow's mount-time fit locks to the initial container size; refit
+  // on resize so wide↔narrow transitions don't strand nodes outside the viewport.
+  useEffect(() => {
+    const element = containerRef.current
+    if (!element) return
+    let timer = 0
+    const observer = new ResizeObserver((entries) => {
+      const { width, height } = entries[entries.length - 1].contentRect
+      if (width === 0 || height === 0) return // skip transient 0×0 during reflow
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        fitView({ padding: 0.15, duration: 200, maxZoom: FIT_MAX_ZOOM })
+      }, 80)
+    })
+    observer.observe(element)
+    return () => {
+      observer.disconnect()
+      window.clearTimeout(timer)
+    }
+  }, [fitView])
+
+  const isRunning = status === 'running'
+
+  const blockProgress = useMemo<BlockProgressInfo>(() => {
+    const completedSet = new Set<BlockInstanceId>(completedBlockIds ?? [])
+    const plannedSet = new Set<BlockInstanceId>(plannedBlockIds ?? [])
+    const runningSet = new Set<BlockInstanceId>()
+    if (isRunning) {
+      for (const id of plannedSet) {
+        if (!completedSet.has(id)) runningSet.add(id)
+      }
+    }
+    return { completedSet, plannedSet, runningSet }
+  }, [completedBlockIds, plannedBlockIds, isRunning])
+
+  // Measured node sizes; the layout redoes itself once they are known.
+  const [nodeSizes, setNodeSizes] = useState<NodeDimensions>()
+
+  const { layoutedNodes, edges, canvasHeight } = useMemo(() => {
+    const nodes = fableToNodes(fable, catalogue)
+    const edgeList = fableToEdges(fable, catalogue)
+    // 200/130 = RunNode's real size (the 280 default padded gaps); 48s apart.
+    const laid = layoutNodes(
+      nodes,
+      edgeList,
+      {
+        direction: 'LR',
+        nodeWidth: 200,
+        nodeHeight: 130,
+        nodeSpacingX: 48,
+        nodeSpacingY: 48,
+      },
+      nodeSizes,
+    )
+    const hasPlanInfo = blockProgress.plannedSet.size > 0
+    const remapped = edgeList.map((e) => {
+      // Running → every edge gets the ambient beam (track + drifting dots);
+      // the glowing worm marks only edges into currently-running blocks
+      // (or everything when no detailed plan is available).
+      const worm =
+        isRunning && (!hasPlanInfo || blockProgress.runningSet.has(e.target))
+      return {
+        ...e,
+        type: isRunning ? ('beam' as const) : ('smoothstep' as const),
+        data: { worm },
+        animated: false,
+        style: undefined,
+      }
+    })
+    return {
+      layoutedNodes: laid,
+      edges: remapped,
+      canvasHeight: computeCanvasHeight(laid),
+    }
+  }, [fable, catalogue, isRunning, blockProgress, nodeSizes])
+  // React Flow owns the node state so its measurements stick across rebuilds.
+  const [nodes, setNodes, onNodesChange] = useNodesState(layoutedNodes)
+  useEffect(() => {
+    setNodes((prev) => withMeasured(layoutedNodes, prev))
+  }, [layoutedNodes, setNodes])
+  useEffect(() => {
+    const sizes: NodeDimensions = {}
+    for (const node of nodes) {
+      const { width, height } = node.measured ?? {}
+      if (!width || !height) return
+      sizes[node.id] = { width: Math.round(width), height: Math.round(height) }
+    }
+    setNodeSizes((prev) => (sameSizes(prev, sizes) ? prev : sizes))
+  }, [nodes])
+
+  return (
+    <ShowConfigContext value={showConfig}>
+      <ResolvedConfigContext value={resolvedConfig ?? EMPTY_RESOLVED}>
+        <BlockProgressContext value={blockProgress}>
+          <div
+            ref={containerRef}
+            style={maximized ? undefined : { height: `${canvasHeight}px` }}
+            className={cn(
+              'relative overflow-hidden',
+              maximized
+                ? 'fixed inset-0 z-50 bg-background'
+                : [
+                    'rounded-lg',
+                    // Narrow: inline `height` is the authority (React Flow needs a
+                    // definite height, not just `min-height`). Wide: `!h-full`
+                    // overrides it so the canvas fills the bounded column.
+                    'min-[1280px]:!h-full min-[1280px]:min-h-0 min-[1280px]:flex-1',
+                  ],
+            )}
+          >
+            <ReactFlow
+              nodes={nodes}
+              onNodesChange={onNodesChange}
+              edges={edges}
+              nodeTypes={nodeTypes}
+              edgeTypes={edgeTypes}
+              nodesDraggable={false}
+              nodesConnectable={false}
+              elementsSelectable={false}
+              panOnDrag={true}
+              zoomOnScroll={true}
+              fitView={true}
+              fitViewOptions={{ padding: 0.15, maxZoom: FIT_MAX_ZOOM }}
+              // Default 0.5 floor can't fit a wide pipeline into a phone container.
+              minZoom={0.1}
+              onNodeClick={(_event, node) => {
+                // Toggle: click the already-selected block to clear.
+                setSelectedBlockId(selectedBlockId === node.id ? null : node.id)
+              }}
+              onPaneClick={() => {
+                if (selectedBlockId !== null) setSelectedBlockId(null)
+              }}
+            >
+              <Background
+                variant={BackgroundVariant.Dots}
+                gap={24}
+                size={1.5}
+                color="#cbd5e1"
+                className="dark:opacity-30"
+              />
+              <Controls
+                showInteractive={false}
+                position="bottom-left"
+                className="bottom-2! left-2!"
+              />
+              {showMiniMap && <CanvasMiniMap />}
+              <Panel position="top-left" className="top-2! left-2!">
+                <label className="flex h-7 cursor-pointer items-center gap-2 rounded-md border bg-background/80 px-2.5 text-sm font-medium shadow-xs backdrop-blur-sm hover:bg-muted">
+                  <Checkbox
+                    checked={showConfig}
+                    onCheckedChange={(checked) => setShowConfig(checked)}
+                    // A neutral tick: no primary fill on the canvas.
+                    className="data-checked:border-input data-checked:bg-transparent data-checked:text-foreground dark:data-checked:bg-input/30"
+                  />
+                  {t('detail.parameters')}
+                </label>
+              </Panel>
+              <Panel position="top-right" className="top-2! right-2!">
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-7 w-7 bg-background/80 backdrop-blur-sm"
+                  onClick={() => setMaximized((prev) => !prev)}
+                  aria-label={t(
+                    maximized
+                      ? 'detail.restoreCanvas'
+                      : 'detail.maximizeCanvas',
+                  )}
+                  title={t(
+                    maximized
+                      ? 'detail.restoreCanvas'
+                      : 'detail.maximizeCanvas',
+                  )}
+                >
+                  {maximized ? (
+                    <Minimize2 className="h-3.5 w-3.5" />
+                  ) : (
+                    <Maximize2 className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+              </Panel>
+            </ReactFlow>
+          </div>
+        </BlockProgressContext>
+      </ResolvedConfigContext>
+    </ShowConfigContext>
+  )
+}
+
+export function RunCanvas(props: RunCanvasProps) {
+  const { data: validation } = useFableValidation(props.fable)
+  return (
+    <ReactFlowProvider>
+      <ValueTypesContext
+        value={validation?.configuration_restrictions ?? EMPTY_TYPES}
+      >
+        <RunCanvasInner {...props} />
+      </ValueTypesContext>
+    </ReactFlowProvider>
+  )
+}
+
+const MIN_CANVAS_HEIGHT = 280
+const MAX_CANVAS_HEIGHT = 520
+/** Padding above + below the laid-out nodes so the Show-config / controls
+ * overlays don't clip the top/bottom rows. */
+const VERTICAL_CHROME_PADDING = 96
+
+interface PositionedNode {
+  position: { x: number; y: number }
+  measured?: { width?: number; height?: number }
+  width?: number
+  height?: number
+}
+
+function sameSizes(a: NodeDimensions | undefined, b: NodeDimensions): boolean {
+  if (!a || Object.keys(a).length !== Object.keys(b).length) return false
+  return Object.entries(b).every(([id, size]) => {
+    const was = a[id] as NodeDimensions[string] | undefined
+    return was?.width === size.width && was.height === size.height
+  })
+}
+
+/**
+ * Compute a viewport height that fits the laid-out node bbox. Falls back
+ * to MIN_CANVAS_HEIGHT for empty / tiny graphs and clamps at
+ * MAX_CANVAS_HEIGHT so a runaway graph doesn't take over the page.
+ */
+function computeCanvasHeight(nodes: ReadonlyArray<PositionedNode>): number {
+  if (nodes.length === 0) return MIN_CANVAS_HEIGHT
+  let maxBottom = 0
+  for (const node of nodes) {
+    // dagre sets `width`/`height` on the node; fall back to a sensible
+    // default if the layout step skipped a node for any reason.
+    const h = node.measured?.height ?? node.height ?? 130
+    const bottom = node.position.y + h
+    if (bottom > maxBottom) maxBottom = bottom
+  }
+  const total = maxBottom + VERTICAL_CHROME_PADDING
+  return Math.max(MIN_CANVAS_HEIGHT, Math.min(MAX_CANVAS_HEIGHT, total))
+}

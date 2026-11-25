@@ -10,6 +10,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest'
 import { useUiStore } from '@/stores/uiStore'
+import { STORAGE_KEYS } from '@/lib/storage-keys'
 
 describe('uiStore', () => {
   beforeEach(() => {
@@ -44,46 +45,6 @@ describe('uiStore', () => {
     })
   })
 
-  describe('layout', () => {
-    it('starts with fluid layout mode', () => {
-      expect(useUiStore.getState().layoutMode).toBe('fluid')
-    })
-
-    it('sets layout mode', () => {
-      useUiStore.getState().setLayoutMode('boxed')
-      expect(useUiStore.getState().layoutMode).toBe('boxed')
-    })
-
-    it('starts with gradient dashboard variant', () => {
-      expect(useUiStore.getState().dashboardVariant).toBe('gradient')
-    })
-
-    it('sets dashboard variant', () => {
-      useUiStore.getState().setDashboardVariant('modern')
-      expect(useUiStore.getState().dashboardVariant).toBe('modern')
-    })
-
-    it('starts with no panel shadow', () => {
-      expect(useUiStore.getState().panelShadow).toBe('none')
-    })
-
-    it('sets panel shadow', () => {
-      useUiStore.getState().setPanelShadow('md')
-      expect(useUiStore.getState().panelShadow).toBe('md')
-    })
-
-    it('sets panel shadow to all variants', () => {
-      useUiStore.getState().setPanelShadow('sm')
-      expect(useUiStore.getState().panelShadow).toBe('sm')
-
-      useUiStore.getState().setPanelShadow('lg')
-      expect(useUiStore.getState().panelShadow).toBe('lg')
-
-      useUiStore.getState().setPanelShadow('none')
-      expect(useUiStore.getState().panelShadow).toBe('none')
-    })
-  })
-
   describe('admin view modes', () => {
     it('has correct default view modes', () => {
       expect(useUiStore.getState().pluginsViewMode).toBe('table')
@@ -107,6 +68,83 @@ describe('uiStore', () => {
     it('sets artifacts view mode', () => {
       useUiStore.getState().setArtifactsViewMode('table')
       expect(useUiStore.getState().artifactsViewMode).toBe('table')
+    })
+  })
+
+  describe('timezone', () => {
+    it('defaults to UTC', () => {
+      expect(useUiStore.getState().timeZone).toBe('UTC')
+    })
+
+    it('sets the application timezone', () => {
+      useUiStore.getState().setTimeZone('Europe/Berlin')
+      expect(useUiStore.getState().timeZone).toBe('Europe/Berlin')
+    })
+
+    it('persists the timezone to localStorage', () => {
+      useUiStore.getState().setTimeZone('Asia/Tokyo')
+      const stored = JSON.parse(
+        localStorage.getItem(STORAGE_KEYS.stores.ui) ?? '{}',
+      )
+      expect(stored.state?.timeZone).toBe('Asia/Tokyo')
+    })
+
+    it('reset restores UTC', () => {
+      useUiStore.getState().setTimeZone('America/New_York')
+      useUiStore.getState().reset()
+      expect(useUiStore.getState().timeZone).toBe('UTC')
+    })
+  })
+
+  describe('timezone migration', () => {
+    it('back-fills timeZone to UTC for a pre-v6 (v5) persisted state', async () => {
+      localStorage.setItem(
+        STORAGE_KEYS.stores.ui,
+        JSON.stringify({
+          state: {
+            theme: 'dark',
+            pluginsViewMode: 'card',
+            modelsViewMode: 'card',
+            artifactsViewMode: 'card',
+          },
+          version: 5,
+        }),
+      )
+      await useUiStore.persist.rehydrate()
+      expect(useUiStore.getState().timeZone).toBe('UTC')
+      // Pre-existing persisted fields survive the migration.
+      expect(useUiStore.getState().theme).toBe('dark')
+    })
+
+    it('drops the layout and card-style switches from a v6 persisted state', async () => {
+      localStorage.setItem(
+        STORAGE_KEYS.stores.ui,
+        JSON.stringify({
+          state: {
+            theme: 'dark',
+            layoutMode: 'boxed',
+            dashboardVariant: 'modern',
+            panelShadow: 'md',
+            timeZone: 'Europe/Berlin',
+          },
+          version: 6,
+        }),
+      )
+      await useUiStore.persist.rehydrate()
+      const state = useUiStore.getState() as unknown as Record<string, unknown>
+      expect(state.layoutMode).toBeUndefined()
+      expect(state.dashboardVariant).toBeUndefined()
+      expect(state.panelShadow).toBeUndefined()
+      expect(useUiStore.getState().timeZone).toBe('Europe/Berlin')
+    })
+
+    it('back-fills timeZone for an old v1 persisted state', async () => {
+      localStorage.setItem(
+        STORAGE_KEYS.stores.ui,
+        JSON.stringify({ state: { theme: 'light' }, version: 1 }),
+      )
+      await useUiStore.persist.rehydrate()
+      expect(useUiStore.getState().timeZone).toBe('UTC')
     })
   })
 
@@ -143,7 +181,6 @@ describe('uiStore', () => {
     it('resets all state to initial values', () => {
       // Modify some state
       useUiStore.getState().setTheme('dark')
-      useUiStore.getState().setLayoutMode('boxed')
       useUiStore.getState().setIsInitialized(true)
 
       // Reset
@@ -151,7 +188,6 @@ describe('uiStore', () => {
 
       // Verify initial state is restored
       expect(useUiStore.getState().theme).toBe('system')
-      expect(useUiStore.getState().layoutMode).toBe('fluid')
       expect(useUiStore.getState().isInitialized).toBe(false)
     })
   })

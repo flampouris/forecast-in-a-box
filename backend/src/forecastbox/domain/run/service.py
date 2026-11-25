@@ -15,7 +15,7 @@ Owns:
 - status polling with cascade,
 - linked-blueprint lookup,
 - output availability / content lookups,
-- logs packaging.
+- (logs packaging lives in ``domain/run/logs.py``).
 
 No HTTP exceptions are raised here; callers are responsible for mapping domain
 exceptions (``RunNotFound``, ``RunAccessDenied``) to HTTP responses.
@@ -24,29 +24,53 @@ Authorization is enforced via ``domain.run.db`` which filters / rejects
 based on the supplied ``AuthContext``.
 """
 
-import asyncio
 import logging
+from functools import partial
 from typing import cast
 
 from cascade.controller.report import JobId
 from cascade.gateway import api, client
-from cascade.low.core import TaskId
+from cascade.low.core import DatasetId, TaskId
 from cascade.low.func import Either
+from fiab_core.fable import BlockInstanceId, is_textual
+from pydantic import Field
 
 import forecastbox.domain.blueprint.db as blueprint_db
 import forecastbox.domain.run.db as run_db
+from forecastbox.domain.blueprint.db import BlueprintRecord
 from forecastbox.domain.blueprint.types import BlueprintId
-from forecastbox.domain.experiment.types import ExperimentDefinitionId
+from forecastbox.domain.gateway.exceptions import GatewayExited, GatewayNotStarted
+from forecastbox.domain.gateway.service import get_current_cascade_proc, get_gateway_url
 from forecastbox.domain.run.background import execute_background
-from forecastbox.domain.run.db import CompilerRuntimeContext
-from forecastbox.domain.run.exceptions import RunNotFound
-from forecastbox.domain.run.types import RunId
-from forecastbox.schemata.jobs import Blueprint, Run
+from forecastbox.domain.run.cascade import RunOutputCharacteristic, RunOutputs, stored_output_max_length
+from forecastbox.domain.run.db import CompilerRuntimeContext, RunRecord
+from forecastbox.domain.run.detail import retrieve_compilation_detail
+from forecastbox.domain.run.exceptions import CompilationDetailCorrupted, CompilationDetailNotFound, RunConcurrencyIssue, RunNotFound
+from forecastbox.domain.run.stop import submit_stop_cascade
+from forecastbox.domain.run.types import ExperimentDefinitionId, RunId
+from forecastbox.schemata.run import RunStatus
 from forecastbox.utility.auth import AuthContext
-from forecastbox.utility.config import config
+from forecastbox.utility.concurrency.manager import SubmissionRejected, TaskName, execution_manager
+from forecastbox.utility.config import ConcurrentPools
+from forecastbox.utility.httpx import get_encoding
+from forecastbox.utility.memcache import pop as pop_memcache
 from forecastbox.utility.pydantic import FiabBaseModel
+from forecastbox.utility.time import value_dt2str
 
 logger = logging.getLogger(__name__)
+
+
+def _decode_textual_output(raw: bytes, mime_type: str) -> str:
+    """Decode raw bytes to string using the charset declared in the mime_type.
+
+    Falls back to utf-8 when no charset is specified. On decode error, stores a
+    diagnostic message instead of raising.
+    """
+    encoding = get_encoding(mime_type)
+    try:
+        return raw.decode(encoding)[:stored_output_max_length]
+    except Exception as e:
+        return f"Decoding Error: {repr(e)}"[:stored_output_max_length]
 
 
 class RunDetail(FiabBaseModel):
@@ -54,16 +78,21 @@ class RunDetail(FiabBaseModel):
 
     run_id: RunId
     attempt_count: int
-    status: str
+    status: RunStatus
     created_at: str
     updated_at: str
+    user: str
     blueprint_id: BlueprintId
     blueprint_version: int
     error: str | None = None
     progress: str | None = None
     cascade_job_id: str | None = None
     available_task_ids: list[TaskId] | None = None
+    lost_task_ids: dict[TaskId, str] = Field(default_factory=dict)
     outputs: dict | None = None
+    completed_block_ids: set[BlockInstanceId] | None = None
+    planned_block_ids: set[BlockInstanceId] | None = None
+    resolution: dict[BlockInstanceId, dict[str, str | None]] | None = None
 
 
 class ExecuteResult(FiabBaseModel):
@@ -75,13 +104,37 @@ class ExecuteResult(FiabBaseModel):
     """Attempt number; always 1 on a fresh execution."""
 
 
-async def get_blueprint_for_execution(blueprint_id: BlueprintId, blueprint_version: int | None) -> Blueprint | None:
+def get_characteristic_of_output(execution: RunRecord, dataset_id: DatasetId) -> Either[RunOutputCharacteristic, str]:  # type: ignore[invalid-argument]
+    """Return the declared characteristic for a run output task."""
+    raw_outputs = execution.outputs
+    if raw_outputs is None:
+        return Either.error(f"Run {execution.run_id!r} has no recorded outputs yet")
+
+    try:
+        outputs = RunOutputs.model_validate(raw_outputs)
+    except Exception as e:
+        return Either.error(f"Run {execution.run_id!r} has invalid output metadata: {e!r}")
+
+    task_id = dataset_id.task
+    characteristic = outputs.outputs.get(task_id)
+    if characteristic is None:
+        return Either.error(f"Output {task_id!r} not found for run {execution.run_id!r}")
+    return Either.ok(characteristic)
+
+
+async def get_blueprint_for_execution(blueprint_id: BlueprintId, blueprint_version: int | None) -> BlueprintRecord | None:
     """Retrieve a Blueprint from the jobs store by id and optional version."""
-    return await blueprint_db.get_blueprint(blueprint_id, blueprint_version)
+    return cast(
+        BlueprintRecord | None,
+        await execution_manager.await_jobs_db(
+            "blueprint.get",
+            partial(blueprint_db.get_blueprint, blueprint_id, blueprint_version),
+        ),
+    )
 
 
-async def execute(
-    blueprint: Blueprint,
+def submit_run_sync(
+    blueprint: BlueprintRecord,
     auth_context: AuthContext,
     run_id: RunId | None = None,
     experiment_id: ExperimentDefinitionId | None = None,
@@ -91,46 +144,84 @@ async def execute(
 ) -> Either[ExecuteResult, str]:  # type: ignore[invalid-argument]
     """Always creates a Run linked to the given Blueprint.
 
-    Inserts a Run row immediately and returns an ExecuteResult, then fires off
-    compilation and cascade submission in a thread-pool executor so the async loop
-    is not blocked.  When ``run_id`` is supplied the new attempt is appended under
+    Inserts a Run row and enqueues compilation and cascade submission onto
+    the RunSubmission pool so this call can quickly return the ExecuteResult.
+    When ``run_id`` is supplied the new attempt is appended under
     that existing id (restart semantics); otherwise a fresh id is generated by the
     database layer.  Experiment metadata is stored on the row when provided and
-    preserved on restart.
+    preserved on restart.  If the RunSubmission pool rejects the task, the
+    inserted Run row is marked failed and an error is returned; no exception
+    escapes for that case.
     """
     logger.debug(f"starting blueprint execution {blueprint.blueprint_id}")
     if not blueprint.builder:
         return Either.error(f"Blueprint {blueprint.blueprint_id!r} has no compilable blocks")
 
-    blueprint_id = BlueprintId(str(blueprint.blueprint_id))  # ty:ignore[invalid-argument-type]
-    blueprint_version = cast(int, blueprint.version)
-
-    new_run_id, attempt_count, created_at = await run_db.upsert_run(
+    new_run_id, attempt_count, created_at = run_db.upsert_run(
         run_id=run_id,
-        blueprint_id=blueprint_id,
-        blueprint_version=blueprint_version,
+        blueprint_id=blueprint.blueprint_id,
+        blueprint_version=blueprint.version,
         created_by=auth_context.user_id,
         status="submitted",
         experiment_id=experiment_id,
         experiment_version=experiment_version,
+        compiler_runtime_context=compiler_runtime_context,
         experiment_context=experiment_context,
     )
 
-    loop = asyncio.get_running_loop()
     logger.debug(f"submitting blueprint execution {blueprint.blueprint_id}")
-    loop.run_in_executor(
-        None,
-        execute_background,
-        new_run_id,
-        attempt_count,
-        created_at,
-        blueprint,
-        compiler_runtime_context,
-        loop,
-        auth_context,
-    )
+    try:
+        execution_manager.submit_monitored(
+            ConcurrentPools.RunSubmission,
+            TaskName("run.submit.execute"),
+            partial(
+                execute_background,
+                new_run_id,
+                attempt_count,
+                created_at,
+                blueprint,
+                compiler_runtime_context,
+                auth_context,
+            ),
+        )
+    except SubmissionRejected as e:
+        logger.warning(f"run submission rejected: {new_run_id=}, {attempt_count=}: {e!r}")
+        run_db.update_run_runtime(
+            new_run_id,
+            attempt_count,
+            expected_status="submitted",
+            status="failed",
+            error=f"run submission rejected: {e}"[:255],
+        )
+        return Either.error(f"Run submission rejected, try again later: {e}")
 
     return Either.ok(ExecuteResult(run_id=new_run_id, attempt_count=attempt_count))
+
+
+async def execute(
+    blueprint: BlueprintRecord,
+    auth_context: AuthContext,
+    run_id: RunId | None = None,
+    experiment_id: ExperimentDefinitionId | None = None,
+    experiment_version: int | None = None,
+    compiler_runtime_context: CompilerRuntimeContext = CompilerRuntimeContext(),
+    experiment_context: str | None = None,
+) -> Either[ExecuteResult, str]:  # type: ignore[invalid-argument]
+    """Always creates a Run linked to the given Blueprint."""
+    return await execution_manager.awaitable_submit(
+        ConcurrentPools.General,
+        TaskName("run.submit"),
+        partial(
+            submit_run_sync,
+            blueprint=blueprint,
+            auth_context=auth_context,
+            run_id=run_id,
+            experiment_id=experiment_id,
+            experiment_version=experiment_version,
+            compiler_runtime_context=compiler_runtime_context,
+            experiment_context=experiment_context,
+        ),
+    )
 
 
 async def restart_run(run_id: RunId, auth_context: AuthContext) -> Either[ExecuteResult, str]:  # type: ignore[invalid-argument]
@@ -139,68 +230,189 @@ async def restart_run(run_id: RunId, auth_context: AuthContext) -> Either[Execut
     Raises ``RunNotFound`` if the execution does not exist.
     Raises ``RunAccessDenied`` if the actor does not own the execution.
     """
-    existing = await run_db.get_run(run_id, auth_context=auth_context)
-    # get_run raises RunNotFound / RunAccessDenied on failure.
+    existing = cast(
+        RunRecord,
+        await execution_manager.await_jobs_db(
+            "run.get",
+            partial(run_db.get_run, run_id, auth_context=auth_context),
+        ),
+    )
 
-    blueprint_id = BlueprintId(str(existing.blueprint_id))  # ty:ignore[invalid-argument-type]
-    blueprint_version = cast(int, existing.blueprint_version)
-    blueprint = await blueprint_db.get_blueprint(blueprint_id, blueprint_version)
+    blueprint = cast(
+        BlueprintRecord | None,
+        await execution_manager.await_jobs_db(
+            "blueprint.get",
+            partial(blueprint_db.get_blueprint, existing.blueprint_id, existing.blueprint_version),
+        ),
+    )
     if blueprint is None:
-        return Either.error(f"Blueprint {blueprint_id!r} v{blueprint_version} not found")
+        return Either.error(f"Blueprint {existing.blueprint_id!r} v{existing.blueprint_version} not found")
 
-    raw_context = cast(dict, existing.compiler_runtime_context)
-    context = CompilerRuntimeContext.model_validate(raw_context)
+    context = CompilerRuntimeContext.model_validate(existing.compiler_runtime_context)
 
     return await execute(
         blueprint,
         auth_context,
         run_id=run_id,
-        experiment_id=ExperimentDefinitionId(str(existing.experiment_id)) if existing.experiment_id is not None else None,  # ty:ignore[invalid-argument-type]
-        experiment_version=cast(int | None, existing.experiment_version),
+        experiment_id=existing.experiment_id,
+        experiment_version=existing.experiment_version,
         compiler_runtime_context=context,
-        experiment_context=cast(str | None, existing.experiment_context),
+        experiment_context=existing.experiment_context,
     )
 
 
-async def poll_and_update(execution: Run) -> RunDetail:
-    """Poll cascade for a Run's status, update db if changed, and return current detail."""
-    run_id = RunId(str(execution.run_id))  # ty:ignore[invalid-argument-type]
-    actual_attempt = cast(int, execution.attempt_count)
-    cascade_job_id = cast(str | None, execution.cascade_job_id)
-    status = cast(str, execution.status)
+class _StaleRecord(Exception):
+    """Raised inside a poll when a compare-and-swap status write lost, so the Run is to be read again."""
+
+
+_POLL_ATTEMPTS = 3
+
+
+def _current_cascade_proc_or_none() -> int | str | None:
+    try:
+        return get_current_cascade_proc()
+    except (GatewayExited, GatewayNotStarted):
+        return None
+
+
+def _request_job_progress(job_id: JobId, detailed_report: bool) -> api.JobProgressResponse:
+    response = client.request_response(
+        api.JobProgressRequest(job_ids=[job_id], detailed_report=detailed_report),
+        get_gateway_url(),
+    )
+    return cast(api.JobProgressResponse, response)
+
+
+def _fetch_textual_values(job_id: JobId, candidates: dict[TaskId, str]) -> dict[TaskId, str]:
+    """Fetch and decode textual outputs from the gateway. Failures are logged per task and omitted from the result."""
+    values: dict[TaskId, str] = {}
+    for task_id, mime_type in candidates.items():
+        try:
+            fetch_resp = client.request_response(
+                api.ResultRetrievalRequest(job_id=job_id, dataset_id=DatasetId(task=task_id, output="0")),
+                get_gateway_url(),
+            )
+            fetch_resp = cast(api.ResultRetrievalResponse, fetch_resp)  # type: ignore[attr-defined]
+            if fetch_resp.error:
+                logger.warning("Failed to fetch value for task %r: %s", task_id, fetch_resp.error)
+                continue
+            decoded = api.decoded_result(fetch_resp, job=None)  # type: ignore[attr-defined]
+            if isinstance(decoded, bytes):
+                values[task_id] = _decode_textual_output(decoded, mime_type)
+        except Exception as e:
+            logger.warning("Failed to fetch value for task %r: %r", task_id, e)
+    return values
+
+
+def poll_and_update(execution: RunRecord, detailed_report: bool = False) -> RunDetail:
+    """Blocking: poll cascade for a Run's status, update db if changed, and return current detail.
+
+    Every status write is a compare-and-swap against the status in ``execution``. If it loses,
+    the Run is read again and the whole poll is redone on the fresh record, up to a few times.
+
+    A Run that is ``stopping`` is reconciled with the gateway: if the gateway still reports the job as
+    running, the stop is issued again; if it reports a completion or failure, that is recorded; if it
+    does not know the job anymore, the Run becomes ``stopped``.
+
+    Raises ``RunNotFound`` if the Run disappeared in the meantime, and ``RunConcurrencyIssue``
+    if it kept being modified concurrently.
+    """
+    for _ in range(_POLL_ATTEMPTS):
+        try:
+            return _poll_and_update_once(execution, detailed_report)
+        except _StaleRecord:
+            fresh = run_db.get_run_unchecked(execution.run_id, execution.attempt_count)
+            if fresh is None:
+                raise RunNotFound(f"Run {execution.run_id!r} not found.")
+            execution = fresh
+    raise RunConcurrencyIssue(f"Run {execution.run_id!r} is being modified concurrently, retry later.")
+
+
+def _poll_and_update_once(execution: RunRecord, detailed_report: bool) -> RunDetail:
+    run_id = execution.run_id
+    actual_attempt = execution.attempt_count
+    cascade_job_id = execution.cascade_job_id
+    status = execution.status
 
     # Derive available_task_ids from stored outputs without calling cascade for terminal states:
-    # completed → assume all outputs are available; failed → assume none are.
-    raw_outputs = cast(dict | None, execution.outputs)
+    # completed → assume all outputs are available while the same gateway process is active;
+    # failed → only those with a locally cached value.
+    raw_outputs = execution.outputs
+    stored_cascade_proc = getattr(execution, "cascade_proc", None)
     available_task_ids: list[TaskId] | None
+    lost_task_ids: dict[TaskId, str] = {}
     if status == "completed":
-        available_task_ids = [TaskId(k) for k in (raw_outputs or {}).get("outputs", {}).keys()]
-    elif status == "failed":
-        available_task_ids = []
+        current_cascade_proc = _current_cascade_proc_or_none()
+        if current_cascade_proc is not None and stored_cascade_proc == current_cascade_proc:
+            available_task_ids = [TaskId(k) for k in (raw_outputs or {}).get("outputs", {}).keys()]
+        elif raw_outputs:
+            try:
+                cached_outputs = RunOutputs.model_validate(raw_outputs)
+                available_task_ids = [tid for tid, char in cached_outputs.outputs.items() if char.value is not None]
+                lost_task_ids = {tid: "Gateway Proc changed" for tid, char in cached_outputs.outputs.items() if char.value is None}
+            except Exception:
+                available_task_ids = []
+        else:
+            available_task_ids = []
+    elif status in ("failed", "stopped"):
+        if raw_outputs:
+            try:
+                cached_outputs = RunOutputs.model_validate(raw_outputs)
+                available_task_ids = [tid for tid, char in cached_outputs.outputs.items() if char.value is not None]
+            except Exception:
+                available_task_ids = []
+        else:
+            available_task_ids = []
     else:
         available_task_ids = None
 
-    def _build(status_override: str | None = None, error_override: str | None = None, progress_override: str | None = None) -> RunDetail:
+    def _build(
+        status_override: RunStatus | None = None,
+        error_override: str | None = None,
+        progress_override: str | None = None,
+        completed_block_ids: set[BlockInstanceId] | None = None,
+        planned_block_ids: set[BlockInstanceId] | None = None,
+    ) -> RunDetail:
         return RunDetail(
             run_id=run_id,
             attempt_count=actual_attempt,
             status=status_override or status,
-            created_at=str(execution.created_at),
-            updated_at=str(execution.updated_at),
-            blueprint_id=BlueprintId(str(execution.blueprint_id)),  # ty:ignore[invalid-argument-type]
-            blueprint_version=cast(int, execution.blueprint_version),
-            error=error_override if error_override is not None else cast(str | None, execution.error),
-            progress=progress_override if progress_override is not None else cast(str | None, execution.progress),
+            created_at=value_dt2str(execution.created_at),
+            updated_at=value_dt2str(execution.updated_at),
+            user=execution.created_by,
+            blueprint_id=execution.blueprint_id,
+            blueprint_version=execution.blueprint_version,
+            error=error_override if error_override is not None else execution.error,
+            progress=progress_override if progress_override is not None else execution.progress,
             cascade_job_id=cascade_job_id,
             available_task_ids=available_task_ids,
+            lost_task_ids=lost_task_ids,
             outputs=raw_outputs,
+            completed_block_ids=completed_block_ids,
+            planned_block_ids=planned_block_ids,
+            resolution=execution.compiler_runtime_context.get("resolution") or None,
         )
 
-    if status in ("submitted", "preparing", "running") and cascade_job_id:
+    def write_status(new_status: RunStatus, **fields: object) -> None:
+        updated = run_db.update_run_runtime(run_id, actual_attempt, expected_status=status, status=new_status, **fields)
+        if not updated:
+            raise _StaleRecord
+
+    # TODO handle jobs with inactive cascade_proc_id -- either in poll_and_update, or in a db tombstone cleaner
+    if status in ("submitted", "preparing", "running", "stopping", "unknown") and cascade_job_id:
         job_id = JobId(cascade_job_id)
+        warning_error: str | None = None
+        task_to_block: dict[TaskId, BlockInstanceId] | None = None
+        if detailed_report:
+            try:
+                compilation_detail = retrieve_compilation_detail(run_id)
+                task_to_block = {task_id: td.block for task_id, td in compilation_detail.task_detail.items()}
+            except (CompilationDetailNotFound, CompilationDetailCorrupted) as e:
+                detailed_report = False
+                warning_error = f"unable to provide completed/planned tasks: {repr(e)}"
+
         try:
-            response = client.request_response(api.JobProgressRequest(job_ids=[job_id]), f"{config.cascade.cascade_url}")
-            response = cast(api.JobProgressResponse, response)
+            response = _request_job_progress(job_id, detailed_report)
         except TimeoutError:
             return _build(status_override="unknown", error_override="failed to communicate with gateway")
         except Exception as e:
@@ -212,20 +424,89 @@ async def poll_and_update(execution: Run) -> RunDetail:
         if response.error:
             return _build(status_override="unknown", error_override=response.error)
 
+        updated_outputs: RunOutputs | None = None
+        # Fetch and store values for newly available textual outputs.
+        # We compare what cascade reports as available against what is already stored locally,
+        # and fetch any textual (text/plain) outputs that have not been fetched yet.
+        if raw_outputs is not None and job_id in response.datasets:
+            try:
+                outputs_model = RunOutputs.model_validate(raw_outputs)
+                already_fetched = {tid for tid, char in outputs_model.outputs.items() if char.value is not None}
+                cascade_available = {d.task for d in response.datasets[job_id]}
+                candidates: dict[TaskId, str] = {}
+                for task_id in cascade_available - already_fetched:
+                    char = outputs_model.outputs.get(task_id)
+                    if char is None or not is_textual(char.mime_type):
+                        continue
+                    candidates[task_id] = char.mime_type
+                if candidates:
+                    fetched = _fetch_textual_values(job_id, candidates)
+                    for task_id, value in fetched.items():
+                        outputs_model.outputs[task_id].value = value
+                        updated_outputs = outputs_model
+            except Exception as e:
+                logger.warning("Failed to process textual outputs for run %r: %r", run_id, e)
+        if updated_outputs is not None:
+            raw_outputs = updated_outputs.model_dump()
+
+        # NOTE we should check more carefuly in the None branch -- the job_id may not be part of the response
+        # if the job has not started yet -- but we should verify that in the status, etc
+        if task_to_block is not None and response.planned_task_ids is not None and job_id in response.planned_task_ids:
+            # any block that has a task planned is a planned block
+            planned_block_ids = {task_to_block[task_id] for task_id in response.planned_task_ids[job_id]}
+        else:
+            planned_block_ids = None
+        if task_to_block is not None and response.completed_task_ids is not None and job_id in response.completed_task_ids:
+            # any block that has all tasks completed is a completed block
+            uncompleted_task_to_block = {k: v for k, v in task_to_block.items() if k not in response.completed_task_ids[job_id]}
+            completed_block_ids = set(task_to_block.values()) - set(uncompleted_task_to_block.values())
+        else:
+            completed_block_ids = None
         jobprogress = response.progresses.get(job_id)
+        outputs_kwargs = {"outputs": raw_outputs} if updated_outputs is not None else {}
+        cached_available = lambda: (
+            [tid for tid, char in updated_outputs.outputs.items() if char.value is not None] if updated_outputs else []
+        )
         if jobprogress is None:
-            await run_db.update_run_runtime(run_id, actual_attempt, status="failed", error="evicted from gateway")
-            available_task_ids = []
+            if status == "stopping":
+                write_status("stopped", **outputs_kwargs)
+                available_task_ids = cached_available()
+                pop_memcache(run_id)
+                return _build(status_override="stopped")
+            write_status("failed", error="evicted from gateway", **outputs_kwargs)
+            available_task_ids = cached_available()
+            pop_memcache(run_id)
             return _build(status_override="failed", error_override="evicted from gateway")
         elif jobprogress.failure:
-            await run_db.update_run_runtime(run_id, actual_attempt, status="failed", error=jobprogress.failure)
-            available_task_ids = []
-            return _build(status_override="failed", error_override=jobprogress.failure)
+            # NOTE the api for stop communication from gw is overall a bit odd, as is it leaves error set on the entity despite its not a genuine error -- improve when you rework this whole thing
+            if status == "stopping" and jobprogress.failure.startswith("terminated by gateway"):
+                final_status = "stopped"
+            else:
+                final_status = "failed"
+            write_status(final_status, error=jobprogress.failure, **outputs_kwargs)
+            available_task_ids = cached_available()
+            pop_memcache(run_id)
+            return _build(status_override=final_status, error_override=jobprogress.failure)
         elif jobprogress.completed or jobprogress.pct == "100.00":
-            await run_db.update_run_runtime(run_id, actual_attempt, status="completed", progress="100.00")
+            write_status("completed", progress="100.00", **outputs_kwargs)
             return _build(status_override="completed", progress_override="100.00")
+        elif status == "stopping":
+            # NOTE the earlier stop attempt has apparently not succeeded -- try again. Quick if gateway is already stopping the job
+            try:
+                submit_stop_cascade(run_id, actual_attempt, job_id)
+            except Exception as e:
+                logger.warning(f"failed to enqueue repeated cascade stop of {run_id=}, {actual_attempt=}: {e!r}")
+            if updated_outputs is not None:
+                run_db.update_run_runtime(run_id, actual_attempt, outputs=raw_outputs)
+            return _build(status_override="stopping", progress_override=jobprogress.pct)
         else:
-            await run_db.update_run_runtime(run_id, actual_attempt, status="running", progress=jobprogress.pct)
-            return _build(status_override="running", progress_override=jobprogress.pct)
+            write_status("running", progress=jobprogress.pct, **outputs_kwargs)
+            return _build(
+                status_override="running",
+                error_override=warning_error,
+                progress_override=jobprogress.pct,
+                completed_block_ids=completed_block_ids,
+                planned_block_ids=planned_block_ids,
+            )
 
     return _build()

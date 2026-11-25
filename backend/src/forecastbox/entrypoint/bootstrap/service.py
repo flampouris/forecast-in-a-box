@@ -41,7 +41,7 @@ if __name__ == "__main__":
     freeze_support()
     setup_process()
 
-    if not config.api.allow_service:
+    if not config.backend.allow_service:
         raise TypeError("launched as a service but config incompatible")
 
     previous_cleanup()
@@ -52,10 +52,12 @@ if __name__ == "__main__":
     )
     backend = get_context("forkserver").Process(target=launch_backend)
     backend.start()
-    handle = ChildProcessGroup([backend])
+    handle = ChildProcessGroup((backend,))
     if backend.pid:
         mark_started(backend.pid)
     else:
         raise ValueError(f"start failure: {backend.exitcode}")
 
-    check_backend_ready(config, handle, config.cascade.spawn_gateway)
+    check_backend_ready(config, handle)
+
+    # TODO this is missing the interrupt/term handlers and awaits -- yet another reason to unify

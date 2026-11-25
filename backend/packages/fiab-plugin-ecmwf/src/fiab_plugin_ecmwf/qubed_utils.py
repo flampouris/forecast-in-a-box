@@ -27,14 +27,41 @@ QubedOutput(dataqube=Qube(...), datatype='netcdf')
 
 import functools
 from collections.abc import Mapping
-from typing import Any, Iterable
+from typing import Any, Callable, Concatenate, Iterable, ParamSpec, TypeVar, overload
 
+import numpy as np
 from fiab_core.fable import QubedOutput
 from qubed import Qube
 
+P = ParamSpec("P")
+R = TypeVar("R")
+QubeLike = TypeVar("QubeLike", bound=Qube | QubedOutput)
 
-def collapse(qube: QubedOutput, axis: str | list[str]) -> QubedOutput:
-    """Return a new QubedOutput with the dataqube collapsed by removing the specified axis.
+
+@overload
+def support_qubed_output(func: Callable[Concatenate[Qube, P], Qube]) -> Callable[Concatenate[QubeLike, P], QubeLike]: ...
+@overload
+def support_qubed_output(func: Callable[Concatenate[Qube, P], R]) -> Callable[Concatenate[Qube | QubedOutput, P], R]: ...
+def support_qubed_output(func: Callable[..., Any]) -> Any:
+    """Decorator to support both QubedOutput and Qube inputs for the utility functions.
+    If a QubedOutput is passed, it will extract the dataqube and pass it to the function.
+    If a Qube is passed, it will pass it directly to the function.
+    If the function returns a Qube and the input was a QubedOutput, the result is re-wrapped.
+    """
+
+    @functools.wraps(func)
+    def wrapper(qube: Qube | QubedOutput, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(qube, QubedOutput):
+            result = func(qube.dataqube, *args, **kwargs)
+            return qube.model_copy(update={"dataqube": result}) if isinstance(result, Qube) else result
+        return func(qube, *args, **kwargs)
+
+    return wrapper
+
+
+@support_qubed_output
+def collapse(qube: Qube, axis: str | list[str]) -> Qube:
+    """Return a new Qube collapsed by removing the specified axis.
 
     Parameters
     ----------
@@ -43,16 +70,16 @@ def collapse(qube: QubedOutput, axis: str | list[str]) -> QubedOutput:
 
     Returns
     -------
-    QubedOutput
-        A new QubedOutput with the collapsed dataqube.
+    Qube
+        A new Qube with the collapsed axis.
 
     Usage
     -----
-    >>> output = QubedOutput(dataqube=Qube.from_datacube({
+    >>> output = Qube.from_datacube({
     ...     'param': ['2t', 'tp'],
     ...     'time': [0, 1, 2],
     ...     'level': [1000, 850, 700],
-    ... }))
+    ... })
     >>> collapsed = collapse(output, 'level')
     >>> dimensions(collapsed)
     {'param', 'time'}
@@ -64,12 +91,32 @@ def collapse(qube: QubedOutput, axis: str | list[str]) -> QubedOutput:
     if not all(ax in dims for ax in axes):
         raise ValueError(f"Dimension '{', '.join(set(axes) - dims)}' not in dataqube dimensions {dims}")
 
-    reduced_qube = qube.dataqube.remove_by_key(axes)
-    return qube.model_copy(update={"dataqube": reduced_qube})
+    return qube.remove_by_key(axes)
 
 
-def expand(qube: QubedOutput, dimension: Mapping[str, Iterable[Any]]) -> QubedOutput:
-    """Return a new QubedOutput with the dataqube expanded by adding the specified dimension(s).
+def _broadcast_array_over_new_axis(value: np.ndarray, size: int) -> np.ndarray:
+    value = value.reshape((1,)) if value.ndim == 0 else value
+    expanded = np.expand_dims(value, axis=1)
+    return np.broadcast_to(expanded, (expanded.shape[0], size, *expanded.shape[2:]))
+
+
+def _broadcast_new_axis_metadata(qube: Qube, size: int) -> Qube:
+    metadata = {key: _broadcast_array_over_new_axis(value, size) for key, value in qube.metadata.items()}
+    children = tuple(_broadcast_new_axis_metadata(child, size) for child in qube.children)
+    return qube.replace(metadata=metadata, children=children)
+
+
+def _expand_axis(qube: Qube, key: str, values: Iterable[Any]) -> Qube:
+    axis_values = list(values)
+    value_group = Qube.from_datacube({key: axis_values}).children[0].values if axis_values else [None]
+    axis_size = len(axis_values) or 1
+    children = tuple(_broadcast_new_axis_metadata(child, axis_size) for child in qube.children)
+    return Qube.make_root([Qube.make_node(key, value_group, children)])
+
+
+@support_qubed_output
+def expand(qube: Qube, dimension: Mapping[str, Iterable[Any]]) -> Qube:
+    """Return a new Qube with the dataqube expanded by adding the specified dimension(s).
 
     Parameters
     ----------
@@ -93,19 +140,17 @@ def expand(qube: QubedOutput, dimension: Mapping[str, Iterable[Any]]) -> QubedOu
     >>> axes(expanded)
     {'ensemble': {'ens1', 'ens2'}, 'param': {'2t', 'tp'}, 'time': {0, 1, 2}}
     """
-    dataqube = functools.reduce(
-        lambda q, kv: Qube.make_root([Qube.make_node(kv[0], list(kv[1]), q.children)]), dimension.items(), qube.dataqube
-    )
-
-    return qube.model_copy(update={"dataqube": dataqube})
+    return functools.reduce(lambda q, kv: _expand_axis(q, kv[0], kv[1]), dimension.items(), qube)
 
 
-def coxpand(qube: QubedOutput, axis: str | list[str], dimension: Mapping[str, Iterable[Any]]) -> QubedOutput:
+@support_qubed_output
+def coxpand(qube: Qube, axis: str | list[str], dimension: Mapping[str, Iterable[Any]]) -> Qube:
     """Collapse, then expand"""
     return expand(collapse(qube, axis), dimension)
 
 
-def axes(qube: QubedOutput) -> dict[str, set[Any]]:
+@support_qubed_output
+def axes(qube: Qube) -> dict[str, set[Any]]:
     """Return the axes of the dataqube.
 
     Returns
@@ -115,7 +160,7 @@ def axes(qube: QubedOutput) -> dict[str, set[Any]]:
 
     Usage
     -----
-    >>> output = QubedInstanceOutput(dataqube=Qube.from_datacube({
+    >>> output = QubedOutput(dataqube=Qube.from_datacube({
     ...     'param': ['2t', 'tp'],
     ...     'time': [0, 1, 2],
     ... }))
@@ -125,10 +170,11 @@ def axes(qube: QubedOutput) -> dict[str, set[Any]]:
     >>> axes['time']
     {0, 1, 2}
     """
-    return qube.dataqube.axes()
+    return qube.axes()
 
 
-def dimensions(qube: QubedOutput) -> set[str]:
+@support_qubed_output
+def dimensions(qube: Qube) -> set[str]:
     """Return the list of dimension names of the dataqube.
 
     Returns
@@ -138,17 +184,43 @@ def dimensions(qube: QubedOutput) -> set[str]:
 
     Usage
     -----
-    >>> output = QubedInstanceOutput(dataqube=Qube.from_datacube({
+    >>> output = QubedOutput(dataqube=Qube.from_datacube({
     ...     'param': ['2t', 'tp'],
     ...     'time': [0, 1, 2],
     ... }))
     >>> output.dimensions()
     {'param', 'time'}
     """
-    return set(axes(qube).keys())
+    return set(qube.axes().keys())
 
 
-def contains(qube: QubedOutput, item: Qube | str | dict) -> bool:
+@support_qubed_output
+def common_dimensions(qube: Qube) -> set[str]:
+    """Return the list of dimension names present in all nodes of the dataqube.
+
+    Returns
+    -------
+    set[str]
+        A set of dimension names.
+
+    Usage
+    -----
+    >>> output = QubedOutput(
+    ...     dataqube=(Qube.from_datacube({
+    ...         'param': ['2t', 'tp'],
+    ...         'time': [0, 1, 2],
+    ...     }) | Qube.from_datacube({
+    ...         'param': ['msl'],
+    ...     }))
+    ... )
+    >>> common_dimensions(output)
+    {'param'}
+    """
+    return set.intersection(*[set(datacube.keys()) for datacube in qube.datacubes()])
+
+
+@support_qubed_output
+def contains(qube: Qube, item: Qube | str | dict) -> bool:
     """Check if the QubedOutput contains the specified dimension(s) or axes.
 
     If a string is provided, it checks if that dimension exists.
@@ -186,3 +258,32 @@ def contains(qube: QubedOutput, item: Qube | str | dict) -> bool:
         return key in current_axes and all(v in current_axes[key] for v in values)
 
     return all(_contains_axis_values(k, v) for k, v in dict_cast_to_list.items())
+
+
+def select(
+    qube: QubedOutput,
+    selection: Mapping[str, Any | Iterable[Any] | Callable[[Any], bool]],
+) -> QubedOutput:
+    """Return a new QubedOutput with the dataqube matching selection criteria
+
+    Usage
+    -----
+    >>> output = QubedOutput(dataqube=Qube.from_datacube({
+    ...     'param': ['2t', 'tp'],
+    ...     'time': [0, 1, 2],
+    ... }))
+    >>> selection = select(output, {'param': '2t'})
+    >>> axes(selection)
+    {'param': {'2t'}, 'time': {0, 1, 2}}
+    """
+    return QubedOutput(dataqube=qube.dataqube.select(selection))
+
+
+@support_qubed_output
+def datacubes(qube: Qube) -> Iterable[dict[str, Any | list[Any]]]:
+    return qube.datacubes()
+
+
+def from_datacubes(datacubes: Iterable[dict[str, Any | list[Any]]]) -> Qube:
+    """Return Qube from an iterable of datacubes"""
+    return functools.reduce(lambda q, dc: q | Qube.from_datacube(dc), datacubes, Qube.empty())

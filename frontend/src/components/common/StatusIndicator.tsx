@@ -15,8 +15,9 @@
  * Supports multiple variants: dot, badge, and full
  */
 
+import { useTranslation } from 'react-i18next'
 import type { TrafficLightStatus } from '@/types/status.types'
-import { getTrafficLightLabel } from '@/types/status.types'
+import { getTrafficLightLabelKey } from '@/types/status.types'
 import { cn } from '@/lib/utils'
 
 interface StatusIndicatorProps {
@@ -67,7 +68,7 @@ const statusColors: Record<
   green: {
     bg: 'bg-emerald-500',
     pulseRing: 'bg-emerald-100 dark:bg-emerald-900/30',
-    text: 'text-emerald-600 dark:text-emerald-400',
+    text: 'text-success',
     ring: 'ring-emerald-500/20',
   },
   orange: {
@@ -96,8 +97,9 @@ export function StatusIndicator({
   showPulse = true,
   className,
 }: StatusIndicatorProps) {
+  const { t } = useTranslation('status')
   const colors = statusColors[status]
-  const displayLabel = label ?? getTrafficLightLabel(status)
+  const displayLabel = label ?? t(getTrafficLightLabelKey(status))
 
   // Dot variant - just a colored dot
   // Pulse for green (heartbeat) or unknown (loading)

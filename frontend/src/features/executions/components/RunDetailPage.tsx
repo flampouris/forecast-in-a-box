@@ -1,0 +1,511 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/**
+ * RunDetailPage Component
+ *
+ * Job detail page with status header, execution canvas, and tabbed panels.
+ */
+
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import {
+  ArrowLeft,
+  FileJson,
+  Network,
+  Package,
+  ScrollText,
+  Share2,
+} from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { Link, useNavigate, useParams } from '@tanstack/react-router'
+import { RunCanvas } from './RunCanvas'
+import { CompilationForceGraph } from './CompilationForceGraph'
+import { CompilationPanel } from './CompilationPanel'
+import { RunErrorBanner } from './RunErrorBanner'
+import { RunStatusHeader } from './RunStatusHeader'
+import { RunAttemptTimeline } from './RunAttemptTimeline'
+import { LogsPanel } from './LogsPanel'
+import { OutputsPanel } from './OutputsPanel'
+import { SpecificationPanel } from './SpecificationPanel'
+import { StoredOutputsCard } from './StoredOutputsCard'
+import type { LogFocus } from './LogsPanel'
+import type { CSSProperties, ReactNode } from 'react'
+import { useBlockDisplayNames } from '@/features/fable-builder/hooks/useBlockDisplayNames'
+import { RunMetadataDialog } from '@/features/journal/components/RunMetadataDialog'
+import { useExecutionHoverStore } from '@/features/executions/stores/executionHoverStore'
+import { distinguishingSettings } from '@/features/executions/outputs/block-settings'
+import { useViewportFill } from '@/hooks/useViewportFill'
+import { useSplitLayout } from '@/hooks/useSplitLayout'
+import { useMedia } from '@/hooks/useMedia'
+import { SplitPane } from '@/components/common/SplitResizeHandle'
+import { STORAGE_KEYS } from '@/lib/storage-keys'
+import { showToast } from '@/lib/toast'
+import { ApiClientError } from '@/api/client'
+import { useBlockCatalogue, useFableRetrieve } from '@/api/hooks/useFable'
+import {
+  useDeleteJob,
+  useJobStatus,
+  useRestartJob,
+  useStopJob,
+} from '@/api/hooks/useJobs'
+import { CoreVersionMismatchBadge } from '@/components/common/CoreVersionMismatchBadge'
+import { LoadingSpinner } from '@/components/common/LoadingSpinner'
+import { Button } from '@/components/ui/button'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { useActivityStore } from '@/stores/activityStore'
+import { P } from '@/components/base/typography'
+import { cn } from '@/lib/utils'
+import { PAGE_WIDTH_CLASS } from '@/lib/page-width'
+import { createLogger } from '@/lib/logger'
+
+const log = createLogger('RunDetailPage')
+
+// Wide-screen layout: each column fills its pane and scrolls via its TabsContent.
+const WIDE_COLUMN =
+  'min-[1280px]:flex min-[1280px]:h-full min-[1280px]:min-w-0 min-[1280px]:flex-1 min-[1280px]:flex-col'
+const WIDE_TAB_CONTENT =
+  'min-[1280px]:min-h-0 min-[1280px]:flex-1 min-[1280px]:overflow-y-auto'
+
+/** Wide: resizable two-pane split (persisted); narrow: plain stacked flow. */
+function SplitOrStack({
+  isWide,
+  initialStartPct,
+  onStartPctChange,
+  canvas,
+  details,
+}: {
+  isWide: boolean
+  initialStartPct: number | undefined
+  onStartPctChange: (startPct: number) => void
+  canvas: ReactNode
+  details: ReactNode
+}) {
+  if (!isWide) {
+    return (
+      <div className="flex flex-col gap-8">
+        {canvas}
+        {details}
+      </div>
+    )
+  }
+  return (
+    <SplitPane
+      className="min-h-0 flex-1"
+      initialStartPct={initialStartPct}
+      defaultStartPct={42}
+      onChange={onStartPctChange}
+      minStartPx={320}
+      minEndPx={460}
+      start={canvas}
+      end={details}
+    />
+  )
+}
+
+export function RunDetailPage() {
+  const { t } = useTranslation('executions')
+  const { jobId } = useParams({ from: '/_authenticated/execute/$jobId' })
+  const navigate = useNavigate()
+  const [activeTab, setActiveTab] = useState('outputs')
+  // The page outlives a switch to another run; the request names its run.
+  const [logFocus, setLogFocus] = useState<
+    (LogFocus & { jobId: string }) | null
+  >(null)
+  const tabsRef = useRef<HTMLDivElement>(null)
+  const [metadataOpen, setMetadataOpen] = useState(false)
+  const [toolbarSlot, setToolbarSlot] = useState<HTMLDivElement | null>(null)
+  const handleToolbarRef = useCallback((node: HTMLDivElement | null) => {
+    setToolbarSlot(node)
+  }, [])
+
+  const statusQuery = useJobStatus(jobId)
+  const restartMutation = useRestartJob()
+  const deleteMutation = useDeleteJob()
+  const stopMutation = useStopJob()
+
+  const jobData = statusQuery.data
+  const { data: fableData } = useFableRetrieve(jobData?.blueprint_id)
+  // Builder as run; name and metadata from latest.
+  const { data: runBlueprint } = useFableRetrieve(
+    jobData?.blueprint_id,
+    jobData?.blueprint_version,
+  )
+  const runBuilder = runBlueprint?.builder
+  const blockNames = useBlockDisplayNames(runBuilder)
+
+  // Cross-panel selection is per-run; clear it on mount and on jobId change.
+  const resetExecutionSelection = useExecutionHoverStore(
+    (state) => state.resetExecutionSelection,
+  )
+  useEffect(() => {
+    resetExecutionSelection()
+    return () => resetExecutionSelection()
+  }, [jobId, resetExecutionSelection])
+
+  const columnsFill = useViewportFill(true, { insetPx: 32 })
+  const isWide = useMedia('(min-width: 1280px)')
+  const { defaultLayout: splitLayout, onLayoutChanged: onSplitLayoutChanged } =
+    useSplitLayout(STORAGE_KEYS.layout.runDetailSplit)
+  // Stored shape predates SplitPane ({canvas, details} shares) — keep it.
+  const initialStartPct =
+    splitLayout && 'canvas' in splitLayout && 'details' in splitLayout
+      ? (splitLayout.canvas / (splitLayout.canvas + splitLayout.details)) * 100
+      : undefined
+  const onStartPctChange = useCallback(
+    (startPct: number) =>
+      onSplitLayoutChanged({ canvas: startPct, details: 100 - startPct }),
+    [onSplitLayoutChanged],
+  )
+  const { data: catalogue } = useBlockCatalogue()
+  // As-run values off the run detail (#640); null on older runs.
+  const resolvedConfig = jobData?.resolution ?? undefined
+  const blockSettings = useMemo(
+    () =>
+      runBuilder
+        ? distinguishingSettings(runBuilder, catalogue, resolvedConfig)
+        : undefined,
+    [runBuilder, catalogue, resolvedConfig],
+  )
+
+  // Sync scroll-to-top before paint — a tall /configure scroll position
+  // otherwise clamps into the shorter loading layout and exposes the footer.
+  useLayoutEffect(() => {
+    window.scrollTo(0, 0)
+  }, [jobId])
+
+  const handleRestart = () => {
+    restartMutation.mutate(
+      { runId: jobId, attemptCount: jobData!.attempt_count },
+      {
+        onSuccess: () => {
+          useActivityStore.getState().addTask({
+            id: `job:${jobId}`,
+            type: 'job',
+            label:
+              fableData?.display_name ??
+              t('activity.jobFallbackLabel', { id: jobId.slice(0, 8) }),
+            description: t('activity.restarting', {
+              attempt: jobData!.attempt_count + 1,
+            }),
+            status: 'active',
+            startedAt: Date.now(),
+            navigateTo: `/execute/${jobId}`,
+          })
+          showToast.success(t('actions.restartJob'))
+        },
+        onError: (error) => {
+          log.error('Failed to restart job', { jobId, error })
+          showToast.error(error.message)
+        },
+      },
+    )
+  }
+
+  const handleStop = () => {
+    stopMutation.mutate({ runId: jobId, attemptCount: jobData!.attempt_count })
+  }
+
+  const handleDelete = () => {
+    deleteMutation.mutate(
+      { runId: jobId, attemptCount: jobData!.attempt_count },
+      {
+        onSuccess: () => {
+          showToast.success(t('actions.deleteJob'))
+          navigate({ to: '/execute' })
+        },
+        onError: (error) => {
+          log.error('Failed to delete job', { jobId, error })
+          showToast.error(error.message)
+        },
+      },
+    )
+  }
+
+  // The logs tab takes a fresh snapshot for it.
+  const handleShowInLogs = (message: string) => {
+    setLogFocus({ jobId, message, at: Date.now() })
+    setActiveTab('logs')
+    const tabs = tabsRef.current
+    if (tabs && tabs.getBoundingClientRect().top > window.innerHeight / 2) {
+      tabs.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }
+  }
+
+  const handleEditConfig = () => {
+    if (!jobData?.blueprint_id) return
+    navigate({
+      to: '/configure',
+      search: { fableId: jobData.blueprint_id },
+    })
+  }
+
+  if (statusQuery.isLoading) {
+    // min-h-screen (not the loaded state's smaller min) so the spinner area
+    // fills the viewport and the navy footer stays below the fold during the
+    // submit → detail-page transition.
+    return (
+      <div
+        className={cn(
+          PAGE_WIDTH_CLASS,
+          'flex min-h-screen flex-col items-center justify-center px-4 py-8 sm:px-6 lg:px-8',
+        )}
+      >
+        <LoadingSpinner />
+      </div>
+    )
+  }
+
+  if (statusQuery.isError) {
+    const is404 =
+      statusQuery.error instanceof ApiClientError &&
+      statusQuery.error.status === 404
+
+    return (
+      <div className="mx-auto max-w-3xl space-y-4 px-4 py-8 text-center">
+        <P className="text-muted-foreground">
+          {is404
+            ? t('errors.jobNotFoundDescription')
+            : statusQuery.error.message}
+        </P>
+        <Button
+          variant="outline"
+          nativeButton={false}
+          render={<Link to="/execute" />}
+        >
+          <ArrowLeft className="mr-1.5 h-4 w-4" />
+          {t('errors.backToExecutions')}
+        </Button>
+      </div>
+    )
+  }
+
+  if (!jobData) return null
+
+  const jobName = fableData?.display_name ?? t('detail.untitledJob')
+  const canEditConfig = !!jobData.blueprint_id
+
+  return (
+    <div
+      className={cn(
+        // Underscores in arbitrary values emit spaces; `calc(100vh-15rem)`
+        // (no spaces) is invalid CSS and silently discarded.
+        PAGE_WIDTH_CLASS,
+        'flex min-h-[calc(100vh_-_15rem)] flex-col gap-8 px-4 py-8 sm:px-6 lg:px-8',
+      )}
+    >
+      <RunStatusHeader
+        jobId={jobId}
+        name={jobName}
+        description={fableData?.display_description ?? undefined}
+        status={jobData.status}
+        progress={jobData.progress ?? '0'}
+        createdAt={jobData.created_at}
+        updatedAt={jobData.updated_at}
+        onRestart={handleRestart}
+        onStop={handleStop}
+        onDelete={handleDelete}
+        onEditConfig={canEditConfig ? handleEditConfig : undefined}
+        onEditMetadata={() => setMetadataOpen(true)}
+        isRestartPending={restartMutation.isPending}
+        isStopPending={stopMutation.isPending}
+        isDeletePending={deleteMutation.isPending}
+        completedBlockCount={jobData.completed_block_ids?.length ?? null}
+        plannedBlockCount={jobData.planned_block_ids?.length ?? null}
+        idLineExtra={
+          <RunAttemptTimeline
+            jobId={jobId}
+            attemptCount={jobData.attempt_count}
+          />
+        }
+      />
+
+      {fableData?.coreVersionMismatch && (
+        <CoreVersionMismatchBadge detail={fableData.coreVersionMismatch} />
+      )}
+
+      {jobData.status === 'failed' && jobData.error && (
+        <RunErrorBanner
+          error={jobData.error}
+          jobId={jobId}
+          onShowInLogs={() => handleShowInLogs(jobData.error ?? '')}
+          onRestart={handleRestart}
+          onEditConfig={handleEditConfig}
+          canEditConfig={canEditConfig}
+        />
+      )}
+
+      {/* Wide: viewport-pinned resizable split; narrow: stacked document scroll. */}
+      <div
+        ref={columnsFill.ref}
+        style={
+          columnsFill.height !== null
+            ? ({ '--fill-h': `${columnsFill.height}px` } as CSSProperties)
+            : undefined
+        }
+        className={cn(
+          'flex flex-1 flex-col gap-8',
+          // Wide: pin to the measured viewport remainder (calc fallback).
+          // flex-none cancels the inherited flex-1 so the height holds.
+          'min-[1280px]:h-[var(--fill-h,calc(100vh_-_17rem))]',
+          'min-[1280px]:flex-none min-[1280px]:overflow-hidden',
+        )}
+      >
+        <SplitOrStack
+          isWide={isWide}
+          initialStartPct={initialStartPct}
+          onStartPctChange={onStartPctChange}
+          canvas={
+            <div className={WIDE_COLUMN}>
+              {runBuilder && catalogue ? (
+                <RunCanvas
+                  fable={runBuilder}
+                  catalogue={catalogue}
+                  status={jobData.status}
+                  completedBlockIds={jobData.completed_block_ids}
+                  plannedBlockIds={jobData.planned_block_ids}
+                  resolvedConfig={resolvedConfig}
+                />
+              ) : (
+                <div className="flex h-full flex-col items-center justify-center gap-2 rounded-lg border border-dashed py-12 text-center">
+                  <P className="font-medium text-muted-foreground">
+                    {t('detail.graphUnavailable')}
+                  </P>
+                  <P className="text-muted-foreground">
+                    {t('detail.graphUnavailableDescription')}
+                  </P>
+                </div>
+              )}
+            </div>
+          }
+          details={
+            <div className={WIDE_COLUMN}>
+              <Tabs
+                ref={tabsRef}
+                value={activeTab}
+                onValueChange={setActiveTab}
+                className="min-[1280px]:flex min-[1280px]:h-full min-[1280px]:min-h-0 min-[1280px]:flex-col"
+              >
+                {/* Sticky for mobile scroll (no-op wide); keep `bg-muted` as its backdrop. */}
+                <TabsList className="sticky top-0 z-10 grid w-full shrink-0 grid-cols-5">
+                  <TabsTrigger value="outputs">
+                    <Package className="h-4 w-4" />
+                    {t('tabs.outputs')}
+                  </TabsTrigger>
+                  <TabsTrigger value="logs">
+                    <ScrollText className="h-4 w-4" />
+                    {t('tabs.logs')}
+                  </TabsTrigger>
+                  <TabsTrigger value="compilation">
+                    <Network className="h-4 w-4" />
+                    {t('tabs.compilation')}
+                  </TabsTrigger>
+                  <TabsTrigger value="graph">
+                    <Share2 className="h-4 w-4" />
+                    {t('tabs.graph')}
+                  </TabsTrigger>
+                  <TabsTrigger value="specification">
+                    <FileJson className="h-4 w-4" />
+                    {t('tabs.specification')}
+                  </TabsTrigger>
+                </TabsList>
+                <div
+                  ref={handleToolbarRef}
+                  className={cn(
+                    'sticky top-12 z-10 my-2 flex shrink-0 items-center gap-3 bg-background',
+                    activeTab !== 'outputs' && 'hidden',
+                  )}
+                />
+                <TabsContent
+                  value="outputs"
+                  // pr at wide layout keeps the grid off the column scrollbar.
+                  className={cn(
+                    WIDE_TAB_CONTENT,
+                    'space-y-4 min-[1280px]:pr-2',
+                  )}
+                >
+                  <StoredOutputsCard
+                    jobId={jobId}
+                    status={jobData.status}
+                    attempt={jobData.attempt_count}
+                    outputs={jobData.outputs}
+                    lostTaskIds={jobData.lost_task_ids}
+                    fable={runBuilder}
+                    catalogue={catalogue}
+                    runName={fableData?.display_name ?? undefined}
+                  />
+                  <OutputsPanel
+                    jobId={jobId}
+                    status={jobData.status}
+                    outputs={jobData.outputs}
+                    lostTaskIds={jobData.lost_task_ids}
+                    completedBlockIds={jobData.completed_block_ids}
+                    plannedBlockIds={jobData.planned_block_ids}
+                    blockNames={blockNames}
+                    blockSettings={blockSettings}
+                    toolbarSlot={toolbarSlot}
+                    onViewLogs={() => setActiveTab('logs')}
+                  />
+                </TabsContent>
+                {/* Kept mounted: the snapshot outlives tab switches. */}
+                <TabsContent
+                  value="logs"
+                  keepMounted
+                  className={WIDE_TAB_CONTENT}
+                >
+                  <LogsPanel
+                    key={jobId}
+                    jobId={jobId}
+                    status={jobData.status}
+                    createdAt={jobData.created_at}
+                    updatedAt={jobData.updated_at}
+                    focus={logFocus?.jobId === jobId ? logFocus : null}
+                  />
+                </TabsContent>
+                <TabsContent value="compilation" className={WIDE_TAB_CONTENT}>
+                  <CompilationPanel
+                    jobId={jobId}
+                    status={jobData.status}
+                    fable={runBuilder}
+                    catalogue={catalogue}
+                    onSwitchTab={setActiveTab}
+                  />
+                </TabsContent>
+                <TabsContent value="graph" className={WIDE_TAB_CONTENT}>
+                  <CompilationForceGraph
+                    jobId={jobId}
+                    status={jobData.status}
+                    fable={runBuilder}
+                    catalogue={catalogue}
+                  />
+                </TabsContent>
+                <TabsContent value="specification" className={WIDE_TAB_CONTENT}>
+                  <SpecificationPanel fableSnapshot={runBuilder} />
+                </TabsContent>
+              </Tabs>
+            </div>
+          }
+        />
+      </div>
+
+      <RunMetadataDialog
+        blueprint={fableData}
+        open={metadataOpen}
+        onOpenChange={setMetadataOpen}
+      />
+    </div>
+  )
+}

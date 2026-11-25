@@ -13,7 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { worker } from '@tests/../mocks/browser'
 import { renderWithRouter } from '@tests/utils/render'
 import type { JobExecutionList } from '@/api/types/job.types'
-import { JobStatusDetailsPopover } from '@/features/dashboard/components/JobStatusDetailsPopover'
+import { RunStatusDetailsPopover } from '@/features/dashboard/components/RunStatusDetailsPopover'
 import { API_ENDPOINTS } from '@/api/endpoints'
 
 vi.mock('@/utils/env', () => ({
@@ -33,6 +33,7 @@ const mockJobsResponse: JobExecutionList = {
       error: null,
       progress: '45',
       cascade_job_id: null,
+      lost_task_ids: {},
       outputs: null,
     },
     {
@@ -46,6 +47,7 @@ const mockJobsResponse: JobExecutionList = {
       error: null,
       progress: '100',
       cascade_job_id: null,
+      lost_task_ids: {},
       outputs: null,
     },
     {
@@ -59,6 +61,7 @@ const mockJobsResponse: JobExecutionList = {
       error: null,
       progress: '100',
       cascade_job_id: null,
+      lost_task_ids: {},
       outputs: null,
     },
     {
@@ -72,6 +75,7 @@ const mockJobsResponse: JobExecutionList = {
       error: 'OOM',
       progress: '60',
       cascade_job_id: null,
+      lost_task_ids: {},
       outputs: null,
     },
     {
@@ -85,6 +89,7 @@ const mockJobsResponse: JobExecutionList = {
       error: null,
       progress: '0',
       cascade_job_id: null,
+      lost_task_ids: {},
       outputs: null,
     },
   ],
@@ -94,7 +99,7 @@ const mockJobsResponse: JobExecutionList = {
   total_pages: 1,
 }
 
-describe('JobStatusDetailsPopover', () => {
+describe('RunStatusDetailsPopover', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     worker.use(
@@ -110,9 +115,9 @@ describe('JobStatusDetailsPopover', () => {
 
   it('shows running count in the trigger card', async () => {
     const screen = await renderWithRouter(
-      <JobStatusDetailsPopover>
+      <RunStatusDetailsPopover>
         <div data-testid="trigger">Trigger</div>
-      </JobStatusDetailsPopover>,
+      </RunStatusDetailsPopover>,
     )
 
     await expect.element(screen.getByTestId('trigger')).toBeVisible()
@@ -120,14 +125,14 @@ describe('JobStatusDetailsPopover', () => {
 
   it('opens popover with status rows when clicked', async () => {
     const screen = await renderWithRouter(
-      <JobStatusDetailsPopover>
+      <RunStatusDetailsPopover>
         <div data-testid="trigger">Trigger</div>
-      </JobStatusDetailsPopover>,
+      </RunStatusDetailsPopover>,
     )
 
     await screen.getByTestId('trigger').click()
 
-    await expect.element(screen.getByText('Execution Status')).toBeVisible()
+    await expect.element(screen.getByText('Run status')).toBeVisible()
     await expect.element(screen.getByText('Running')).toBeVisible()
     await expect.element(screen.getByText('Submitted')).toBeVisible()
     await expect.element(screen.getByText('Completed')).toBeVisible()
@@ -136,14 +141,14 @@ describe('JobStatusDetailsPopover', () => {
 
   it('shows correct counts for each status', async () => {
     const screen = await renderWithRouter(
-      <JobStatusDetailsPopover>
+      <RunStatusDetailsPopover>
         <div data-testid="trigger">Trigger</div>
-      </JobStatusDetailsPopover>,
+      </RunStatusDetailsPopover>,
     )
 
     await screen.getByTestId('trigger').click()
 
-    await expect.element(screen.getByText('Execution Status')).toBeVisible()
+    await expect.element(screen.getByText('Run status')).toBeVisible()
 
     // Verify total in footer
     await expect.element(screen.getByText('Total')).toBeVisible()
@@ -152,14 +157,14 @@ describe('JobStatusDetailsPopover', () => {
 
   it('shows refresh button', async () => {
     const screen = await renderWithRouter(
-      <JobStatusDetailsPopover>
+      <RunStatusDetailsPopover>
         <div data-testid="trigger">Trigger</div>
-      </JobStatusDetailsPopover>,
+      </RunStatusDetailsPopover>,
     )
 
     await screen.getByTestId('trigger').click()
 
-    await expect.element(screen.getByText('Execution Status')).toBeVisible()
+    await expect.element(screen.getByText('Run status')).toBeVisible()
 
     // Refresh button should be present (ghost icon button)
     const refreshButton = screen.getByRole('button', { name: '' }).first()

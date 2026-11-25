@@ -9,29 +9,57 @@
  */
 
 import type { JobStatus, RunOutputs } from '@/api/types/job.types'
+import type { LostTaskIds } from '@/features/executions/outputs/availability'
+import type { BlockSettings } from '@/features/executions/outputs/block-settings'
 import { OutputsView } from '@/features/executions/outputs/OutputsView'
 
 interface OutputsPanelProps {
   jobId: string
   status: JobStatus
   outputs: RunOutputs | null
-  /** DOM node to portal the toolbar into. Lifted out of the panel so the
-   * filter row can sit alongside the parent's tab triggers. */
+  /** Reasons for outputs that are no longer retrievable. */
+  lostTaskIds?: LostTaskIds
+  /** Drive skeleton highlights for blocks currently being processed. */
+  completedBlockIds?: ReadonlyArray<string> | null
+  /** Used to show block-level skeletons before any outputs payload arrives. */
+  plannedBlockIds?: ReadonlyArray<string> | null
+  /** Display name per block id, from the run's workflow. */
+  blockNames?: Readonly<Record<string, string>>
+  /** Options differing between same-type blocks. */
+  blockSettings?: BlockSettings
+  /** Portal target so the filter row can sit alongside the parent's tabs. */
   toolbarSlot?: HTMLElement | null
+  /** Switches to the Logs tab from the failed-run notice. */
+  onViewLogs?: () => void
 }
 
 export function OutputsPanel({
   jobId,
   status,
   outputs,
+  lostTaskIds,
+  completedBlockIds,
+  plannedBlockIds,
+  blockNames,
+  blockSettings,
   toolbarSlot,
+  onViewLogs,
 }: OutputsPanelProps) {
   return (
+    // Remount per job so sniffed-mime and open-viewer state never leak across
+    // executions — task ids are only unique within a single job.
     <OutputsView
+      key={jobId}
       jobId={jobId}
       status={status}
       outputs={outputs}
+      lostTaskIds={lostTaskIds}
+      completedBlockIds={completedBlockIds}
+      plannedBlockIds={plannedBlockIds}
+      blockNames={blockNames}
+      blockSettings={blockSettings}
       toolbarSlot={toolbarSlot}
+      onViewLogs={onViewLogs}
     />
   )
 }

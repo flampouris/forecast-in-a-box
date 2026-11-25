@@ -1,0 +1,94 @@
+# Plugins (core)
+
+This document describes the Plugin system, as a means of extending Forecast-in-a-Box with custom products and data sources.
+It is intended for Developers (with technical proficiency), and describes what a python package must satisfy to be a well-behaved plugin, and how to setup a local development environment.
+
+Please also refer to [Plugins (basic)](../../operator/plugins.md), for how to configure or troubleshoot a plugin installation.
+
+## Plugin Package
+
+### Core Contract
+A plugin is a regular wheel tightly bound to the [fiab-core](../../../backend/packages/fiab-core) package.
+Notably, the `fiab-core` prescribes a Python contract -- each plugin wheel/package *must* expose at the top module a field called `plugin` which is an instance of the dataclass `Plugin` from `fiab-core`'s `plugin.py` submodule.
+
+This is only inspected at runtime -- nothing prevents you from installing an invalid plugin.
+Doing so marks the plugin as failed in the backend, displaying the error message (such as `ImportError` or `AttributeError`) as its failure detail.
+
+### Versioning Convention
+The plugin expectedly declares `fiab-core` as a required python package.
+There is **important convention** for major versioning -- a plugin should have the same major version as the `fiab-core` it is compatible with.
+There will never be breaking/backwards incompatible changes in `fiab-core` in minor/patch version increments.
+Minor releases of `fiab-core` may add new fields or functionality, but never without defaults etc -- ie, they will stay compatible with plugins corresponding to the major version.
+The reason for this convention is displaying correct available versions in the Update dropdown in the UI.
+The actual install-time check respects the regular python mechanisms for dependency constraints -- hence a wheel `your-plugin-3.4.5` should have in its `requires` a `fiab-core>=3.0.0,<4.0.0`.
+
+### Other Dependencies
+A plugin would ideally not have dependencies that are not part of the existing backend's dependencies, because having any puts it at possible odds with other plugins.
+For all dependencies (novel or shared with backend), they should be as uconstrained as possible.
+If a constraint is incompatible with backend, the plugin will not be installed -- we propagate the backend's constraint into the `pip` invocation, meaning pip will refuse to execute the command.
+The same for an already installed plugin with incompatible constraint.
+
+## Local Development
+It is assumed that for development, you have a repository containing your plugin as a python project.
+You can then use for the backend both a production-install (using the `fiab.sh` script) or a development-install (using the `just dev` command).
+Consult the [Launching](launching.md) document for more detail.
+
+Either way, you need to have the following in your `config.toml` something like this:
+```
+[external.plugin_stores.yourPluginStore]
+url = "file://./packages/fiab-plugin-test"
+method = "localSingle"
+```
+The `yourPluginStore` is an arbitrary string, and the `url` needs to specify the path to the package.
+This example shows how the existing `fiab-plugin-test` in the `forecastbox-in-a-box` repository itself is configured.
+It is assuming that it is launched via `just dev`, hence the relative path to the package resolves correctly.
+You may want to put there absolute path instead if you don't want to reason about where the `fiab.sh`/`just dev` are.
+
+This makes the plugin installable by the backend, ie, go to backend's screen for Plugins and install by clicking.
+That will run the `pip install <url>`. You _can_ include `-e` in the url, which will give you an editable install.
+We don't support live reloads, ie, if you make code changes, you best restart the backend (but you don't need to reinstall the plugin).
+
+Do not install the plugin yourself into the backend's venv -- a part of the installation process is inserting
+an entry into the database (the `plugin_state` table), which records the pip source, module name, and
+installed version. Failure to go through the install flow may leave the backend in an inconsistent state.
+If you want to test the "would it actually install" outside of backend, you may run `uv pip install --dry-run` with the respective `venv` to see what would happen -- this is definitively recommended if you want to see the possible error line hands-on and fast.
+Note that backend itself does a `--dry-run` first when installing a plugin -- you don't need to worry that a misconfigured plugin would destroy everything.
+But extracting the error from the backend logs may be more lengthy than seeing it first-hand.
+
+If you would like your plugin to be installed automatically on first launch of a fresh install, add its id
+to `external.default_plugins` in `config.toml`, eg:
+```
+[external]
+default_plugins = ["yourPluginStore:yourPluginId"]
+```
+This is only consulted on first run (see `entrypoint.warmup` and `entrypoint.bootstrap.checks.install_default_plugins`) --
+it is a list of ids, not a full plugin specification, and it is never rewritten by the backend at runtime.
+
+## Troubleshooting
+
+Note that FiaB is persistent, which means that plugin installation, job submission history, artifacts, and others remain even if you restart the process, the browser, the computer, the simulation of the world.
+This persistence is via sqlite databases, `jobs.db` and `user.db`, located in `<repo>/backend/.fiab` (if launching with `just dev`).
+The database is created from scratch if not found -- meaning if you need to clean history completely, just delete the `.db` files.
+You can also manually manipulate entries in the database if you need a fine surgery.
+Alternative, wipe the `venv` and the database (in `.fiab/job.db`): run `just dev reinstall` - consult [Launching](./launching.md).
+The config file itself does not need any editing -- it only ever contains plugin *stores* and, optionally, the ids of default plugins to auto-install on first run, never the install record of a concrete plugin.
+Next run of `just dev` would re-create the db and venv in a pristine state.
+
+You can attempt a finer surgery instead -- delete the row corresponding to your plugin from the `plugin_state` table in the database (it's just sqlite), and uninstall the package from the venv.
+If you have external dependencies by your plugin, you need to handle them manually as well.
+
+Multiple things can go wrong: Installation, Import, Update, Uninstallation.
+Every case can be investigated by hand, outside of the backend environment, in a plain python shell or uv commands.
+
+For the install, it is the pip install --dry-run described above.
+The backend does actually a much more complicated thing because it strictly wants to preserve its existing venv.
+If you see "too many changes" in your pip install dryrun, investigate them -- maybe you have too many external dependencies or constraints?
+
+For the import, you can simply try to import your module and access the `plugin` attribute, and verify it being an instance of the `Plugin` class from the `fiab-core`.
+This could possibly reveal a mismatch between your plugin's `fiab-core` expectaction and the actual version.
+Another possible source of issues is that changing a python package in an _already running_ python process is fraught with danger.
+Generally, restarting the backend after a plugin update may make weird issues go away.
+
+For the update/uninstall, mind we don't uninstall the external requirements, only the plugin wheel itself.
+If your external requirements constraint changes across your plugin version, you _must_ handle by hand.
+We expect to improve it in a later version, but it is not easy.

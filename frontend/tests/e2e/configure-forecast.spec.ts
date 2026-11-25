@@ -12,7 +12,6 @@
  * Configure Forecast E2E Tests (Full Stack)
  *
  * Tests the full forecast configuration flow including:
- * - Form mode: adding blocks, configuring fields, step navigation
  * - Graph mode: adding blocks, selecting nodes, config panel
  * - Save & load configuration flow
  * - Review & validation
@@ -20,7 +19,7 @@
  * Run with: npm run test:e2e:stack
  */
 
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import type { Page } from '@playwright/test'
 
 /**
@@ -29,14 +28,34 @@ import type { Page } from '@playwright/test'
  */
 async function navigateTo(page: Page, path: string) {
   await page.goto('/')
-  await page.waitForURL(/dashboard/, { timeout: 15000 })
+  await page.waitForURL(/overview/, { timeout: 15000 })
   await page.waitForLoadState('networkidle')
   await page.goto(path)
   await page.waitForLoadState('networkidle')
   await page.waitForTimeout(2000)
 }
 
-test.describe('Fable Builder - Form Mode', () => {
+/** Fork the first plugin template; false when the environment ships none. */
+async function openTemplateConfig(page: Page): Promise<boolean> {
+  await navigateTo(page, '/overview')
+  // Generous: opening the dialog costs a real /blueprint/expand.
+  const card = page.getByTestId('starter-template-card').first()
+  if (!(await card.isVisible({ timeout: 30000 }).catch(() => false))) {
+    return false
+  }
+  await card.click()
+  await page.waitForURL(/configure/, { timeout: 30000 })
+  // Take the template's own example values rather than filling the dialog.
+  const skip = page.getByRole('button', { name: /^skip$/i })
+  if (await skip.isVisible({ timeout: 45000 }).catch(() => false)) {
+    await skip.click()
+  }
+  await page.waitForLoadState('networkidle')
+  await page.waitForTimeout(2000)
+  return true
+}
+
+test.describe('Fable Builder - Page', () => {
   test.beforeEach(async ({ page }) => {
     await navigateTo(page, '/configure')
   })
@@ -48,161 +67,17 @@ test.describe('Fable Builder - Form Mode', () => {
       await expect(searchInput).toBeVisible()
     }
 
-    // Should have mode toggle buttons
-    const graphButton = page.getByRole('button', { name: /graph/i })
-    const formButton = page.getByRole('button', { name: /form/i })
-    if (await graphButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await expect(graphButton).toBeVisible()
-      await expect(formButton).toBeVisible()
-    }
-  })
-
-  test('switches to Form mode via toggle button', async ({ page }) => {
-    const formButton = page.getByRole('button', { name: /form/i })
-    if (await formButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await formButton.click()
-      await page.waitForTimeout(500)
-
-      // Form mode should show step navigation (source, transform, product, sink)
-      const sourceStep = page.getByRole('button', { name: /source/i })
-      if (await sourceStep.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await expect(sourceStep).toBeVisible()
-      }
-    }
-  })
-
-  test('adds a source block from the palette in form mode', async ({
-    page,
-  }) => {
-    // Switch to form mode
-    const formButton = page.getByRole('button', { name: /form/i })
-    if (await formButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await formButton.click()
-      await page.waitForTimeout(500)
-    }
-
-    // Look for add block buttons in the form canvas area
-    // In form mode, available block factories appear as "Add" buttons
-    const addButtons = page.getByRole('button', {
-      name: /earthkit|ensemble|temporal|zarr/i,
-    })
-    const addCount = await addButtons.count()
-
-    if (addCount > 0) {
-      await addButtons.first().click()
-      await page.waitForTimeout(1000)
-
-      // After adding, block count badge should update in header
-      const blocksBadge = page.getByText(/\d+ blocks?/)
-      if (
-        await blocksBadge
-          .first()
-          .isVisible({ timeout: 3000 })
-          .catch(() => false)
-      ) {
-        await expect(blocksBadge.first()).toBeVisible()
-      }
-    }
-  })
-
-  test('block instance card appears with config fields after adding block', async ({
-    page,
-  }) => {
-    // Switch to form mode
-    const formButton = page.getByRole('button', { name: /form/i })
-    if (await formButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await formButton.click()
-      await page.waitForTimeout(500)
-    }
-
-    // Add a block
-    const addButtons = page.getByRole('button', {
-      name: /earthkit|ensemble|temporal|zarr/i,
-    })
-    if ((await addButtons.count()) > 0) {
-      await addButtons.first().click()
-      await page.waitForTimeout(1000)
-
-      // Check for configuration fields (inputs/selects in the card)
-      const inputs = page.locator(
-        'input[type="text"], input[type="number"], select',
-      )
-      const inputCount = await inputs.count()
-      // Should have at least one config field
-      if (inputCount > 0) {
-        await expect(inputs.first()).toBeVisible()
-      }
-    }
-  })
-
-  test('fills in configuration fields', async ({ page }) => {
-    // Switch to form mode
-    const formButton = page.getByRole('button', { name: /form/i })
-    if (await formButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await formButton.click()
-      await page.waitForTimeout(500)
-    }
-
-    // Add a source block
-    const addButtons = page.getByRole('button', {
-      name: /earthkit|ensemble|temporal|zarr/i,
-    })
-    if ((await addButtons.count()) > 0) {
-      await addButtons.first().click()
-      await page.waitForTimeout(1000)
-
-      // Find text and number inputs and fill them
-      const textInputs = page.locator(
-        'input[type="text"]:not([placeholder="Search blocks..."])',
-      )
-      if ((await textInputs.count()) > 0) {
-        await textInputs.first().fill('test-value')
-        await expect(textInputs.first()).toHaveValue('test-value')
-      }
-
-      const numberInputs = page.locator('input[type="number"]')
-      if ((await numberInputs.count()) > 0) {
-        await numberInputs.first().fill('48')
-        await expect(numberInputs.first()).toHaveValue('48')
-      }
-    }
-  })
-
-  test('navigates between form steps', async ({ page }) => {
-    // Switch to form mode
-    const formButton = page.getByRole('button', { name: /form/i })
-    if (await formButton.isVisible({ timeout: 5000 }).catch(() => false)) {
-      await formButton.click()
-      await page.waitForTimeout(500)
-
-      // Look for step navigation buttons
-      const nextButton = page.getByRole('button', { name: /next step/i })
-      if (await nextButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-        // Add a source block first so we can navigate
-        const addButtons = page.getByRole('button', {
-          name: /earthkit|ensemble|temporal|zarr/i,
-        })
-        if ((await addButtons.count()) > 0) {
-          await addButtons.first().click()
-          await page.waitForTimeout(500)
-        }
-
-        await nextButton.click()
-        await page.waitForTimeout(500)
-
-        // Should advance to next step (transform or product)
-        const prevButton = page.getByRole('button', { name: /previous step/i })
-        if (await prevButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-          await expect(prevButton).toBeVisible()
-        }
-      }
+    // The View menu
+    const optionsButton = page.getByRole('button', { name: /^view$/i })
+    if (await optionsButton.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await expect(optionsButton).toBeVisible()
     }
   })
 
   test('unsaved badge appears after making changes', async ({ page }) => {
     // Add a block to make changes
     const addButtons = page.getByRole('button', {
-      name: /earthkit|ensemble|temporal|zarr/i,
+      name: /operational forecast|ensemble|temporal|zarr/i,
     })
 
     // Check palette sidebar for blocks
@@ -216,7 +91,7 @@ test.describe('Fable Builder - Form Mode', () => {
       await buttonsToClick.first().click()
       await page.waitForTimeout(1000)
 
-      // Should show "Unsaved" badge in header
+      // Should show the draft-status badge in the header
       const unsavedBadge = page.getByText(/saving draft|draft saved/i)
       if (
         await unsavedBadge
@@ -317,81 +192,63 @@ test.describe('Fable Builder - Graph Mode', () => {
     }
   })
 
-  test('adds multiple blocks and verifies nodes appear', async ({ page }) => {
-    const paletteButtons = page.locator('button[title^="Add "]')
-    const buttonCount = await paletteButtons.count()
-
-    if (buttonCount >= 2) {
-      // Add first block (source)
-      await paletteButtons.first().click()
-      await page.waitForTimeout(1000)
-
-      // Add second block (try a different kind)
-      await paletteButtons.nth(1).click()
-      await page.waitForTimeout(1000)
-
-      // Should have at least 2 nodes
-      const nodes = page.locator('.react-flow__node')
-      const nodeCount = await nodes.count()
-      expect(nodeCount).toBeGreaterThanOrEqual(2)
-    }
-  })
-
-  test('switches between graph and form mode preserving state', async ({
+  test('graph renders a node for every block in a multi-block fable', async ({
     page,
   }) => {
-    // Add a block in graph mode
-    const paletteButtons = page.locator('button[title^="Add "]')
-    if ((await paletteButtons.count()) > 0) {
-      await paletteButtons.first().click()
-      await page.waitForTimeout(1000)
-
-      // Check block count in header
-      const blocksBadge = page.getByText(/\d+ blocks?/)
-      const initialText = await blocksBadge
-        .first()
-        .textContent()
-        .catch(() => null)
-
-      // Switch to form mode
-      const formButton = page.getByRole('button', { name: /form/i })
-      if (await formButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-        await formButton.click()
-        await page.waitForTimeout(500)
-
-        // Block count should persist
-        if (initialText) {
-          const newBlocksBadge = page.getByText(/\d+ blocks?/)
-          if (
-            await newBlocksBadge
-              .first()
-              .isVisible({ timeout: 3000 })
-              .catch(() => false)
-          ) {
-            const newText = await newBlocksBadge.first().textContent()
-            expect(newText).toBe(initialText)
-          }
-        }
-
-        // Switch back to graph mode
-        const graphButton = page.getByRole('button', { name: /graph/i })
-        if (await graphButton.isVisible({ timeout: 3000 }).catch(() => false)) {
-          await graphButton.click()
-          await page.waitForTimeout(500)
-
-          // Node should still be there
-          const nodes = page.locator('.react-flow__node')
-          if (
-            await nodes
-              .first()
-              .isVisible({ timeout: 3000 })
-              .catch(() => false)
-          ) {
-            await expect(nodes.first()).toBeVisible()
-          }
-        }
-      }
+    // Seed a 3-block fable as a localStorage draft — FableBuilderPage restores
+    // it on mount. Deterministic: avoids adding blocks through the palette,
+    // whose availability is validation-driven and raced the catalogue
+    // round-trip, which made the old "add two blocks" flow flaky.
+    const draft = {
+      fable: {
+        blocks: {
+          block_source_1: {
+            factory_id: {
+              plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+              factory: 'operationalForecastSource',
+            },
+            configuration_values: {
+              source: 'mars',
+              forecast: 'aifs-ens',
+              base_time: '2024-01-15T00:00:00',
+            },
+            input_ids: {},
+          },
+          block_product_1: {
+            factory_id: {
+              plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+              factory: 'ensembleStatistics',
+            },
+            configuration_values: { statistic: 'mean' },
+            input_ids: { dataset: 'block_source_1' },
+          },
+          block_sink_1: {
+            factory_id: {
+              plugin: { store: 'ecmwf', local: 'ecmwf-base' },
+              factory: 'zarrSink',
+            },
+            configuration_values: {
+              path: '/data/output/european_temperature.zarr',
+            },
+            input_ids: { dataset: 'block_product_1' },
+          },
+        },
+      },
+      fableId: null,
+      fableName: 'European Temperature Forecast',
+      fableVersion: null,
+      savedAt: Date.now(),
     }
+    await page.addInitScript((value) => {
+      window.localStorage.setItem('fiab.fable.draft', value)
+    }, JSON.stringify(draft))
+
+    await navigateTo(page, '/configure')
+
+    // 3 blocks → 3 graph nodes.
+    await expect(page.locator('.react-flow__node')).toHaveCount(3, {
+      timeout: 15000,
+    })
   })
 
   test('closes config panel with close button', async ({ page }) => {
@@ -411,7 +268,7 @@ test.describe('Fable Builder - Graph Mode', () => {
           await closeButton.click()
           await page.waitForTimeout(300)
 
-          // Panel should show "Select a block to configure" or similar
+          // Panel should show the empty-panel placeholder or similar
           const emptyState = page.getByText(/select a block/i)
           if (
             await emptyState
@@ -473,13 +330,13 @@ test.describe('Fable Builder - Save & Load', () => {
             await saveAction.click()
             await page.waitForTimeout(2000)
 
-            // Unsaved badge should disappear
+            // Draft-status badge should disappear
             const unsavedBadge = page.getByText(/saving draft|draft saved/i)
             const isUnsavedVisible = await unsavedBadge
               .first()
               .isVisible({ timeout: 2000 })
               .catch(() => false)
-            // After save, unsaved should not be visible
+            // After save, the draft badge should not be visible
             if (!isUnsavedVisible) {
               expect(isUnsavedVisible).toBe(false)
             }
@@ -522,7 +379,7 @@ test.describe('Fable Builder - Save & Load', () => {
         await paletteButtons.nth(1).click()
         await page.waitForTimeout(1000)
 
-        // Unsaved badge should reappear
+        // Draft-status badge should reappear
         const unsavedBadge = page.getByText(/saving draft|draft saved/i)
         if (
           await unsavedBadge
@@ -536,13 +393,12 @@ test.describe('Fable Builder - Save & Load', () => {
     }
   })
 
-  test('loads a preset configuration via URL param', async ({ page }) => {
-    // Navigate with a preset param
-    await page.goto('/configure?preset=quick-start')
-    await page.waitForLoadState('networkidle')
-    await page.waitForTimeout(3000)
+  test('forking a plugin template loads its blocks', async ({ page }) => {
+    if (!(await openTemplateConfig(page))) {
+      test.skip(true, 'no plugin templates in this environment')
+    }
 
-    // Should load with pre-configured blocks
+    // Should load with the template's blocks
     const blocksBadge = page.getByText(/\d+ blocks?/)
     if (
       await blocksBadge
@@ -570,10 +426,9 @@ test.describe('Fable Builder - Review & Validation', () => {
   test('navigates to review step and shows configuration summary', async ({
     page,
   }) => {
-    // Load a preset to get a complete config
-    await page.goto('/configure?preset=quick-start')
-    await page.waitForLoadState('networkidle')
-    await page.waitForTimeout(3000)
+    if (!(await openTemplateConfig(page))) {
+      test.skip(true, 'no plugin templates in this environment')
+    }
 
     // Click Review & Submit
     const reviewButton = page.getByRole('button', { name: /review/i })
@@ -609,10 +464,9 @@ test.describe('Fable Builder - Review & Validation', () => {
   })
 
   test('back to edit returns from review step', async ({ page }) => {
-    // Load preset and go to review
-    await page.goto('/configure?preset=quick-start')
-    await page.waitForLoadState('networkidle')
-    await page.waitForTimeout(3000)
+    if (!(await openTemplateConfig(page))) {
+      test.skip(true, 'no plugin templates in this environment')
+    }
 
     const reviewButton = page.getByRole('button', { name: /review/i })
     if (await reviewButton.isVisible({ timeout: 5000 }).catch(() => false)) {
@@ -627,12 +481,14 @@ test.describe('Fable Builder - Review & Validation', () => {
           await backButton.click()
           await page.waitForTimeout(500)
 
-          // Should show mode toggle again (edit step)
-          const graphButton = page.getByRole('button', { name: /graph/i })
+          // Should show the graph-options button again (edit step)
+          const optionsButton = page.getByRole('button', {
+            name: /^view$/i,
+          })
           if (
-            await graphButton.isVisible({ timeout: 3000 }).catch(() => false)
+            await optionsButton.isVisible({ timeout: 3000 }).catch(() => false)
           ) {
-            await expect(graphButton).toBeVisible()
+            await expect(optionsButton).toBeVisible()
           }
         }
       }
@@ -640,10 +496,9 @@ test.describe('Fable Builder - Review & Validation', () => {
   })
 
   test('shows validation status on review step', async ({ page }) => {
-    // Load preset
-    await page.goto('/configure?preset=quick-start')
-    await page.waitForLoadState('networkidle')
-    await page.waitForTimeout(3000)
+    if (!(await openTemplateConfig(page))) {
+      test.skip(true, 'no plugin templates in this environment')
+    }
 
     const reviewButton = page.getByRole('button', { name: /review/i })
     if (await reviewButton.isVisible({ timeout: 5000 }).catch(() => false)) {
@@ -652,7 +507,7 @@ test.describe('Fable Builder - Review & Validation', () => {
         await reviewButton.click()
         await page.waitForTimeout(3000)
 
-        // Should show either "Ready to Submit" or "Configuration Has Errors"
+        // Should show either "Ready to submit" or "Workflow has errors"
         const readyText = page.getByText(/ready to submit/i)
         const errorsText = page.getByText(/has errors/i)
         const validatingText = page.getByText(/validating/i)
@@ -676,11 +531,10 @@ test.describe('Fable Builder - Review & Validation', () => {
     }
   })
 
-  test('submit job button visible on review step', async ({ page }) => {
-    // Load preset
-    await page.goto('/configure?preset=quick-start')
-    await page.waitForLoadState('networkidle')
-    await page.waitForTimeout(3000)
+  test('start run button visible on review step', async ({ page }) => {
+    if (!(await openTemplateConfig(page))) {
+      test.skip(true, 'no plugin templates in this environment')
+    }
 
     const reviewButton = page.getByRole('button', { name: /review/i })
     if (await reviewButton.isVisible({ timeout: 5000 }).catch(() => false)) {
@@ -689,9 +543,9 @@ test.describe('Fable Builder - Review & Validation', () => {
         await reviewButton.click()
         await page.waitForTimeout(2000)
 
-        // Submit Job button should be visible
+        // Start Run button should be visible
         const submitButton = page.getByRole('button', {
-          name: /submit job/i,
+          name: /start run/i,
         })
         if (
           await submitButton.isVisible({ timeout: 5000 }).catch(() => false)

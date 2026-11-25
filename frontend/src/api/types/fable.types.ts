@@ -10,14 +10,18 @@
 
 import { Cloud, Cog, Download, Shuffle } from 'lucide-react'
 import { z } from 'zod'
+import i18n from 'i18next'
 import { EnvironmentSpecificationSchema } from './job.types'
+import { QubeNodeSchema } from './artifacts.types'
 import {
   PluginCompositeIdSchema,
   parsePluginKey,
   toPluginDisplayId,
 } from './plugins.types'
+import type { QubeNode } from './artifacts.types'
 import type { LucideIcon } from 'lucide-react'
 import type { PluginCompositeId } from './plugins.types'
+import type { EnvironmentSpecification } from './job.types'
 
 export type PluginId = string
 export type BlockFactoryId = string
@@ -34,6 +38,19 @@ export const PluginBlockFactoryIdSchema = z.object({
 })
 
 export type PluginBlockFactoryId = z.infer<typeof PluginBlockFactoryIdSchema>
+
+/**
+ * Expansion item from PUT /blueprint/expand.
+ *
+ * Backend now includes per-option restrictions in addition to plugin+factory.
+ */
+export const BlockExpansionSchema = z.object({
+  plugin: PluginCompositeIdSchema,
+  factory: z.string(),
+  restrictions: z.record(z.string(), z.string()).optional().default({}),
+})
+
+export type BlockExpansion = z.infer<typeof BlockExpansionSchema>
 
 export const BlockConfigurationOptionSchema = z.object({
   title: z.string(),
@@ -84,39 +101,91 @@ export const BlockFactoryCatalogueSchema = z.record(
 
 export type BlockFactoryCatalogue = z.infer<typeof BlockFactoryCatalogueSchema>
 
-export const BlockInstanceSchema = z.object({
-  factory_id: PluginBlockFactoryIdSchema,
-  configuration_values: z.record(z.string(), z.string()),
-  input_ids: z.record(z.string(), z.string()),
+export interface BlockInstance {
+  factory_id: PluginBlockFactoryId
+  configuration_values: Record<string, string>
+  input_ids: Record<string, string>
+}
+
+/** API-level block schema (what the backend sends and expects in BlueprintBuilder.blocks). */
+const RoutableBlockApiSchema = z.object({
+  instance_id: z.string(),
+  plugin: PluginCompositeIdSchema,
+  factory: z.string(),
+  instance: z.object({
+    configuration_values: z.record(z.string(), z.string()),
+    input_ids: z.record(z.string(), z.string()).optional().default({}),
+  }),
 })
 
-export type BlockInstance = z.infer<typeof BlockInstanceSchema>
-
+/**
+ * Parses the backend BlueprintBuilder into the internal dict-based representation.
+ * The backend sends blocks as a list of RoutableBlocks; the frontend stores them
+ * as a Record keyed by instance_id with factory_id hoisted onto each BlockInstance.
+ */
 export const FableBuilderV1Schema = z.object({
-  blocks: z.record(z.string(), BlockInstanceSchema),
+  blocks: z.array(RoutableBlockApiSchema).transform((routableBlocks) => {
+    const dict: Record<BlockInstanceId, BlockInstance> = {}
+    for (const b of routableBlocks) {
+      dict[b.instance_id] = {
+        factory_id: { plugin: b.plugin, factory: b.factory },
+        configuration_values: b.instance.configuration_values,
+        input_ids: b.instance.input_ids,
+      }
+    }
+    return dict
+  }),
   environment: EnvironmentSpecificationSchema.nullable().optional(),
   local_glyphs: z.record(z.string(), z.string()).optional(),
 })
 
-export type FableBuilderV1 = z.infer<typeof FableBuilderV1Schema>
+export type FableBuilderV1 = {
+  blocks: Record<BlockInstanceId, BlockInstance>
+  environment?: EnvironmentSpecification | null
+  local_glyphs?: Record<string, string>
+}
 
 /**
- * Intrinsic glyph available for ${glyph} interpolation in block configuration values.
- * Returned by GET /api/v1/blueprint/glyphs/list?glyph_type=intrinsic
+ * Intrinsic glyph item from GET /api/v1/blueprint/glyphs/list?glyph_type=intrinsic
  */
-export const GlyphDetailSchema = z.object({
+export const IntrinsicGlyphItemSchema = z.object({
+  glyph_type: z.literal('intrinsic'),
   name: z.string(),
   display_name: z.string(),
   valueExample: z.string(),
-  /** "intrinsic" for intrinsic glyphs; owner id (or passthrough sentinel "user") otherwise. */
   created_by: z.string(),
 })
 
-export type GlyphDetail = z.infer<typeof GlyphDetailSchema>
+export type IntrinsicGlyphItem = z.infer<typeof IntrinsicGlyphItemSchema>
+
+/**
+ * Global glyph item from GET /api/v1/blueprint/glyphs/list?glyph_type=global
+ */
+export const GlobalGlyphItemSchema = z.object({
+  glyph_type: z.literal('global'),
+  global_glyph_id: z.string(),
+  key: z.string(),
+  value: z.string(),
+  public: z.boolean(),
+  overriddable: z.boolean().nullable(),
+  created_by: z.string(),
+  created_at: z.string(),
+  updated_at: z.string(),
+})
+
+export type GlobalGlyphItem = z.infer<typeof GlobalGlyphItemSchema>
+
+/** Discriminated union of glyph list items */
+export const GlyphListItemSchema = z.discriminatedUnion('glyph_type', [
+  IntrinsicGlyphItemSchema,
+  GlobalGlyphItemSchema,
+])
+
+export type GlyphListItem = z.infer<typeof GlyphListItemSchema>
 
 /** Paginated response from GET /api/v1/blueprint/glyphs/list */
 export const GlyphListResponseSchema = z.object({
-  glyphs: z.array(GlyphDetailSchema),
+  glyphs: z.array(GlyphListItemSchema),
   total: z.number(),
   page: z.number(),
   page_size: z.number(),
@@ -140,6 +209,7 @@ export interface GlobalGlyphPostRequest {
 
 /** Response from global glyph endpoints */
 export const GlobalGlyphResponseSchema = z.object({
+  glyph_type: z.literal('global'),
   global_glyph_id: z.string(),
   key: z.string(),
   value: z.string(),
@@ -170,35 +240,63 @@ export type GlyphFunctionsResponse = z.infer<
   typeof GlyphFunctionsResponseSchema
 >
 
+/** A resolveDisplay input; `typeName` is a bare type such as `param`. */
+export interface ResolvableValue {
+  typeName: string
+  value: string
+}
+
+/** Response from POST /blueprint/options/resolveDisplay, in request order. */
+export const ResolveDisplayResponseSchema = z.object({
+  elements: z.array(
+    z.object({
+      typeName: z.string(),
+      value: z.string(),
+      display: z.string().nullable(),
+    }),
+  ),
+})
+
+export type ResolveDisplayResponse = z.infer<
+  typeof ResolveDisplayResponseSchema
+>
+
 export const FableValidationExpansionSchema = z.object({
   global_errors: z.array(z.string()),
   block_errors: z.record(z.string(), z.array(z.string())),
   possible_sources: z.array(PluginBlockFactoryIdSchema),
-  possible_expansions: z.record(
-    z.string(),
-    z.array(PluginBlockFactoryIdSchema),
-  ),
-  resolved_configuration_options: z
+  possible_expansions: z.record(z.string(), z.array(BlockExpansionSchema)),
+  configuration_restrictions: z
     .record(z.string(), z.record(z.string(), z.string()))
     .optional()
     .default({}),
+  resolved_configuration_options: z
+    .record(z.string(), z.record(z.string(), z.string().nullable()))
+    .optional()
+    .default({}),
+  missing_glyphs: z
+    .record(z.string(), z.record(z.string(), z.array(z.string())))
+    .optional()
+    .default({}),
+  /** Per-block output qube for the graph lens; parsed per-block so one
+   * unparseable qube is dropped rather than failing the whole response. */
+  block_output_qubes: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .default({})
+    .transform((rec) => {
+      const out: Record<string, QubeNode> = {}
+      for (const [blockId, raw] of Object.entries(rec)) {
+        const parsed = QubeNodeSchema.safeParse(raw)
+        if (parsed.success) out[blockId] = parsed.data
+      }
+      return out
+    }),
 })
 
 export type FableValidationExpansion = z.infer<
   typeof FableValidationExpansionSchema
 >
-
-export const SavedFableSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  fable: FableBuilderV1Schema,
-  tags: z.array(z.string()),
-  created_at: z.string(),
-  updated_at: z.string(),
-  user_id: z.string().optional(),
-})
-
-export type SavedFable = z.infer<typeof SavedFableSchema>
 
 export const FableUpsertResponseSchema = z.object({
   blueprint_id: z.string(),
@@ -215,16 +313,58 @@ export interface FableUpsertRequest {
   parent_id?: string
 }
 
-/** routes/blueprint.py: BlueprintListItem */
-export const BlueprintListItemSchema = z.object({
-  blueprint_id: z.string(),
-  version: z.number(),
-  display_name: z.string().nullable(),
-  display_description: z.string().nullable(),
-  tags: z.array(z.string()).nullable(),
-  source: z.string().nullable(),
-  created_by: z.string().nullable(),
+/** Reserved tag (backend #494): value holds the version-mismatch detail
+ * (e.g. `"!3 != 4"`). Stripped from user tags, surfaced as a warning. */
+export const CORE_VERSION_MISMATCH_KEY = 'CoreVersionMismatch'
+
+/** Backend tag: `value` is null for plain labels, set for informational ones. */
+const TagObjectSchema = z.object({
+  key: z.string(),
+  value: z.string().nullish(),
 })
+
+export interface PartitionedTags {
+  /** User-facing tag keys (reserved keys removed). */
+  tags: Array<string>
+  /** `CoreVersionMismatch` detail, or null when versions agree. */
+  coreVersionMismatch: string | null
+}
+
+/** Split backend tags into plain keys (kept as `string[]` for existing
+ * save/search/group/display) and the extracted mismatch detail. */
+export function partitionBlueprintTags(
+  raw: ReadonlyArray<{ key: string; value?: string | null }>,
+): PartitionedTags {
+  let coreVersionMismatch: string | null = null
+  const tags: Array<string> = []
+  for (const tag of raw) {
+    if (tag.key === CORE_VERSION_MISMATCH_KEY) {
+      coreVersionMismatch = tag.value ?? null
+    } else {
+      tags.push(tag.key)
+    }
+  }
+  return { tags, coreVersionMismatch }
+}
+
+/** routes/blueprint.py: BlueprintDetail (as returned by the list endpoint) */
+export const BlueprintListItemSchema = z
+  .object({
+    blueprint_id: z.string(),
+    version: z.number(),
+    display_name: z.string().nullable(),
+    display_description: z.string().nullable(),
+    tags: z.array(TagObjectSchema).nullable(),
+    source: z.string().nullable(),
+    // Backend field is `user` -- kept as `created_by` here since that's the
+    // established app-level name for this "owner" value.
+    user: z.string(),
+  })
+  .transform(({ tags, user, ...rest }) => ({
+    ...rest,
+    created_by: user,
+    ...partitionBlueprintTags(tags ?? []),
+  }))
 
 export type BlueprintListItem = z.infer<typeof BlueprintListItemSchema>
 
@@ -255,15 +395,20 @@ export interface BlueprintDeleteRequest {
   version: number
 }
 
-export const FableRetrieveResponseSchema = z.object({
-  blueprint_id: z.string(),
-  version: z.number(),
-  builder: FableBuilderV1Schema,
-  display_name: z.string().nullable(),
-  display_description: z.string().nullable(),
-  tags: z.array(z.string()),
-  parent_id: z.string().nullable().optional(),
-})
+export const FableRetrieveResponseSchema = z
+  .object({
+    blueprint_id: z.string(),
+    version: z.number(),
+    builder: FableBuilderV1Schema,
+    display_name: z.string().nullable(),
+    display_description: z.string().nullable(),
+    tags: z.array(TagObjectSchema),
+    parent_id: z.string().nullable().optional(),
+  })
+  .transform(({ tags, ...rest }) => ({
+    ...rest,
+    ...partitionBlueprintTags(tags),
+  }))
 
 export type FableRetrieveResponse = z.infer<typeof FableRetrieveResponseSchema>
 
@@ -277,6 +422,16 @@ export interface BlockValidationState {
   errors: Array<string>
   hasErrors: boolean
   possibleExpansions: Array<PluginBlockFactoryId>
+  /** Per-child-factory config restrictions. Outer key
+   * `factoryIdToKey(childId)`; inner maps option id → FableType (e.g.
+   * `mapPlotSink → { param: "list[enumClosed[…]]" }`). */
+  possibleExpansionRestrictions: Record<string, Record<string, string>>
+  /** Config restrictions for this block's own fields. */
+  configurationRestrictions: Record<string, string>
+  /** Unknown glyph names per option, from /blueprint/expand. */
+  missingGlyphs: Record<string, Array<string>>
+  /** Edited since this result; errors dropped until the next check. */
+  stale?: boolean
 }
 
 export interface FableValidationState {
@@ -290,7 +445,16 @@ export interface FableValidationState {
    * glyph references (${...}). Sourced from /blueprint/expand — the frontend
    * never resolves glyphs client-side.
    */
-  resolvedConfigurationOptions: Record<BlockInstanceId, Record<string, string>>
+  resolvedConfigurationOptions: Record<
+    BlockInstanceId,
+    Record<string, string | null>
+  >
+  /**
+   * Per-block output qube (qubed node tree), keyed by BlockInstanceId.
+   * The qube flowing out of a block — i.e. on every edge leaving it. Used by
+   * the graph qube lens; empty when the backend doesn't provide it.
+   */
+  blockOutputQubes: Record<BlockInstanceId, QubeNode>
 }
 
 export interface BlockKindMetadata {
@@ -312,11 +476,17 @@ export const BLOCK_KIND_ORDER: Array<BlockKind> = [
   'sink',
 ]
 
+// `label`/`description` are getters so they resolve through i18next on access
+// (at render), keeping this module free of the i18n initialisation side-effect.
 export const BLOCK_KIND_METADATA: Record<BlockKind, BlockKindMetadata> = {
   source: {
     kind: 'source',
-    label: 'Source',
-    description: 'Data sources like forecasts and initial conditions',
+    get label() {
+      return i18n.t('configure:blockKind.source.label')
+    },
+    get description() {
+      return i18n.t('configure:blockKind.source.description')
+    },
     color: 'text-blue-500',
     bgColor: 'bg-blue-50 dark:bg-blue-950',
     borderColor: 'border-blue-200 dark:border-blue-800',
@@ -326,8 +496,12 @@ export const BLOCK_KIND_METADATA: Record<BlockKind, BlockKindMetadata> = {
   },
   transform: {
     kind: 'transform',
-    label: 'Transform',
-    description: 'Transform and process data',
+    get label() {
+      return i18n.t('configure:blockKind.transform.label')
+    },
+    get description() {
+      return i18n.t('configure:blockKind.transform.description')
+    },
     color: 'text-amber-500',
     bgColor: 'bg-amber-50 dark:bg-amber-950',
     borderColor: 'border-amber-200 dark:border-amber-800',
@@ -337,8 +511,12 @@ export const BLOCK_KIND_METADATA: Record<BlockKind, BlockKindMetadata> = {
   },
   product: {
     kind: 'product',
-    label: 'Product',
-    description: 'Compute derived products from data',
+    get label() {
+      return i18n.t('configure:blockKind.product.label')
+    },
+    get description() {
+      return i18n.t('configure:blockKind.product.description')
+    },
     color: 'text-purple-500',
     bgColor: 'bg-purple-50 dark:bg-purple-950',
     borderColor: 'border-purple-200 dark:border-purple-800',
@@ -348,8 +526,12 @@ export const BLOCK_KIND_METADATA: Record<BlockKind, BlockKindMetadata> = {
   },
   sink: {
     kind: 'sink',
-    label: 'Output',
-    description: 'Store or visualize results',
+    get label() {
+      return i18n.t('configure:blockKind.sink.label')
+    },
+    get description() {
+      return i18n.t('configure:blockKind.sink.description')
+    },
     color: 'text-emerald-500',
     bgColor: 'bg-emerald-50 dark:bg-emerald-950',
     borderColor: 'border-emerald-200 dark:border-emerald-800',
@@ -374,6 +556,38 @@ export function createEmptyFable(): FableBuilderV1 {
   return {
     blocks: {},
     local_glyphs: {},
+  }
+}
+
+/**
+ * Serialize an internal FableBuilderV1 to the API wire format (BlueprintBuilder).
+ * The backend expects blocks as a list of RoutableBlocks, not a dict.
+ */
+export function serializeFable(fable: FableBuilderV1): {
+  blocks: Array<{
+    instance_id: string
+    plugin: PluginCompositeId
+    factory: string
+    instance: {
+      configuration_values: Record<string, string>
+      input_ids: Record<string, string>
+    }
+  }>
+  environment?: EnvironmentSpecification | null
+  local_glyphs?: Record<string, string>
+} {
+  return {
+    blocks: Object.entries(fable.blocks).map(([instanceId, instance]) => ({
+      instance_id: instanceId,
+      plugin: instance.factory_id.plugin,
+      factory: instance.factory_id.factory,
+      instance: {
+        configuration_values: instance.configuration_values,
+        input_ids: instance.input_ids,
+      },
+    })),
+    environment: fable.environment,
+    local_glyphs: fable.local_glyphs,
   }
 }
 
@@ -421,32 +635,6 @@ export function getFactory(
  */
 export function factoryIdToKey(id: PluginBlockFactoryId): string {
   return `${pluginIdToDisplayKey(id.plugin)}:${id.factory}`
-}
-
-/**
- * Parse a string key back to PluginBlockFactoryId
- * Key format: "store/local:factory"
- */
-export function keyToFactoryId(key: string): PluginBlockFactoryId {
-  const colonIndex = key.lastIndexOf(':')
-  if (colonIndex === -1) {
-    throw new Error(`Invalid factory key format: ${key}`)
-  }
-  const pluginPart = key.substring(0, colonIndex)
-  const factory = key.substring(colonIndex + 1)
-
-  // Parse "store/local" format
-  const slashIndex = pluginPart.indexOf('/')
-  if (slashIndex === -1) {
-    throw new Error(`Invalid plugin ID format in key: ${key}`)
-  }
-  const store = pluginPart.substring(0, slashIndex)
-  const local = pluginPart.substring(slashIndex + 1)
-
-  return {
-    plugin: { store, local },
-    factory,
-  }
 }
 
 /**
@@ -566,29 +754,54 @@ export function getBlocksByKind(
     .map(([instanceId, instance]) => ({ instanceId, instance }))
 }
 
+/** Backend wraps validator failures with `repr(exc)`; unwrap that exact
+ * `Error('msg')` shape to the bare message, leaving clean strings untouched. */
+const PYTHON_EXCEPTION_REPR =
+  /^[A-Z]\w*(?:Error|Exception|Warning)\((['"])([\s\S]*)\1\)$/
+
+export function unwrapBackendError(message: string): string {
+  const match = PYTHON_EXCEPTION_REPR.exec(message)
+  if (!match) return message
+  return match[2].replace(/\\(['"\\])/g, '$1')
+}
+
 export function toValidationState(
   expansion: FableValidationExpansion,
+  fable?: FableBuilderV1,
+  catalogue?: BlockFactoryCatalogue,
 ): FableValidationState {
   const blockStates: Record<BlockInstanceId, BlockValidationState> = {}
+  const configurationRestrictionsByBlock = expansion.configuration_restrictions
+  const missingRequiredByBlock =
+    fable && catalogue ? getMissingRequiredConfigErrors(fable, catalogue) : {}
+  const allBlockIds = new Set<string>([
+    ...Object.keys(expansion.block_errors),
+    ...Object.keys(expansion.possible_expansions),
+    ...Object.keys(configurationRestrictionsByBlock),
+    ...Object.keys(missingRequiredByBlock),
+    ...Object.keys(expansion.missing_glyphs),
+  ])
 
-  for (const [blockId, errors] of Object.entries(expansion.block_errors)) {
+  for (const blockId of allBlockIds) {
+    const backendErrors = (expansion.block_errors[blockId] ?? []).map(
+      unwrapBackendError,
+    )
+    const missingErrors = missingRequiredByBlock[blockId] ?? []
+    const errors = [...backendErrors, ...missingErrors]
+    const missingGlyphs = expansion.missing_glyphs[blockId] ?? {}
+    const possibleExpansions = expansion.possible_expansions[blockId] ?? []
+    const hasMissingGlyphs = Object.values(missingGlyphs).some(
+      (names) => names.length > 0,
+    )
     blockStates[blockId] = {
       errors,
-      hasErrors: errors.length > 0,
-      possibleExpansions: expansion.possible_expansions[blockId] ?? [],
-    }
-  }
-
-  for (const [blockId, expansions] of Object.entries(
-    expansion.possible_expansions,
-  )) {
-    // Only add blocks that weren't already added from block_errors
-    if (!(blockId in blockStates)) {
-      blockStates[blockId] = {
-        errors: [],
-        hasErrors: false,
-        possibleExpansions: expansions,
-      }
+      hasErrors: errors.length > 0 || hasMissingGlyphs,
+      possibleExpansions: toPluginFactoryIds(possibleExpansions),
+      possibleExpansionRestrictions:
+        toExpansionRestrictionMap(possibleExpansions),
+      configurationRestrictions:
+        configurationRestrictionsByBlock[blockId] ?? {},
+      missingGlyphs,
     }
   }
 
@@ -602,5 +815,102 @@ export function toValidationState(
     blockStates,
     possibleSources: expansion.possible_sources,
     resolvedConfigurationOptions: expansion.resolved_configuration_options,
+    blockOutputQubes: expansion.block_output_qubes,
   }
+}
+
+function toPluginFactoryIds(
+  expansions: ReadonlyArray<BlockExpansion>,
+): Array<PluginBlockFactoryId> {
+  return expansions.map((expansion) => ({
+    plugin: expansion.plugin,
+    factory: expansion.factory,
+  }))
+}
+
+function toExpansionRestrictionMap(
+  expansions: ReadonlyArray<BlockExpansion>,
+): Record<string, Record<string, string>> {
+  const result: Record<string, Record<string, string>> = {}
+  for (const expansion of expansions) {
+    result[factoryIdToKey(expansion)] = expansion.restrictions
+  }
+  return result
+}
+
+function isOptionalValueType(valueType: string): boolean {
+  return /^optional\[(.+)\]$/i.test(valueType.trim())
+}
+
+function getRecordItem<T>(
+  record: Record<string, T>,
+  key: string,
+): T | undefined {
+  return Object.hasOwn(record, key) ? record[key] : undefined
+}
+
+export function getBlockConfigurationRestrictions(
+  fable: FableBuilderV1,
+  validationState: FableValidationState | null,
+  blockId: BlockInstanceId,
+): Record<string, string> {
+  const block = getRecordItem(fable.blocks, blockId)
+  if (!block || !validationState) return {}
+
+  const blockFactoryKey = factoryIdToKey(block.factory_id)
+  const restrictions: Record<string, string> = {}
+  for (const sourceId of Object.values(block.input_ids)) {
+    const sourceState = getRecordItem(validationState.blockStates, sourceId)
+    const sourceRestrictions = sourceState
+      ? getRecordItem(
+          sourceState.possibleExpansionRestrictions,
+          blockFactoryKey,
+        )
+      : undefined
+
+    Object.assign(restrictions, sourceRestrictions)
+  }
+  const blockState = getRecordItem(validationState.blockStates, blockId)
+  Object.assign(restrictions, blockState?.configurationRestrictions)
+  return restrictions
+}
+
+function toPythonStringSet(items: ReadonlyArray<string>): string {
+  return `{${items.map((item) => `'${item}'`).join(', ')}}`
+}
+
+function getMissingRequiredConfigErrors(
+  fable: FableBuilderV1,
+  catalogue: BlockFactoryCatalogue,
+): Record<BlockInstanceId, Array<string>> {
+  const missingByBlock: Record<BlockInstanceId, Array<string>> = {}
+
+  for (const [blockId, block] of Object.entries(fable.blocks)) {
+    const factory = getFactory(catalogue, block.factory_id)
+    if (!factory) continue
+
+    const missingKeys = Object.entries(factory.configuration_options)
+      .filter(([configKey, option]) => {
+        if (isOptionalValueType(option.value_type)) return false
+        if (
+          !Object.prototype.hasOwnProperty.call(
+            block.configuration_values,
+            configKey,
+          )
+        ) {
+          return true
+        }
+        return block.configuration_values[configKey].trim() === ''
+      })
+      .map(([configKey]) => configKey)
+      .sort()
+
+    if (missingKeys.length > 0) {
+      missingByBlock[blockId] = [
+        `Block contains missing config: ${toPythonStringSet(missingKeys)}`,
+      ]
+    }
+  }
+
+  return missingByBlock
 }

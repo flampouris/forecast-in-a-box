@@ -12,31 +12,36 @@ from earthkit.workflows.fluent import Action
 from fiab_core.fable import (
     ActionLookup,
     BlockConfigurationOption,
-    BlockInstance,
-    BlockInstanceId,
     BlockInstanceOutput,
+    ConfigurationOptionId,
+    ConfigurationOptionRestriction,
     NoOutput,
     QubedOutput,
 )
 from fiab_core.plugin import Error
-from fiab_core.tools.blocks import Product, Sink, Transform
+from fiab_core.tools.blocks import BlockInstanceRich, Product, Sink, Transform
+from fiab_core.types import ListType, ParameterType, StringType
+
+DIR = ConfigurationOptionId("dir")
+PARAM = ConfigurationOptionId("param")
 
 
 class _DemoTransform(Transform):
-    configuration_options: dict[str, BlockConfigurationOption] = {}
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {}
     inputs: list[str] = ["dataset"]
 
-    def validate(self, block: BlockInstance, inputs: dict[str, QubedOutput]) -> Either[BlockInstanceOutput, Error]:  # type:ignore[invalid-argument] # semigroup
+    def validate(
+        self, block: BlockInstanceRich, inputs: dict[str, QubedOutput], restrictions: ConfigurationOptionRestriction
+    ) -> BlockInstanceOutput:
         dataset = inputs.get("dataset")
         if dataset is None:
-            return Either.error("Missing input 'dataset'")
-        return Either.ok(dataset)
+            raise ValueError("Missing input 'dataset'")
+        return dataset
 
     def compile(
         self,
         inputs: ActionLookup,
-        block_id: BlockInstanceId,
-        block: BlockInstance,
+        block: BlockInstanceRich,
     ) -> Either[Action, Error]:  # type:ignore[invalid-argument] # semigroup
         return Either.ok(inputs[block.input_ids["dataset"]])
 
@@ -45,20 +50,21 @@ class _DemoTransform(Transform):
 
 
 class _DemoProduct(Product):
-    configuration_options: dict[str, BlockConfigurationOption] = {}
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {}
     inputs: list[str] = ["dataset"]
 
-    def validate(self, block: BlockInstance, inputs: dict[str, QubedOutput]) -> Either[BlockInstanceOutput, Error]:  # type:ignore[invalid-argument] # semigroup
+    def validate(
+        self, block: BlockInstanceRich, inputs: dict[str, QubedOutput], restrictions: ConfigurationOptionRestriction
+    ) -> BlockInstanceOutput:
         dataset = inputs.get("dataset")
         if dataset is None:
-            return Either.error("Missing input 'dataset'")
-        return Either.ok(dataset)
+            raise ValueError("Missing input 'dataset'")
+        return dataset
 
     def compile(
         self,
         inputs: ActionLookup,
-        block_id: BlockInstanceId,
-        block: BlockInstance,
+        block: BlockInstanceRich,
     ) -> Either[Action, Error]:  # type:ignore[invalid-argument] # semigroup
         return Either.ok(inputs[block.input_ids["dataset"]])
 
@@ -67,19 +73,20 @@ class _DemoProduct(Product):
 
 
 class _DemoSink(Sink):
-    configuration_options: dict[str, BlockConfigurationOption] = {}
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {}
     inputs: list[str] = ["dataset"]
 
-    def validate(self, block: BlockInstance, inputs: dict[str, QubedOutput]) -> Either[BlockInstanceOutput, Error]:  # type:ignore[invalid-argument] # semigroup
+    def validate(
+        self, block: BlockInstanceRich, inputs: dict[str, QubedOutput], restrictions: ConfigurationOptionRestriction
+    ) -> BlockInstanceOutput:
         if "dataset" not in inputs:
-            return Either.error("Missing input 'dataset'")
-        return Either.ok(NoOutput())
+            raise ValueError("Missing input 'dataset'")
+        return NoOutput()
 
     def compile(
         self,
         inputs: ActionLookup,
-        block_id: BlockInstanceId,
-        block: BlockInstance,
+        block: BlockInstanceRich,
     ) -> Either[Action, Error]:  # type:ignore[invalid-argument] # semigroup
         return Either.ok(inputs[block.input_ids["dataset"]])
 
@@ -90,11 +97,11 @@ class _DemoSink(Sink):
 class NetCDFOutputSink(_DemoSink):
     title: str = "NetCDF Output"
     description: str = "Placeholder sink for writing dataset output as NetCDF."
-    configuration_options: dict[str, BlockConfigurationOption] = {
-        "dir": BlockConfigurationOption(
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {
+        DIR: BlockConfigurationOption(
             title="Directory",
             description="Output directory (e.g. '/path/to/output')",
-            value_type="str",
+            value_type=StringType(),
         )
     }
 
@@ -102,11 +109,11 @@ class NetCDFOutputSink(_DemoSink):
 class GRIBOutputSink(_DemoSink):
     title: str = "GRIB Output"
     description: str = "Placeholder sink for writing dataset output as GRIB."
-    configuration_options: dict[str, BlockConfigurationOption] = {
-        "dir": BlockConfigurationOption(
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {
+        DIR: BlockConfigurationOption(
             title="Directory",
             description="Output directory (e.g. '/path/to/output')",
-            value_type="str",
+            value_type=StringType(),
         )
     }
 
@@ -114,11 +121,11 @@ class GRIBOutputSink(_DemoSink):
 class FilterParam(_DemoTransform):
     title: str = "Filter Parameters"
     description: str = "Placeholder transform for selecting specific parameters."
-    configuration_options: dict[str, BlockConfigurationOption] = {
-        "param": BlockConfigurationOption(
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {
+        PARAM: BlockConfigurationOption(
             title="Parameters",
             description="Parameters to select and plot (e.g. '2t', 'msl')",
-            value_type="list[str]",
+            value_type=ListType(ParameterType()),
         )
     }
 
@@ -126,11 +133,11 @@ class FilterParam(_DemoTransform):
 class InterpolationTransform(_DemoTransform):
     title: str = "Interpolation"
     description: str = "Placeholder transform for interpolating datasets."
-    configuration_options: dict[str, BlockConfigurationOption] = {
-        "param": BlockConfigurationOption(
+    configuration_options: dict[ConfigurationOptionId, BlockConfigurationOption] = {
+        PARAM: BlockConfigurationOption(
             title="Grid",
             description="GridSpec to interpolate",
-            value_type="str",
+            value_type=StringType(),
         )
     }
 

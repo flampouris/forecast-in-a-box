@@ -13,50 +13,74 @@ import {
   ChevronLeft,
   ChevronRight,
   Download,
+  SkipBack,
+  SkipForward,
   X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { downloadAction } from '../actions/download'
+import { outputTitle } from '../dims'
+import { useJobResultBlob } from '../useJobResult'
 import { pdfjs } from './pdfjs'
-import type { PDFDocumentProxy } from 'pdfjs-dist'
+import { kbdBadge, viewerHeaderBtn } from './viewerHeaderBtn'
+import { useDialogFocus } from './useDialogFocus'
+import type { PDFDocumentProxy, PDFPageProxy } from 'pdfjs-dist'
 import type { ViewerProps } from '../types'
-import { getJobResult } from '@/api/endpoints/job'
 import { createLogger } from '@/lib/logger'
 import { showToast } from '@/lib/toast'
+import { cn } from '@/lib/utils'
 
 const log = createLogger('PdfViewer')
 const MIN_SCALE = 0.5
 const MAX_SCALE = 4
 
-export default function PdfViewer({ item, adapter, onClose }: ViewerProps) {
+export default function PdfViewer({
+  item,
+  adapter,
+  onClose,
+  onPrev,
+  onNext,
+  navIndex,
+  footer,
+}: ViewerProps) {
   const { t } = useTranslation('executions')
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null)
   const [pageNumber, setPageNumber] = useState(1)
   const [scale, setScale] = useState(1)
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
+  // Shared cache — the grid thumbnail for this same output reuses this blob.
+  const { data, error } = useJobResultBlob(item.jobId, item.taskId)
+  const blob = data?.blob
+
   useEffect(() => {
-    const state: { cancelled: boolean; loaded: PDFDocumentProxy | null } = {
-      cancelled: false,
-      loaded: null,
-    }
+    if (error) showToast.error(error.message)
+  }, [error])
+
+  useEffect(() => {
+    if (!blob) return
+    const state: {
+      cancelled: boolean
+      task: ReturnType<typeof pdfjs.getDocument> | null
+    } = { cancelled: false, task: null }
     void (async () => {
       try {
-        const { blob } = await getJobResult(item.jobId, item.taskId)
+        const buf = await blob.arrayBuffer()
 
         if (state.cancelled) return
-        const buf = await blob.arrayBuffer()
-        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- mutated by cleanup
-        if (state.cancelled) return
-        state.loaded = await pdfjs.getDocument({ data: buf }).promise
+        // pdfjs v6: keep the loading task — it owns teardown.
+        state.task = pdfjs.getDocument({ data: buf })
+        const loaded = await state.task.promise
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- mutated by cleanup
         if (state.cancelled) {
-          await state.loaded.destroy()
+          await state.task.destroy()
           return
         }
-        setDoc(state.loaded)
+        setDoc(loaded)
+        setPageNumber(1)
+        setScale(1)
       } catch (err) {
         log.error('Failed to load PDF', { taskId: item.taskId, error: err })
         showToast.error(err instanceof Error ? err.message : String(err))
@@ -64,47 +88,75 @@ export default function PdfViewer({ item, adapter, onClose }: ViewerProps) {
     })()
     return () => {
       state.cancelled = true
-      if (state.loaded) {
-        // Fire-and-forget destroy — pdfjs cleans worker resources.
-        void state.loaded.destroy()
-      }
+      // Cancels the old render; the canvas keeps its pixels.
+      setDoc(null)
+      // Fire-and-forget: destroying the task tears down the document + worker.
+      void state.task?.destroy()
     }
-  }, [item.jobId, item.taskId])
+  }, [blob, item.taskId])
 
   useEffect(() => {
     if (!doc) return
-    const state: { cancelled: boolean } = { cancelled: false }
+    const state: {
+      cancelled: boolean
+      renderTask: ReturnType<PDFPageProxy['render']> | null
+    } = { cancelled: false, renderTask: null }
     void (async () => {
-      const page = await doc.getPage(pageNumber)
-
-      if (state.cancelled) return
-      const canvas = canvasRef.current
-      if (!canvas) return
-      const dpr = window.devicePixelRatio || 1
-      const viewport = page.getViewport({ scale: scale * dpr })
-      canvas.width = viewport.width
-      canvas.height = viewport.height
-      canvas.style.width = `${viewport.width / dpr}px`
-      canvas.style.height = `${viewport.height / dpr}px`
-      const ctx = canvas.getContext('2d')
-      if (!ctx) return
-      await page.render({ canvasContext: ctx, viewport, canvas }).promise
+      try {
+        const page = await doc.getPage(pageNumber)
+        if (state.cancelled) return
+        // Off-screen: resizing the visible canvas blanks it.
+        const dpr = window.devicePixelRatio || 1
+        const viewport = page.getViewport({ scale: scale * dpr })
+        const offscreen = document.createElement('canvas')
+        offscreen.width = viewport.width
+        offscreen.height = viewport.height
+        const offCtx = offscreen.getContext('2d')
+        if (!offCtx) return
+        state.renderTask = page.render({
+          canvasContext: offCtx,
+          viewport,
+          canvas: offscreen,
+        })
+        await state.renderTask.promise
+        const canvas = canvasRef.current
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- mutated by cleanup
+        if (state.cancelled || !canvas) return
+        canvas.width = viewport.width
+        canvas.height = viewport.height
+        canvas.style.width = `${viewport.width / dpr}px`
+        canvas.style.height = `${viewport.height / dpr}px`
+        canvas.getContext('2d')?.drawImage(offscreen, 0, 0)
+      } catch (err) {
+        // Expected on .cancel() during rapid output nav — swallow it.
+        if (
+          (err as { name?: string } | null)?.name ===
+          'RenderingCancelledException'
+        ) {
+          return
+        }
+        log.error('Failed to render PDF page', {
+          taskId: item.taskId,
+          pageNumber,
+          error: err,
+        })
+        showToast.error(err instanceof Error ? err.message : String(err))
+      }
     })()
     return () => {
       state.cancelled = true
+      state.renderTask?.cancel()
     }
-  }, [doc, pageNumber, scale])
+  }, [doc, pageNumber, scale, item.taskId])
 
   useEffect(() => {
+    // Arrow keys belong to output nav (OutputsView); page nav uses buttons.
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose()
-      else if (e.key === 'ArrowLeft') setPageNumber((p) => Math.max(1, p - 1))
-      else if (e.key === 'ArrowRight')
-        setPageNumber((p) => Math.min(doc?.numPages ?? p, p + 1))
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [doc, onClose])
+  }, [onClose])
 
   const zoomIn = useCallback(
     () => setScale((s) => Math.min(MAX_SCALE, s * 1.25)),
@@ -116,105 +168,152 @@ export default function PdfViewer({ item, adapter, onClose }: ViewerProps) {
   )
   const totalPages = doc?.numPages ?? 0
 
-  // `text-foreground` flips with the theme; on a dark overlay the outline
-  // Button leaves icons invisible, so use a transparent ghost button with
-  // explicit white styling for header controls.
-  const headerBtn =
-    'inline-flex h-8 w-8 items-center justify-center rounded-md text-white/90 transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-30'
-
+  const dialogRef = useDialogFocus<HTMLDivElement>()
   return (
     <div
+      ref={dialogRef}
       role="dialog"
       aria-modal="true"
-      className="fixed inset-0 z-50 flex flex-col bg-black/85"
-      onClick={onClose}
+      data-output-viewer
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex flex-col bg-black/85 outline-none"
+      onClick={(e) => {
+        // Close on direct backdrop clicks; children stop propagation.
+        if (e.target === e.currentTarget) onClose()
+      }}
     >
-      <div
-        role="presentation"
-        className="flex h-full w-full flex-col"
+      <header
+        className="relative flex items-center gap-4 border-b border-white/10 px-4 py-2 text-white"
         onClick={(e) => e.stopPropagation()}
       >
-        <header className="flex items-center gap-4 border-b border-white/10 px-4 py-2 text-white">
-          <span className="truncate font-mono text-sm text-white/80">
-            {item.originalBlock}
+        <span className="truncate font-mono text-sm text-white/80">
+          {outputTitle(item)}
+        </span>
+        {navIndex && (
+          <div className="pointer-events-none absolute left-1/2 flex -translate-x-1/2 items-center gap-1">
+            <button
+              type="button"
+              aria-label={t('outputs.viewer.previousOutput')}
+              className={cn(
+                viewerHeaderBtn,
+                'pointer-events-auto w-auto gap-1 px-1.5',
+              )}
+              onClick={onPrev}
+              disabled={!onPrev}
+            >
+              <SkipBack className="h-4 w-4" />
+              <kbd className={kbdBadge}>←</kbd>
+            </button>
+            <span className="min-w-10 text-center font-mono text-sm tabular-nums">
+              {navIndex.current} / {navIndex.total}
+            </span>
+            <button
+              type="button"
+              aria-label={t('outputs.viewer.nextOutput')}
+              className={cn(
+                viewerHeaderBtn,
+                'pointer-events-auto w-auto gap-1 px-1.5',
+              )}
+              onClick={onNext}
+              disabled={!onNext}
+            >
+              <kbd className={kbdBadge}>→</kbd>
+              <SkipForward className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            type="button"
+            aria-label={t('outputs.viewer.previousPage')}
+            className={viewerHeaderBtn}
+            onClick={() => setPageNumber((p) => Math.max(1, p - 1))}
+            disabled={pageNumber <= 1}
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <span className="min-w-12 text-center font-mono text-sm tabular-nums">
+            {t('outputs.viewer.pageOfTotal', {
+              page: pageNumber,
+              total: totalPages || '?',
+            })}
           </span>
-          <div className="ml-auto flex items-center gap-1">
-            <button
-              type="button"
-              aria-label="Previous page"
-              className={headerBtn}
-              onClick={() => setPageNumber((p) => Math.max(1, p - 1))}
-              disabled={pageNumber <= 1}
-            >
-              <ChevronLeft className="h-4 w-4" />
-            </button>
-            <span className="min-w-12 text-center font-mono text-xs tabular-nums">
-              {t('outputs.viewer.pageOfTotal', {
-                page: pageNumber,
-                total: totalPages || '?',
-              })}
-            </span>
-            <button
-              type="button"
-              aria-label="Next page"
-              className={headerBtn}
-              onClick={() =>
-                setPageNumber((p) => Math.min(totalPages || p, p + 1))
-              }
-              disabled={pageNumber >= totalPages}
-            >
-              <ChevronRight className="h-4 w-4" />
-            </button>
-          </div>
-          <div className="h-5 w-px bg-white/15" />
-          <div className="flex items-center gap-1">
-            <button
-              type="button"
-              aria-label="Zoom out"
-              className={headerBtn}
-              onClick={zoomOut}
-            >
-              <ZoomOut className="h-4 w-4" />
-            </button>
-            <span className="min-w-12 text-center font-mono text-xs tabular-nums">
-              {Math.round(scale * 100)}%
-            </span>
-            <button
-              type="button"
-              aria-label="Zoom in"
-              className={headerBtn}
-              onClick={zoomIn}
-            >
-              <ZoomIn className="h-4 w-4" />
-            </button>
-          </div>
-          <div className="h-5 w-px bg-white/15" />
           <button
             type="button"
-            aria-label={downloadAction.label(t)}
-            className={headerBtn}
+            aria-label={t('outputs.viewer.nextPage')}
+            className={viewerHeaderBtn}
             onClick={() =>
-              void downloadAction.run(item, { resolvedAdapter: adapter })
+              setPageNumber((p) => Math.min(totalPages || p, p + 1))
             }
+            disabled={pageNumber >= totalPages}
           >
-            <Download className="h-4 w-4" />
+            <ChevronRight className="h-4 w-4" />
           </button>
+        </div>
+        <div className="h-5 w-px bg-white/15" />
+        <div className="flex items-center gap-1">
           <button
             type="button"
-            aria-label="Close"
-            className={headerBtn}
-            onClick={onClose}
+            aria-label={t('outputs.viewer.zoomOut')}
+            className={viewerHeaderBtn}
+            onClick={zoomOut}
           >
-            <X className="h-4 w-4" />
+            <ZoomOut className="h-4 w-4" />
           </button>
-        </header>
+          <span className="min-w-12 text-center font-mono text-sm tabular-nums">
+            {Math.round(scale * 100)}%
+          </span>
+          <button
+            type="button"
+            aria-label={t('outputs.viewer.zoomIn')}
+            className={viewerHeaderBtn}
+            onClick={zoomIn}
+          >
+            <ZoomIn className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="h-5 w-px bg-white/15" />
+        <button
+          type="button"
+          aria-label={downloadAction.label(t)}
+          className={viewerHeaderBtn}
+          onClick={() =>
+            void downloadAction.run(item, { resolvedAdapter: adapter })
+          }
+        >
+          <Download className="h-4 w-4" />
+        </button>
+        <button
+          type="button"
+          aria-label={t('outputs.viewer.close')}
+          className={viewerHeaderBtn}
+          onClick={onClose}
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </header>
 
-        <div className="flex-1 overflow-auto p-6">
-          <div className="flex justify-center">
-            <canvas ref={canvasRef} className="bg-white shadow-lg" />
-          </div>
+      <div
+        className="flex-1 overflow-auto p-6"
+        onClick={(e) => {
+          if (e.target === e.currentTarget) onClose()
+        }}
+      >
+        <div
+          className="flex justify-center"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) onClose()
+          }}
+        >
+          <canvas
+            ref={canvasRef}
+            className="bg-white shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          />
         </div>
       </div>
+
+      {footer}
     </div>
   )
 }

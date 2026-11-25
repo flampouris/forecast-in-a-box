@@ -23,12 +23,14 @@
  */
 
 import { HttpResponse, delay, http } from 'msw'
+import { broadcastClientNotification } from './notification.handlers'
 import type {
   CompositeArtifactId,
   MlModelDetail,
   MlModelOverview,
   QubeNode,
 } from '@/api/types/artifacts.types'
+import type { ClientNotification } from '@/api/types/notification.types'
 import { API_ENDPOINTS } from '@/api/endpoints'
 
 /**
@@ -210,18 +212,27 @@ const mockModels: Array<MlModelDetail> = [
   {
     composite_id: {
       artifact_store_id: 'ecmwf',
-      ml_model_checkpoint_id: 'aifs-single-v0.2.1',
+      artifact_local_id: 'aifs-single-v0.2.1',
     },
     display_name: 'AIFS Single',
     display_author: 'ECMWF',
     disk_size_bytes: 2_147_483_648,
     supported_platforms: ['cpu', 'cuda'],
+    // `status` is the catalogue's maturity key
+    tags: { status: 'demo', resolution: 'o96', deterministic: null },
     is_available: true,
+    is_locally_compatible: true,
+    local_compatibility_detail: null,
     display_description:
       'ECMWF Artificial Intelligence Forecasting System (AIFS) single model for medium-range weather prediction.',
     url: 'https://www.ecmwf.int/en/forecasts/documentation-and-support',
     pip_package_constraints: ['torch>=2.0.0', 'numpy>=1.24.0'],
-    output_characteristics: buildAifsQube({
+    input_qube: buildAifsQube({
+      pressureParams: STANDARD_PRESSURE_PARAMS,
+      pressureLevels: STANDARD_PRESSURE_LEVELS,
+      surfaceParams: STANDARD_SURFACE_PARAMS,
+    }),
+    output_qube: buildAifsQube({
       pressureParams: STANDARD_PRESSURE_PARAMS,
       pressureLevels: STANDARD_PRESSURE_LEVELS,
       surfaceParams: STANDARD_SURFACE_PARAMS,
@@ -232,18 +243,27 @@ const mockModels: Array<MlModelDetail> = [
       'base_time',
       'anemoi_kwargs',
     ],
-    timestep: '6h',
   },
   {
     composite_id: {
       artifact_store_id: 'ecmwf',
-      ml_model_checkpoint_id: 'aifs-single-mse-1.1_w_sdpa',
+      artifact_local_id: 'aifs-single-mse-1.1_w_sdpa',
     },
     display_name: 'AIFS Single MSE 1.1',
     display_author: 'ECMWF',
     disk_size_bytes: 993_937_386,
     supported_platforms: ['linux', 'macos'],
+    // exercises the "+N" overflow and long-detail tooltip paths
+    tags: {
+      resolution: 'n320',
+      experimental: null,
+      attention: 'scaled dot-product attention (sdpa) variant',
+      mse: null,
+    },
     is_available: false,
+    is_locally_compatible: false,
+    local_compatibility_detail:
+      'Required CUDA driver version >= 12.0 not found.',
     display_description:
       'ECMWF AIFS single MSE 1.1 model with scaled-dot-product attention for medium-range weather forecasting.',
     url: 'https://sites.ecmwf.int/repository/fiab/aifs/aifs-single-mse-1.1_sdpa.ckpt',
@@ -252,7 +272,12 @@ const mockModels: Array<MlModelDetail> = [
       'torch>=2.6.0',
       'torch_geometric==2.4.0',
     ],
-    output_characteristics: buildAifsQube({
+    input_qube: buildAifsQube({
+      pressureParams: STANDARD_PRESSURE_PARAMS,
+      pressureLevels: STANDARD_PRESSURE_LEVELS,
+      surfaceParams: EXTENDED_SURFACE_PARAMS,
+    }),
+    output_qube: buildAifsQube({
       pressureParams: STANDARD_PRESSURE_PARAMS,
       pressureLevels: STANDARD_PRESSURE_LEVELS,
       surfaceParams: EXTENDED_SURFACE_PARAMS,
@@ -263,18 +288,20 @@ const mockModels: Array<MlModelDetail> = [
       'base_time',
       'anemoi_kwargs',
     ],
-    timestep: '6h',
   },
   {
     composite_id: {
       artifact_store_id: 'ecmwf',
-      ml_model_checkpoint_id: 'aifs-ens-crps-1.0_w_sdpa',
+      artifact_local_id: 'aifs-ens-crps-1.0_w_sdpa',
     },
     display_name: 'AIFS ENS CRPS 1.0',
     display_author: 'ECMWF',
     disk_size_bytes: 921_584_533,
     supported_platforms: ['linux', 'macos'],
+    tags: { status: 'operational', resolution: 'n320', ensemble: null },
     is_available: true,
+    is_locally_compatible: true,
+    local_compatibility_detail: null,
     display_description:
       'ECMWF AIFS ensemble CRPS-trained model with scaled-dot-product attention for probabilistic forecasts.',
     url: 'https://sites.ecmwf.int/repository/fiab/aifs/aifs-ens-crps-1.0_sdpa.ckpt',
@@ -282,17 +309,19 @@ const mockModels: Array<MlModelDetail> = [
       'anemoi-models==0.6.0',
       'torch>=2.6.0',
       'torch_geometric==2.4.0',
+      // wheel-URL constraint as in the real catalog — exercises truncation + copy
+      'https://github.com/cathalobrien/get-flash-attn/releases/download/v0.1-alpha/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl',
     ],
-    // Legacy list[str] shape — exercises the back-compat render path until
-    // the backend update propagates everywhere.
-    output_characteristics: [
-      '2t',
-      '10u',
-      '10v',
-      'msl',
-      'tp',
-      't @ 1000/850/700/500/250 hPa',
-    ],
+    input_qube: buildAifsQube({
+      pressureParams: STANDARD_PRESSURE_PARAMS,
+      pressureLevels: STANDARD_PRESSURE_LEVELS,
+      surfaceParams: EXTENDED_SURFACE_PARAMS,
+    }),
+    output_qube: buildAifsQube({
+      pressureParams: STANDARD_PRESSURE_PARAMS,
+      pressureLevels: STANDARD_PRESSURE_LEVELS,
+      surfaceParams: EXTENDED_SURFACE_PARAMS,
+    }),
     input_characteristics: [
       'input_source',
       'lead_time',
@@ -300,24 +329,28 @@ const mockModels: Array<MlModelDetail> = [
       'ensemble_number',
       'anemoi_kwargs',
     ],
-    timestep: '6h',
   },
   {
     composite_id: {
       artifact_store_id: 'ecmwf',
-      ml_model_checkpoint_id: 'aifs-ens-v0.3.0',
+      artifact_local_id: 'aifs-ens-v0.3.0',
     },
     display_name: 'AIFS ENS',
     display_author: 'ECMWF',
     disk_size_bytes: 3_221_225_472,
     supported_platforms: ['cuda'],
+    // empty tags: chips render nothing
+    tags: {},
     is_available: false,
+    is_locally_compatible: false,
+    local_compatibility_detail: 'No compatible GPU detected on this host.',
     display_description:
       'ECMWF AIFS large ensemble model for operational probabilistic weather forecasting at scale.',
     url: 'https://www.ecmwf.int/en/forecasts/documentation-and-support',
     pip_package_constraints: ['torch>=2.0.0', 'numpy>=1.24.0'],
     // Non-AIFS-shaped qube — exercises the generic compressed-tree dispatch.
-    output_characteristics: buildGenericQube(),
+    input_qube: buildGenericQube(),
+    output_qube: buildGenericQube(),
     input_characteristics: [
       'input_source',
       'lead_time',
@@ -329,19 +362,19 @@ const mockModels: Array<MlModelDetail> = [
 ]
 
 function artifactKey(id: CompositeArtifactId): string {
-  return `${id.artifact_store_id}::${id.ml_model_checkpoint_id}`
+  return `${id.artifact_store_id}::${id.artifact_local_id}`
 }
 
 /** Mimic Python's str(CompositeArtifactId(...)) repr format used by the backend */
 function compositeIdStr(id: CompositeArtifactId): string {
-  return `CompositeArtifactId(artifact_store_id='${id.artifact_store_id}', ml_model_checkpoint_id='${id.ml_model_checkpoint_id}')`
+  return `CompositeArtifactId(artifact_store_id='${id.artifact_store_id}', artifact_local_id='${id.artifact_local_id}')`
 }
 
 function findModel(id: CompositeArtifactId) {
   return mockModels.find(
     (m) =>
       m.composite_id.artifact_store_id === id.artifact_store_id &&
-      m.composite_id.ml_model_checkpoint_id === id.ml_model_checkpoint_id,
+      m.composite_id.artifact_local_id === id.artifact_local_id,
   )
 }
 
@@ -351,6 +384,19 @@ function findModel(id: CompositeArtifactId) {
  * mimicking the real backend's chunked-download polling behaviour.
  */
 const ongoingDownloads = new Map<string, number>()
+
+/** Failed downloads; cleared by a `retry=true` request. */
+const failedDownloads = new Map<string, string>()
+
+const pendingFailures = new Map<string, string>()
+
+/** Fail the next poll of a running download (tests only). */
+export function failNextDownloadPoll(
+  id: CompositeArtifactId,
+  reason: string,
+): void {
+  pendingFailures.set(artifactKey(id), reason)
+}
 
 /** Advance progress by 20-40% per poll, capped at 100. */
 function advanceProgress(key: string): number {
@@ -373,6 +419,26 @@ function advanceProgress(key: string): number {
  */
 export function resetArtifactsHandlerState(): void {
   ongoingDownloads.clear()
+  failedDownloads.clear()
+  pendingFailures.clear()
+}
+
+/** Mirror of the backend's ArtifactDownloadFinishedEvent.as_client_notification. */
+function downloadFinishedNotification(
+  id: CompositeArtifactId,
+): ClientNotification {
+  return {
+    text: `Artifact ${id.artifact_local_id} finished downloading successfully`,
+    sourceDomainName: 'artifact',
+    sourceDomainEvent: 'artifactDownloadFinished',
+    context: {
+      artifact_store_id: id.artifact_store_id,
+      artifact_local_id: id.artifact_local_id,
+      success: true,
+    },
+    detailRoute: 'api/v1/artifacts/model_details',
+    refreshRoutes: ['api/v1/artifacts/list_models'],
+  }
 }
 
 export const artifactsHandlers = [
@@ -385,9 +451,9 @@ export const artifactsHandlers = [
         display_description,
         url,
         pip_package_constraints,
-        output_characteristics,
+        input_qube,
+        output_qube,
         input_characteristics,
-        timestep,
         ...overview
       }) => overview,
     )
@@ -436,6 +502,21 @@ export const artifactsHandlers = [
     }
 
     const key = artifactKey(body)
+    const retry = new URL(request.url).searchParams.get('retry') === 'true'
+    const failure = failedDownloads.get(key)
+    if (failure !== undefined) {
+      if (!retry) {
+        return HttpResponse.json({ detail: failure }, { status: 400 })
+      }
+      failedDownloads.delete(key)
+    }
+    const pending = pendingFailures.get(key)
+    if (pending !== undefined && ongoingDownloads.has(key)) {
+      pendingFailures.delete(key)
+      ongoingDownloads.delete(key)
+      failedDownloads.set(key, pending)
+      return HttpResponse.json({ detail: pending }, { status: 400 })
+    }
     const isNew = !ongoingDownloads.has(key)
 
     if (isNew) {
@@ -452,6 +533,7 @@ export const artifactsHandlers = [
     const progress = advanceProgress(key)
     if (progress >= 100) {
       model.is_available = true
+      broadcastClientNotification(downloadFinishedNotification(body))
       return HttpResponse.json({
         status: 'available',
         composite_id: compositeIdStr(body),
@@ -461,7 +543,7 @@ export const artifactsHandlers = [
 
     return HttpResponse.json({
       status: 'download in progress',
-      composite_id: body,
+      composite_id: compositeIdStr(body),
       progress,
     })
   }),
@@ -482,7 +564,7 @@ export const artifactsHandlers = [
 
     return HttpResponse.json({
       status: 'deleted',
-      composite_id: body,
+      composite_id: compositeIdStr(body),
     })
   }),
 ]

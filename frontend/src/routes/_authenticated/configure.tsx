@@ -11,13 +11,23 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { z } from 'zod'
 import { FableBuilderPage } from '@/features/fable-builder/components/FableBuilderPage'
+import { builderSessionKey } from '@/features/fable-builder/utils/builder-session-key'
 
 const searchSchema = z.object({
-  preset: z
-    .enum(['quick-start', 'standard', 'custom-model', 'dataset'])
-    .optional(),
   state: z.string().optional(),
   fableId: z.string().optional(),
+  /** Open fableId as a template: fork (create-on-save) and prefill example values */
+  template: z.boolean().optional(),
+  /** Owning plugin ("store:local") for the example-values lookup */
+  templatePlugin: z.string().optional(),
+  /** Template display name for the example-values lookup */
+  templateName: z.string().optional(),
+  /** Explicit blank-canvas intent; a bench holding unsaved work asks first. */
+  fresh: z.boolean().optional(),
+  /** A workflow file was just put on the bench; check it for missing glyphs. */
+  loaded: z.boolean().optional(),
+  /** Plain-link tour launch (help surfaces); stripped on start. */
+  tour: z.enum(['first-run']).optional().catch(undefined),
 })
 
 export type ConfigureSearch = z.infer<typeof searchSchema>
@@ -28,13 +38,27 @@ export const Route = createFileRoute('/_authenticated/configure')({
 })
 
 function ConfigurePage() {
-  const { preset, state, fableId } = Route.useSearch()
+  const {
+    state,
+    fableId,
+    template,
+    templatePlugin,
+    templateName,
+    fresh,
+    loaded,
+    tour,
+  } = Route.useSearch()
   return (
     <FableBuilderPage
-      key={fableId}
+      key={builderSessionKey({ fableId, template })}
       fableId={fableId}
-      preset={preset}
       encodedState={state}
+      templateMode={template}
+      templatePlugin={templatePlugin}
+      templateName={templateName}
+      fresh={fresh}
+      loaded={loaded}
+      tour={tour}
     />
   )
 }

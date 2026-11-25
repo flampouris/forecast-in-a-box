@@ -22,6 +22,7 @@ import type {
   ScheduleRunsResponse,
   ScheduleUpdate,
 } from '@/api/types/schedule.types'
+import { shareRunList } from '@/api/hooks/run-status-sharing'
 import {
   createSchedule,
   deleteSchedule,
@@ -35,6 +36,8 @@ import {
 import { ApiClientError } from '@/api/client'
 import { QUERY_CONSTANTS } from '@/utils/constants'
 import { upsertFable } from '@/api/endpoints/fable'
+import { useAppTimeZone } from '@/lib/datetime'
+import { withOneoffTag } from '@/lib/system-tags'
 
 export const scheduleKeys = {
   all: ['schedules'] as const,
@@ -92,6 +95,7 @@ export function useScheduleRuns(
     queryFn: () => getScheduleRuns(experimentId!, page, pageSize, status),
     enabled: !!experimentId,
     refetchInterval: 30000,
+    structuralSharing: shareRunList,
   })
 }
 
@@ -149,25 +153,24 @@ export function useDeleteSchedule() {
 }
 
 /**
- * Fetches the scheduler's current time and computes the offset from the client clock.
+ * Parse a datetime string from the backend.
  *
- * The offset lets us translate naive datetime strings returned by the server
- * (which are in the server's local timezone) into correct client-local Dates.
- *
- * Formula: correctEpoch = new Date(serverTimeStr).getTime() - offsetMs
- */
-/**
- * Parse a naive datetime string from the backend.
- *
- * The backend's current_scheduling_time() uses datetime.now() which returns
- * a naive datetime in the server's local timezone (no timezone suffix).
- * We parse it consistently with new Date() — the offset calculation and
- * conversion both use the same parsing, so any timezone difference cancels out.
+ * The backend returns UTC datetimes with an explicit "+00:00" offset
+ * (e.g. "2024-01-15T10:30:45+00:00"). We parse consistently with new Date()
+ * so the offset calculation and conversion use the same parsing.
  */
 function parseServerTime(dateStr: string): number {
   return new Date(dateStr.trim()).getTime()
 }
 
+/**
+ * Fetches the scheduler's current time and computes the offset from the client clock.
+ *
+ * The offset lets us translate UTC datetime strings returned by the server
+ * into correct client-local Dates.
+ *
+ * Formula: correctEpoch = new Date(serverTimeStr).getTime() - offsetMs
+ */
 export function useServerTime() {
   const { data: offsetMs } = useQuery<number>({
     queryKey: scheduleKeys.serverTime,
@@ -184,6 +187,8 @@ export function useServerTime() {
     refetchOnWindowFocus: false,
   })
 
+  const timeZone = useAppTimeZone()
+
   const serverTimeToLocal = useCallback(
     (serverTimeStr: string, { roundMinute = false } = {}): Date => {
       const parsed = parseServerTime(serverTimeStr)
@@ -196,24 +201,11 @@ export function useServerTime() {
     [offsetMs],
   )
 
-  const serverHourMinuteToLocal = useCallback(
-    (hour: number, minute: number): { hour: number; minute: number } => {
-      if (offsetMs == null) return { hour, minute }
-      // Build a reference date with the given server hour/minute
-      const ref = new Date()
-      ref.setHours(hour, minute, 0, 0)
-      // ref is now interpreted as client-local; adjust by offset to get true local time
-      const local = new Date(ref.getTime() - offsetMs)
-      return { hour: local.getHours(), minute: local.getMinutes() }
-    },
-    [offsetMs],
-  )
-
   return {
     offsetMs: offsetMs ?? null,
     isLoaded: offsetMs != null,
     serverTimeToLocal,
-    serverHourMinuteToLocal,
+    timeZone,
   }
 }
 
@@ -245,7 +237,9 @@ export function useCreateSchedule() {
         builder: fable,
         display_name: name,
         display_description: description,
-        tags,
+        // The blueprint backs an execution, not a preset — mark it out of the
+        // presets list. The schedule entity itself keeps plain tags (below).
+        tags: withOneoffTag(tags),
         parent_id: fableId ?? undefined,
       })
 

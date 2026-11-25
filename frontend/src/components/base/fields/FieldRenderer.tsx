@@ -9,8 +9,12 @@
  */
 
 import { useMemo } from 'react'
+import { ArtifactField } from './fields/ArtifactField'
 import { DateTimeField } from './fields/DateTimeField'
 import { EnumField } from './fields/EnumField'
+import { EnumListField } from './fields/EnumListField'
+import { GeoDomainField } from './fields/GeoDomainField'
+import { GridField } from './fields/GridField'
 import { ListField } from './fields/ListField'
 import { NumberField } from './fields/NumberField'
 import { StringField } from './fields/StringField'
@@ -67,10 +71,36 @@ export function FieldRenderer({
           {label}
         </Label>
       )}
-      {description && (
-        <p className="text-sm text-muted-foreground">{description}</p>
-      )}
+      {description && <FieldDescription text={description} />}
       {inputElement}
+    </div>
+  )
+}
+
+/** Plain text; consecutive `- ` lines render as a bullet list. */
+function FieldDescription({ text }: { text: string }) {
+  const blocks: Array<string | Array<string>> = []
+  for (const line of text.split('\n')) {
+    const item = /^\s*- (.*)$/.exec(line)?.[1]
+    const last = blocks.at(-1)
+    if (item === undefined) {
+      if (line.trim()) blocks.push(line)
+    } else if (Array.isArray(last)) last.push(item)
+    else blocks.push([item])
+  }
+  return (
+    <div className="space-y-0.5 text-sm text-muted-foreground">
+      {blocks.map((block, i) =>
+        Array.isArray(block) ? (
+          <ul key={i} className="list-disc space-y-0.5 pl-4">
+            {block.map((item, j) => (
+              <li key={j}>{item}</li>
+            ))}
+          </ul>
+        ) : (
+          <p key={i}>{block}</p>
+        ),
+      )}
     </div>
   )
 }
@@ -164,6 +194,7 @@ function renderField(
           value={value}
           onChange={onChange}
           options={parsedType.options}
+          lookup={parsedType.lookup}
           placeholder={placeholder}
           disabled={disabled}
           className={className}
@@ -181,45 +212,66 @@ function renderField(
           disabled={disabled}
           className={className}
           itemType={parsedType.itemType}
+          lookup={'lookup' in parsedType ? parsedType.lookup : undefined}
+        />
+      )
+
+    case 'enumList':
+      return (
+        <EnumListField
+          id={id}
+          configKey={configKey}
+          value={value}
+          onChange={onChange}
+          options={parsedType.options}
+          closed={parsedType.closed}
+          lookup={parsedType.lookup}
+          placeholder={placeholder}
+          disabled={disabled}
+          className={className}
+        />
+      )
+
+    case 'geodomain':
+      return (
+        <GeoDomainField
+          id={id}
+          configKey={configKey}
+          value={value}
+          onChange={onChange}
+          placeholder={placeholder}
+          disabled={disabled}
+          className={className}
+        />
+      )
+
+    case 'grid':
+      return (
+        <GridField
+          id={id}
+          configKey={configKey}
+          value={value}
+          onChange={onChange}
+          options={parsedType.options}
+          closed={parsedType.closed}
+          placeholder={placeholder}
+          disabled={disabled}
+          className={className}
+        />
+      )
+
+    case 'artifact':
+      return (
+        <ArtifactField
+          id={id}
+          configKey={configKey}
+          value={value}
+          onChange={onChange}
+          options={parsedType.options}
+          placeholder={placeholder}
+          disabled={disabled}
+          className={className}
         />
       )
   }
-}
-
-/**
- * Lightweight version without label/description for inline use
- */
-export interface InlineFieldRendererProps {
-  id: string
-  configKey: string
-  valueType: string | undefined
-  value: string
-  onChange: (value: string) => void
-  placeholder?: string
-  disabled?: boolean
-  className?: string
-}
-
-export function InlineFieldRenderer({
-  id,
-  configKey,
-  valueType,
-  value,
-  onChange,
-  placeholder,
-  disabled,
-  className,
-}: InlineFieldRendererProps) {
-  const parsedType = useMemo(() => parseValueType(valueType), [valueType])
-
-  return renderField(
-    parsedType,
-    id,
-    configKey,
-    value,
-    onChange,
-    placeholder,
-    disabled,
-    className,
-  )
 }

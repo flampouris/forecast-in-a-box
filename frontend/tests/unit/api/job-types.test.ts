@@ -1,0 +1,135 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+import { describe, expect, it } from 'vitest'
+import {
+  JobExecutionDetailSchema,
+  isTerminalStatus,
+} from '@/api/types/job.types'
+
+const baseDetail = {
+  run_id: 'run-1',
+  attempt_count: 1,
+  status: 'running' as const,
+  created_at: '2026-05-15T10:00:00',
+  updated_at: '2026-05-15T10:05:00',
+  blueprint_id: 'def-1',
+  blueprint_version: 1,
+  error: null,
+  progress: '42',
+  cascade_job_id: 'cascade-1',
+  outputs: null,
+}
+
+describe('JobExecutionDetailSchema', () => {
+  it('parses a minimal payload without the optional block-id arrays', () => {
+    const result = JobExecutionDetailSchema.parse(baseDetail)
+    expect(result.completed_block_ids).toBeUndefined()
+    expect(result.planned_block_ids).toBeUndefined()
+    expect(result.lost_task_ids).toEqual({})
+  })
+
+  it('parses lost task reasons from completed runs', () => {
+    const result = JobExecutionDetailSchema.parse({
+      ...baseDetail,
+      status: 'completed',
+      lost_task_ids: { 'task-image': 'Gateway Proc changed' },
+    })
+    expect(result.lost_task_ids).toEqual({
+      'task-image': 'Gateway Proc changed',
+    })
+  })
+
+  it('parses populated block-id arrays from /run/get during a running job', () => {
+    const result = JobExecutionDetailSchema.parse({
+      ...baseDetail,
+      completed_block_ids: ['block_source_1'],
+      planned_block_ids: ['block_source_1', 'block_product_1', 'block_sink_1'],
+    })
+    expect(result.completed_block_ids).toEqual(['block_source_1'])
+    expect(result.planned_block_ids).toEqual([
+      'block_source_1',
+      'block_product_1',
+      'block_sink_1',
+    ])
+  })
+
+  it('accepts null for both fields once the backend memcache is popped', () => {
+    const result = JobExecutionDetailSchema.parse({
+      ...baseDetail,
+      status: 'completed',
+      completed_block_ids: null,
+      planned_block_ids: null,
+    })
+    expect(result.completed_block_ids).toBeNull()
+    expect(result.planned_block_ids).toBeNull()
+  })
+
+  it('parses the per-block resolution map recorded since ecmwf#640', () => {
+    const result = JobExecutionDetailSchema.parse({
+      ...baseDetail,
+      status: 'completed',
+      resolution: { block_source_1: { base_time: '2026-05-15T00:00:00' } },
+    })
+    expect(result.resolution).toEqual({
+      block_source_1: { base_time: '2026-05-15T00:00:00' },
+    })
+  })
+
+  it('accepts a null as-run value for an explicitly null option (ecmwf#691)', () => {
+    const result = JobExecutionDetailSchema.parse({
+      ...baseDetail,
+      status: 'completed',
+      resolution: { block_source_1: { text: null } },
+    })
+    expect(result.resolution).toEqual({ block_source_1: { text: null } })
+  })
+
+  it('accepts absent and null resolution (pre-#640 backends and old runs)', () => {
+    expect(
+      JobExecutionDetailSchema.parse(baseDetail).resolution,
+    ).toBeUndefined()
+    expect(
+      JobExecutionDetailSchema.parse({ ...baseDetail, resolution: null })
+        .resolution,
+    ).toBeNull()
+  })
+
+  it('rejects non-array values in the block-id fields', () => {
+    expect(() =>
+      JobExecutionDetailSchema.parse({
+        ...baseDetail,
+        completed_block_ids: 'not-an-array',
+      }),
+    ).toThrow()
+  })
+})
+
+describe('run status (ecmwf#770)', () => {
+  it('accepts stopping and stopped', () => {
+    for (const status of ['stopping', 'stopped']) {
+      expect(
+        JobExecutionDetailSchema.parse({ ...baseDetail, status }).status,
+      ).toBe(status)
+    }
+  })
+
+  it('reads a status it does not know as unknown instead of failing', () => {
+    expect(
+      JobExecutionDetailSchema.parse({ ...baseDetail, status: 'paused' })
+        .status,
+    ).toBe('unknown')
+  })
+
+  it('treats stopped as finished and stopping as still active', () => {
+    expect(isTerminalStatus('stopped')).toBe(true)
+    expect(isTerminalStatus('stopping')).toBe(false)
+  })
+})

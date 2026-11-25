@@ -1,0 +1,134 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/** The shared Forecast Journal card: header slot, run rows (flat or grouped), footer slot. */
+
+import { useTranslation } from 'react-i18next'
+import type { ReactNode } from 'react'
+import type { ForecastRunViewModel } from '@/features/journal/types'
+import type { GroupBy } from '@/features/journal/grouping/group-runs'
+import type { FacetToken } from '@/features/journal/facets/facet-types'
+import { useServerTime } from '@/api/hooks/useSchedules'
+import { groupRuns } from '@/features/journal/grouping/group-runs'
+import { ForecastRunRow } from '@/features/journal/components/ForecastRunRow'
+import { JournalGroup } from '@/features/journal/components/JournalGroup'
+import { LoadingSpinner } from '@/components/common/LoadingSpinner'
+import { Card } from '@/components/ui/card'
+import { P } from '@/components/base/typography'
+
+interface ForecastRunListProps {
+  runs: Array<ForecastRunViewModel>
+  isLoading?: boolean
+  emptyText?: string
+  /** Next step offered under the empty text. */
+  emptyAction?: ReactNode
+  groupBy?: GroupBy
+  onToggleBookmark: (runId: string) => void
+  onAddFacet?: (token: FacetToken) => void
+  header?: ReactNode
+  footer?: ReactNode
+  /** Multi-select mode: rows show a checkbox; only completed runs select. */
+  selectedIds?: ReadonlySet<string>
+  selectionCap?: number
+  onToggleSelect?: (runId: string) => void
+}
+
+export function ForecastRunList({
+  runs,
+  isLoading,
+  emptyText,
+  emptyAction,
+  groupBy = 'none',
+  onToggleBookmark,
+  onAddFacet,
+  header,
+  footer,
+  selectedIds,
+  selectionCap,
+  onToggleSelect,
+}: ForecastRunListProps) {
+  const { t } = useTranslation('journal')
+  const { serverTimeToLocal } = useServerTime()
+
+  function rows(items: Array<ForecastRunViewModel>): ReactNode {
+    return items.map((run) => (
+      <ForecastRunRow
+        key={run.runId}
+        run={run}
+        onToggleBookmark={onToggleBookmark}
+        onAddFacet={onAddFacet}
+        onToggleSelect={onToggleSelect}
+        selected={selectedIds?.has(run.runId)}
+        selectDisabled={
+          onToggleSelect !== undefined &&
+          (run.status !== 'completed' ||
+            run.hasComparableOutput === false ||
+            (selectionCap !== undefined &&
+              selectedIds !== undefined &&
+              selectedIds.size >= selectionCap &&
+              !selectedIds.has(run.runId)))
+        }
+      />
+    ))
+  }
+
+  let body: ReactNode
+  if (isLoading) {
+    body = (
+      <div className="flex justify-center p-12">
+        <LoadingSpinner />
+      </div>
+    )
+  } else if (runs.length === 0) {
+    body = (
+      <div className="flex flex-col items-center gap-4 p-12 text-center text-muted-foreground">
+        <P>{emptyText ?? t('empty')}</P>
+        {emptyAction}
+      </div>
+    )
+  } else if (groupBy === 'none') {
+    body = <div className="divide-y divide-border">{rows(runs)}</div>
+  } else {
+    body = groupRuns(runs, groupBy, undefined, serverTimeToLocal).map(
+      (group) => {
+        let label: string
+        if (groupBy === 'date') {
+          label =
+            group.id === 'today'
+              ? t('dateGroup.today')
+              : group.id === 'yesterday'
+                ? t('dateGroup.yesterday')
+                : group.id === 'week'
+                  ? t('dateGroup.week')
+                  : t('dateGroup.older')
+        } else if (group.id === '__untagged__') {
+          label = t('group.untagged')
+        } else if (group.id === '__unscheduled__') {
+          label = t('group.unscheduled')
+        } else {
+          label = group.id
+        }
+        return (
+          <JournalGroup key={group.id} label={label} count={group.runs.length}>
+            {rows(group.runs)}
+          </JournalGroup>
+        )
+      },
+    )
+  }
+
+  return (
+    <Card className="overflow-hidden">
+      {header}
+      {body}
+      {footer}
+    </Card>
+  )
+}

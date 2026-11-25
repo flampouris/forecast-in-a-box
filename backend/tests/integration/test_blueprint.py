@@ -18,31 +18,45 @@ possibly subject of changes, and their failure may be a legitimate behavioral
 change (such as change of return error code).
 """
 
+# TODO this file has grown too huge, we should start splitting it. In particular,
+# lot of things tests just the expand endpoint -- which however can be tested as
+# a unit test because there is no real side effects. We would just need to fake
+# the global glyph database
+
 import io
 import os
 import pathlib
 import sys
 import zipfile
 from datetime import datetime as _dt
-from typing import Any, get_args
+from typing import Any, cast, get_args
 
 import cloudpickle
 import httpx
 import pytest
-from fiab_core.fable import BlockFactoryId, BlockInstance, BlockInstanceId, PluginBlockFactoryId, PluginCompositeId
+from fiab_core.fable import BlockFactoryId, BlockInstance, BlockInstanceId, ConfigurationOptionId, PluginCompositeId
 
 from forecastbox.domain.blueprint.cascade import EnvironmentSpecification
-from forecastbox.domain.blueprint.service import BlueprintBuilder, BlueprintSaveCommand
+from forecastbox.domain.blueprint.service import CORE_VERSION_MISMATCH_TAG_KEY, BlueprintBuilder, BlueprintSaveCommand, RoutableBlock, Tag
 from forecastbox.domain.glyphs.intrinsic import AvailableIntrinsicGlyphs
-from forecastbox.routes.run import RunCreateResponse
+from forecastbox.routes.run import CompilationDetailResponse, RunCreateResponse
 
 from .conftest import fake_artifact_store_id, test_blueprint_artifact_id, testPluginId
-from .utils import compare_with_tolerance, retry_until
+from .utils import compare_with_tolerance, connect_notification_websocket, retry_until, wait_next_notification
 
 
-def ensure_completed_v2(backend_client: httpx.Client, job_id: str, sleep: float = 0.5, attempts: int = 20) -> None:
+def _config(values: dict[str, str]) -> dict[ConfigurationOptionId, str]:
+    return {ConfigurationOptionId(key): value for key, value in values.items()}
+
+
+def ensure_completed_v2(
+    backend_client: httpx.Client, job_id: str, sleep: float = 0.5, attempts: int = 20, attempt_count: int | None = None
+) -> None:
     def do_action() -> Any:
-        response = backend_client.get("/run/get", params={"run_id": job_id}, timeout=10)
+        params = {"run_id": job_id}
+        if attempt_count is not None:
+            params["attempt_count"] = attempt_count
+        response = backend_client.get("/run/get", params=params, timeout=10)
         assert response.is_success, response.text
         return response.json()
 
@@ -56,90 +70,124 @@ def ensure_completed_v2(backend_client: httpx.Client, job_id: str, sleep: float 
 
 
 def _make_builder_source_only() -> BlueprintBuilder:
-    source_42 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_42")),
-        configuration_values={},
-        input_ids={},
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    return BlueprintBuilder(blocks={BlockInstanceId("source_42"): source_42})
+    return BlueprintBuilder(
+        blocks=[
+            source_42,
+        ]
+    )
 
 
 def _make_builder_full(tmpdir: str) -> BlueprintBuilder:
-    source_42 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_42")),
-        configuration_values={},
-        input_ids={},
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    transform_increment = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("transform_increment")),
-        configuration_values={"amount": "1"},
-        input_ids={"a": BlockInstanceId("source_42")},
+    transform_increment = RoutableBlock(
+        instance_id=BlockInstanceId("transform_increment"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "1"}),
+            input_ids={"a": BlockInstanceId("source_42")},
+        ),
     )
-    product_join = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("product_join")),
-        configuration_values={},
-        input_ids={"a": BlockInstanceId("transform_increment"), "b": BlockInstanceId("source_42")},
+    product_join = RoutableBlock(
+        instance_id=BlockInstanceId("product_join"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("product_join"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={"a": BlockInstanceId("transform_increment"), "b": BlockInstanceId("source_42")},
+        ),
     )
-    sink_main = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output${{runId}}.main.txt"},
-        input_ids={"data": BlockInstanceId("product_join")},
+    sink_main = RoutableBlock(
+        instance_id=BlockInstanceId("sink_main"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output${{runId}}.main.txt"}),
+            input_ids={"data": BlockInstanceId("product_join")},
+        ),
     )
-    source_time = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_text")),
-        configuration_values={"text": "${submitDatetime};${startDatetime};${basicExecuteGlobalGlyph};${blueprintExecuteLocalGlyph}"},
-        input_ids={},
+    source_time = RoutableBlock(
+        instance_id=BlockInstanceId("source_time"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_text"),
+        instance=BlockInstance(
+            configuration_values=_config(
+                {"text": "${submitDatetime};${startDatetime};${basicExecuteGlobalGlyph};${blueprintExecuteLocalGlyph}"}
+            ),
+        ),
     )
-    sink_time = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output${{runId}}.time.txt"},
-        input_ids={"data": BlockInstanceId("source_time")},
+    sink_time = RoutableBlock(
+        instance_id=BlockInstanceId("sink_time"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output${{runId}}.time.txt"}),
+            input_ids={"data": BlockInstanceId("source_time")},
+        ),
     )
     return BlueprintBuilder(
-        blocks={
-            BlockInstanceId("source_42"): source_42,
-            BlockInstanceId("transform_increment"): transform_increment,
-            BlockInstanceId("product_join"): product_join,
-            BlockInstanceId("sink_main"): sink_main,
-            BlockInstanceId("source_time"): source_time,
-            BlockInstanceId("sink_time"): sink_time,
-        },
+        blocks=[
+            source_42,
+            transform_increment,
+            product_join,
+            sink_main,
+            source_time,
+            sink_time,
+        ],
         local_glyphs={"blueprintExecuteLocalGlyph": "local_glyph_value"},
     )
 
 
-def test_blueprint_save_and_retrieve(backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_save_and_retrieve(backend_client_user: httpx.Client) -> None:
     builder = _make_builder_source_only()
     builder.environment = EnvironmentSpecification(hosts=2, workers_per_host=4)
     payload = BlueprintSaveCommand(
         builder=builder,
         display_name="Test Blueprint",
         display_description="A blueprint saved via the v2 API",
-        tags=["test", "integration"],
+        tags=[Tag(key="test"), Tag(key="integration")],
     )
 
     # Save new blueprint
-    response = backend_client_with_auth.post("/blueprint/create", json=payload.model_dump())
+    response = backend_client_user.post("/blueprint/create", json=payload.model_dump())
     assert response.is_success, response.text
     saved = response.json()
     assert "blueprint_id" in saved
     assert saved["version"] == 1
 
     # Retrieve by id (latest version)
-    response = backend_client_with_auth.get("/blueprint/get", params={"blueprint_id": saved["blueprint_id"]})
+    response = backend_client_user.get("/blueprint/get", params={"blueprint_id": saved["blueprint_id"]})
     assert response.is_success, response.text
     retrieved = response.json()
     assert retrieved["blueprint_id"] == saved["blueprint_id"]
     assert retrieved["version"] == 1
     assert retrieved["display_name"] == "Test Blueprint"
-    assert retrieved["tags"] == ["test", "integration"]
-    assert retrieved["builder"]["blocks"]["source_42"]["factory_id"]["factory"] == "source_42"
+    assert retrieved["tags"] == [{"key": "test", "value": None}, {"key": "integration", "value": None}]
+    source_42_block = next(b for b in retrieved["builder"]["blocks"] if b["instance_id"] == "source_42")
+    assert source_42_block["factory"] == "source_42"
     assert retrieved["builder"]["environment"]["hosts"] == 2
     assert retrieved["builder"]["environment"]["workers_per_host"] == 4
 
     # Saving again with the same id creates a new version
     payload2 = BlueprintSaveCommand(builder=_make_builder_source_only(), display_name="Test Blueprint v2")
-    response = backend_client_with_auth.post(
+    response = backend_client_user.post(
         "/blueprint/update",
         json={**payload2.model_dump(), "blueprint_id": saved["blueprint_id"], "version": saved["version"]},
     )
@@ -149,7 +197,7 @@ def test_blueprint_save_and_retrieve(backend_client_with_auth: httpx.Client) -> 
     assert saved2["version"] == 2
 
     # Retrieve latest returns version 2
-    response = backend_client_with_auth.get("/blueprint/get", params={"blueprint_id": saved["blueprint_id"]})
+    response = backend_client_user.get("/blueprint/get", params={"blueprint_id": saved["blueprint_id"]})
     assert response.is_success, response.text
     latest = response.json()
     assert latest["version"] == 2
@@ -157,31 +205,277 @@ def test_blueprint_save_and_retrieve(backend_client_with_auth: httpx.Client) -> 
     assert latest["builder"]["environment"] is None
 
     # Retrieve specific version 1 still works
-    response = backend_client_with_auth.get("/blueprint/get", params={"blueprint_id": saved["blueprint_id"], "version": 1})
+    response = backend_client_user.get("/blueprint/get", params={"blueprint_id": saved["blueprint_id"], "version": 1})
     assert response.is_success, response.text
     assert response.json()["version"] == 1
     assert response.json()["display_name"] == "Test Blueprint"
 
+    # Verify source/created_by filters work correctly.
+    me_response = backend_client_user.get("/users/me")
+    assert me_response.is_success, me_response.text
+    my_user_id = me_response.json()["id"]
 
-def test_blueprint_retrieve_nonexistent(backend_client_with_auth: httpx.Client) -> None:
-    response = backend_client_with_auth.get("/blueprint/get", params={"blueprint_id": "does-not-exist"})
+    # Filtering by source=user_defined and correct created_by must include the blueprint.
+    response = backend_client_user.get("/blueprint/list", params={"source": "user_defined", "created_by": my_user_id})
+    assert response.is_success, response.text
+    ids = [b["blueprint_id"] for b in response.json()["blueprints"]]
+    assert saved["blueprint_id"] in ids, f"Expected blueprint to appear when filtered by source=user_defined and created_by={my_user_id!r}"
+
+    # Filtering by a different source must not include it.
+    response = backend_client_user.get("/blueprint/list", params={"source": "plugin_template", "created_by": my_user_id})
+    assert response.is_success, response.text
+    ids = [b["blueprint_id"] for b in response.json()["blueprints"]]
+    assert saved["blueprint_id"] not in ids, "Blueprint should not appear when filtered by source=plugin_template"
+
+    # Filtering by a non-existent created_by must not include it.
+    response = backend_client_user.get("/blueprint/list", params={"source": "user_defined", "created_by": "nonexistent-user-000"})
+    assert response.is_success, response.text
+    ids = [b["blueprint_id"] for b in response.json()["blueprints"]]
+    assert saved["blueprint_id"] not in ids, "Blueprint should not appear when created_by does not match"
+
+
+def test_blueprint_create_combines_reserved_tag_and_local_glyph_errors(backend_client_user: httpx.Client) -> None:
+    """A reserved tag key and a reserved local glyph key are both reported together in a
+    single 422 response -- neither check short-circuits the other."""
+    builder = _make_builder_source_only()
+    builder.local_glyphs = {"runId": "should-not-be-allowed"}
+    payload = BlueprintSaveCommand(
+        builder=builder,
+        display_name="Bad Blueprint",
+        tags=[Tag(key=CORE_VERSION_MISMATCH_TAG_KEY)],
+    )
+    response = backend_client_user.post("/blueprint/create", json=payload.model_dump())
+    assert response.status_code == 422, response.text
+    global_errors = response.json()["detail"]["global_errors"]
+    assert any(CORE_VERSION_MISMATCH_TAG_KEY in err for err in global_errors)
+    assert any("runId" in err for err in global_errors)
+
+
+def test_blueprint_retrieve_nonexistent(backend_client_user: httpx.Client) -> None:
+    response = backend_client_user.get("/blueprint/get", params={"blueprint_id": "does-not-exist"})
     assert response.status_code == 404
 
 
-def test_blueprint_upsert_nonexistent_id(backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_upsert_nonexistent_id(backend_client_user: httpx.Client) -> None:
     """Attempting to add a version to a non-existent id returns 404."""
     builder = _make_builder_source_only()
     payload = BlueprintSaveCommand(builder=builder)
-    response = backend_client_with_auth.post("/blueprint/update", json={**payload.model_dump(), "blueprint_id": "no-such-id", "version": 1})
+    response = backend_client_user.post("/blueprint/update", json={**payload.model_dump(), "blueprint_id": "no-such-id", "version": 1})
     assert response.status_code == 404
 
 
-def test_blueprint_expand(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
-    response = backend_client_with_auth.get("/blueprint/catalogue").raise_for_status()
+def test_plugin_template_in_blueprint_list(backend_client_user: httpx.Client) -> None:
+    """Verify that the testBasic plugin template appears in the blueprint list after startup."""
+    from .conftest import testPluginId
+
+    def do_action() -> dict:
+        response = backend_client_user.get("/status", timeout=10)
+        assert response.is_success
+        return response.json()
+
+    def verify_ok(data: dict) -> dict | None:
+        return data if data.get("plugins") == "ok" else None
+
+    retry_until(do_action, verify_ok, attempts=30, sleep=1.0, error_msg="Plugin loader did not reach 'ok' status")
+
+    response = backend_client_user.get("/blueprint/list", timeout=10)
+    assert response.is_success, response.text
+    blueprints = response.json()["blueprints"]
+    matches = [b for b in blueprints if b.get("source") == "plugin_template" and b.get("display_name") == "testBasic"]
+    assert len(matches) == 1, f"Expected exactly one 'testBasic' plugin_template blueprint in the list, got: {blueprints}"
+
+    # Template tags survive ingest onto the blueprint row, as key-only tags.
+    assert [t["key"] for t in matches[0].get("tags") or []] == ["testTag", "second"], (
+        f"Expected testBasic's template tags on the blueprint row, got: {matches[0].get('tags')}"
+    )
+
+    # Filtering by source=plugin_template must return testBasic.
+    response = backend_client_user.get("/blueprint/list", params={"source": "plugin_template"}, timeout=10)
+    assert response.is_success, response.text
+    source_filtered = response.json()["blueprints"]
+    assert any(b.get("display_name") == "testBasic" for b in source_filtered), (
+        f"testBasic should appear when filtered by source=plugin_template, got: {source_filtered}"
+    )
+
+    # Filtering by created_by=localTest:single must return testBasic.
+    response = backend_client_user.get("/blueprint/list", params={"created_by": "localTest:single"}, timeout=10)
+    assert response.is_success, response.text
+    owner_filtered = response.json()["blueprints"]
+    assert any(b.get("display_name") == "testBasic" for b in owner_filtered), (
+        f"testBasic should appear when filtered by created_by=localTest:single, got: {owner_filtered}"
+    )
+
+    # The templateExampleValues route returns the correct examples for testBasic.
+    response = backend_client_user.get(
+        "/plugin/templateExampleValues",
+        params={"store": testPluginId.store, "local": testPluginId.local, "displayName": "testBasic"},
+        timeout=10,
+    )
+    assert response.is_success, f"Expected 200 for testBasic example values, got: {response.status_code} {response.text}"
+    data = response.json()
+    assert "example_values" in data
+    assert "example_glyphs" in data
+    name_entry = data["example_glyphs"].get("name")
+    assert name_entry is not None, f"Expected 'name' key in example_glyphs, got: {data['example_glyphs']}"
+    assert name_entry.get("example_value") == "world", f"Expected name.example_value=world in example_glyphs, got: {name_entry}"
+
+
+def test_plugin_template_exclusion(backend_client_user: httpx.Client, backend_client_admin: httpx.Client) -> None:
+    """Excluding a template via POST /plugin/settings removes it from the blueprint list.
+    Also verifies that glyph_remapping renames glyph references in testRemapping after re-ingest.
+    """
+    from .conftest import testPluginId
+
+    # Verify testExclusion and testRemapping are initially present.
+    response = backend_client_user.get("/blueprint/list", timeout=10)
+    assert response.is_success, response.text
+    blueprints = response.json()["blueprints"]
+    assert any(b.get("display_name") == "testExclusion" for b in blueprints), (
+        f"testExclusion should be present before exclusion, got: {[b.get('display_name') for b in blueprints]}"
+    )
+    assert any(b.get("display_name") == "testRemapping" for b in blueprints), (
+        f"testRemapping should be present before remapping, got: {[b.get('display_name') for b in blueprints]}"
+    )
+
+    # Exclude testExclusion and set a glyph remapping for testRemapping via the admin settings route.
+    with connect_notification_websocket(backend_client_user) as websocket:
+        response = backend_client_admin.post(
+            "/plugin/settings",
+            json={
+                "pluginCompositeId": testPluginId.model_dump(),
+                "excluded_templates": ["testExclusion"],
+                "glyph_remapping": {"pluginGlyphOld": "pluginGlyphNew", "localOld": "localNew"},
+            },
+            timeout=10,
+        )
+        assert response.status_code in (200, 202), f"Unexpected status from /plugin/settings: {response.status_code} {response.text}"
+
+        # Wait for the re-ingest to complete.
+        def do_action() -> dict:
+            resp = backend_client_user.get("/status", timeout=10)
+            assert resp.is_success
+            return resp.json()
+
+        def verify_ok(data: dict) -> dict | None:
+            return data if data.get("plugins") == "ok" else None
+
+        retry_until(do_action, verify_ok, attempts=30, sleep=1.0, error_msg="Plugin re-ingest did not reach 'ok' status")
+
+        # A pluginSettingsApplied notification for this plugin must have been emitted.
+        expected_plugin_id = PluginCompositeId.to_str(testPluginId)
+        timeout = 15
+        while True:
+            notification, timeout = wait_next_notification(websocket, "plugin", "pluginSettingsApplied", total_timeout=timeout)
+            if notification.context.get("plugin_id") == expected_plugin_id:
+                break
+
+    # testExclusion must be gone; testBasic and testRemapping must remain.
+    response = backend_client_user.get("/blueprint/list", timeout=10)
+    assert response.is_success, response.text
+    blueprints = response.json()["blueprints"]
+    names = [b.get("display_name") for b in blueprints if b.get("source") == "plugin_template"]
+    assert "testExclusion" not in names, f"testExclusion should have been excluded, but found: {names}"
+    assert "testBasic" in names, f"testBasic should still be present, but found: {names}"
+    assert "testRemapping" in names, f"testRemapping should be present, but found: {names}"
+
+    # Verify that /plugin/list reflects the active/excluded template split correctly.
+    plugin_id_key = str(testPluginId)
+    list_response = backend_client_user.get("/plugin/list", timeout=10)
+    assert list_response.is_success, list_response.text
+    list_data = list_response.json()
+    plugin_detail = list_data.get("plugins", {}).get(plugin_id_key, {})
+    settings = plugin_detail.get("settings_data", {}) or {}
+    active = settings.get("included_templates", [])
+    excluded_config = settings.get("excluded_templates", [])
+    assert "testExclusion" not in active, f"testExclusion should not be active, got: {active}"
+    assert "testBasic" in active, f"testBasic should be active, got: {active}"
+    assert "testRemapping" in active, f"testRemapping should be active, got: {active}"
+    assert "testExclusion" in excluded_config, f"testExclusion should appear in excluded_templates, got: {excluded_config}"
+
+    # Excluded template must return 403 from templateExampleValues.
+    response = backend_client_user.get(
+        "/plugin/templateExampleValues",
+        params={"store": testPluginId.store, "local": testPluginId.local, "displayName": "testExclusion"},
+        timeout=10,
+    )
+    assert response.status_code == 403, f"Expected 403 for excluded testExclusion, got: {response.status_code} {response.text}"
+
+    # Unknown display name in a known plugin -> 404.
+    response = backend_client_user.get(
+        "/plugin/templateExampleValues",
+        params={"store": testPluginId.store, "local": testPluginId.local, "displayName": "doesNotExist"},
+        timeout=10,
+    )
+    assert response.status_code == 404, f"Expected 404 for unknown displayName, got: {response.status_code} {response.text}"
+
+    # Unknown plugin -> 404.
+    response = backend_client_user.get(
+        "/plugin/templateExampleValues",
+        params={"store": "unknownStore", "local": "unknownPlugin", "displayName": "testBasic"},
+        timeout=10,
+    )
+    assert response.status_code == 404, f"Expected 404 for unknown plugin, got: {response.status_code} {response.text}"
+
+    # Verify that the glyph remapping was applied to testRemapping.
+    remap_item = next(b for b in blueprints if b.get("display_name") == "testRemapping")
+    remap_id = remap_item["blueprint_id"]
+    response = backend_client_user.get(f"/blueprint/get?blueprint_id={remap_id}", timeout=10)
+    assert response.is_success, response.text
+    builder_data = response.json()["builder"]
+    # The block config value must reference the renamed glyph.
+    config_values = builder_data["blocks"][0]["instance"]["configuration_values"]
+    assert any("pluginGlyphNew" in v for v in config_values.values()), (
+        f"Expected pluginGlyphNew in config values after remapping, got: {config_values}"
+    )
+    assert not any("pluginGlyphOld" in v for v in config_values.values()), (
+        f"pluginGlyphOld should have been renamed, but found in config values: {config_values}"
+    )
+    # The local glyph key and value must also be renamed.
+    local_glyphs = builder_data["local_glyphs"]
+    assert "localNew" in local_glyphs, f"Expected localNew in local_glyphs after remapping, got: {local_glyphs}"
+    assert "localOld" not in local_glyphs, f"localOld should have been renamed, got: {local_glyphs}"
+    assert "pluginGlyphNew" in local_glyphs.get("localNew", ""), f"Expected localNew value to reference pluginGlyphNew, got: {local_glyphs}"
+
+
+def test_plugin_template_validation_failure(backend_client_user: httpx.Client) -> None:
+    """Templates that fail validation with their example values are absent from the blueprint list
+    and their error is reported in load_errors in the plugin listing."""
+    from .conftest import testPluginId
+
+    # Wait for the initial plugin load to finish.
+    def do_action() -> dict:
+        response = backend_client_user.get("/status", timeout=10)
+        assert response.is_success
+        return response.json()
+
+    def verify_ok(data: dict) -> dict | None:
+        return data if data.get("plugins") == "ok" else None
+
+    retry_until(do_action, verify_ok, attempts=30, sleep=1.0, error_msg="Plugin loader did not reach 'ok' status")
+
+    # testFailValidation must NOT appear in the blueprint list.
+    response = backend_client_user.get("/blueprint/list", timeout=10)
+    assert response.is_success, response.text
+    blueprints = response.json()["blueprints"]
+    names = [b.get("display_name") for b in blueprints if b.get("source") == "plugin_template"]
+    assert "testFailValidation" not in names, f"testFailValidation should have been rejected but found in: {names}"
+
+    # Its error must be reported in load_errors for the plugin in /plugin/list.
+    plugin_id_key = str(testPluginId)
+    list_response = backend_client_user.get("/plugin/list", timeout=10)
+    assert list_response.is_success, list_response.text
+    plugin_detail = list_response.json().get("plugins", {}).get(plugin_id_key, {})
+    load_errors = plugin_detail.get("load_errors", [])
+    details = " ".join(e.get("detail", "") for e in load_errors)
+    assert "testFailValidation" in details, f"Expected 'testFailValidation' in load_errors for {plugin_id_key!r}, got: {load_errors!r}"
+
+
+def test_blueprint_expand(tmpdir: Any, backend_client_user: httpx.Client) -> None:
+    response = backend_client_user.get("/blueprint/catalogue").raise_for_status()
     assert len(response.json()) > 0
 
-    builder = BlueprintBuilder(blocks={})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    builder = BlueprintBuilder(blocks=[])
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.json()["possible_sources"] == [
         {"plugin": {"store": "localTest", "local": "single"}, "factory": "source_42"},
         {"plugin": {"store": "localTest", "local": "single"}, "factory": "source_text"},
@@ -190,152 +484,358 @@ def test_blueprint_expand(tmpdir: Any, backend_client_with_auth: httpx.Client) -
     ]
     assert response.json()["possible_expansions"] == {}
 
-    source_42 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_42")),
-        configuration_values={},
-        input_ids={},
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    blocks = {BlockInstanceId("source_42"): source_42}
+    blocks = [source_42]
     builder = BlueprintBuilder(blocks=blocks)
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.json()["possible_expansions"] == {
         "source_42": [
-            {"plugin": {"store": "localTest", "local": "single"}, "factory": "transform_increment"},
-            {"plugin": {"store": "localTest", "local": "single"}, "factory": "product_join"},
-            {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_file"},
-            {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_image"},
+            {
+                "plugin": {"store": "localTest", "local": "single"},
+                "factory": "transform_increment",
+                "restrictions": {"amount": "enumClosed[int](1,2,3)"},
+            },
+            {"plugin": {"store": "localTest", "local": "single"}, "factory": "product_join", "restrictions": {}},
+            {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_file", "restrictions": {}},
+            {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_filetree", "restrictions": {}},
+            {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_image", "restrictions": {}},
         ]
     }
 
-    transform_increment = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("transform_increment")),
-        configuration_values={"amount": "2"},
-        input_ids={"a": BlockInstanceId("source_42")},
+    transform_increment = RoutableBlock(
+        instance_id=BlockInstanceId("transform_increment"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "2"}),
+            input_ids={"a": BlockInstanceId("source_42")},
+        ),
     )
-    blocks[BlockInstanceId("transform_increment")] = transform_increment
+    blocks.append(transform_increment)
     builder = BlueprintBuilder(blocks=blocks)
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.json()["possible_expansions"]["transform_increment"] == [
-        {"plugin": {"store": "localTest", "local": "single"}, "factory": "transform_increment"},
-        {"plugin": {"store": "localTest", "local": "single"}, "factory": "product_join"},
-        {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_file"},
-        {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_image"},
+        {
+            "plugin": {"store": "localTest", "local": "single"},
+            "factory": "transform_increment",
+            "restrictions": {"amount": "enumClosed[int](1,2,3)"},
+        },
+        {"plugin": {"store": "localTest", "local": "single"}, "factory": "product_join", "restrictions": {}},
+        {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_file", "restrictions": {}},
+        {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_filetree", "restrictions": {}},
+        {"plugin": {"store": "localTest", "local": "single"}, "factory": "sink_image", "restrictions": {}},
     ]
 
-    product_join = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("product_join")),
-        configuration_values={},
-        input_ids={"a": BlockInstanceId("transform_increment"), "b": BlockInstanceId("source_42")},
+    product_join = RoutableBlock(
+        instance_id=BlockInstanceId("product_join"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("product_join"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={"a": BlockInstanceId("transform_increment"), "b": BlockInstanceId("source_42")},
+        ),
     )
-    # Using an unknown glyph should fail validation
-    sink_file_bad = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output${{blueprintExpandGlobalGlyph}}.main.txt"},
-        input_ids={"data": BlockInstanceId("product_join")},
+    # Using an unknown glyph should not fail validation — it should be reported in missing_glyphs
+    sink_file = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output${{blueprintExpandGlobalGlyph}}.main.txt"}),
+            input_ids={"data": BlockInstanceId("product_join")},
+        ),
     )
-    blocks[BlockInstanceId("product_join")] = product_join
-    blocks[BlockInstanceId("sink_file")] = sink_file_bad
+    blocks.append(product_join)
+    blocks.append(sink_file)
 
     builder = BlueprintBuilder(blocks=blocks)
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
-    assert "sink_file" in response.json()["block_errors"]
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert "sink_file" not in response.json()["block_errors"]
+    assert response.json()["missing_glyphs"]["sink_file"]["fname"] == ["blueprintExpandGlobalGlyph"]
 
-    # After posting blueprintExpandGlobalGlyph as a global glyph, the same blueprint should pass validation
-    post_resp = backend_client_with_auth.post(
+    # After posting blueprintExpandGlobalGlyph as a global glyph, missing_glyphs should be empty
+    post_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "blueprintExpandGlobalGlyph", "value": "test_expand_value"},
     )
     assert post_resp.is_success, post_resp.text
 
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert "sink_file" not in response.json()["block_errors"]
     assert len(response.json()["block_errors"]) == 0
+    assert response.json()["missing_glyphs"] == {}
     assert response.json()["resolved_configuration_options"]["sink_file"]["fname"] == f"{tmpdir}/outputtest_expand_value.main.txt"
 
     # A builder with an intrinsic name used as a local glyph key should fail validation
     builder_invalid_local = BlueprintBuilder(
-        blocks=dict(blocks),
+        blocks=list(blocks),
         local_glyphs={"runId": "should-not-be-allowed"},
     )
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_invalid_local.model_dump())
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_invalid_local.model_dump())
     assert len(response.json()["global_errors"]) > 0
 
-    # A block using a local glyph defined on the builder should pass validation
-    sink_file_local = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output${{blueprintExpandLocalGlyph}}.main.txt"},
-        input_ids={"data": BlockInstanceId("product_join")},
+    # A block using a local glyph defined on the builder should pass validation.
+    # Replace the sink_file block in the list with a variant that references the local glyph.
+    sink_file_local = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output${{blueprintExpandLocalGlyph}}.main.txt"}),
+            input_ids={"data": BlockInstanceId("product_join")},
+        ),
     )
-    blocks[BlockInstanceId("sink_file")] = sink_file_local
+    blocks = [sink_file_local if b.instance_id == BlockInstanceId("sink_file") else b for b in blocks]
     builder_with_local = BlueprintBuilder(
-        blocks=dict(blocks),
+        blocks=blocks,
         local_glyphs={"blueprintExpandLocalGlyph": "expand_local_value"},
     )
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_with_local.model_dump())
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_with_local.model_dump())
     assert "sink_file" not in response.json()["block_errors"]
     assert len(response.json()["global_errors"]) == 0
     assert response.json()["resolved_configuration_options"]["sink_file"]["fname"] == f"{tmpdir}/outputexpand_local_value.main.txt"
 
-    # A known intrinsic glyph (${runId}) should also pass validation
-    sink_file_intrinsic = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output${{runId}}.main.txt"},
-        input_ids={"data": BlockInstanceId("product_join")},
+    # A known intrinsic glyph (${runId}) should also pass validation.
+    # Replace the sink_file block again with the intrinsic-glyph variant.
+    sink_file_intrinsic = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output${{runId}}.main.txt"}),
+            input_ids={"data": BlockInstanceId("product_join")},
+        ),
     )
-    blocks[BlockInstanceId("sink_file")] = sink_file_intrinsic
+    blocks = [sink_file_intrinsic if b.instance_id == BlockInstanceId("sink_file") else b for b in blocks]
 
     builder = BlueprintBuilder(blocks=blocks)
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
-    expected_expansion = [{"factory": "sink_file", "plugin": {"local": "single", "store": "localTest"}}]
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    expected_expansion = [
+        {"factory": "sink_file", "plugin": {"local": "single", "store": "localTest"}, "restrictions": {}},
+        {"factory": "sink_filetree", "plugin": {"local": "single", "store": "localTest"}, "restrictions": {}},
+    ]
     # NOTE this looks odd but sink_file produces the url of the file, and that url is a text which can again be written to a file
     assert response.json()["possible_expansions"]["sink_file"] == expected_expansion, "sink_file should expand only to sink_file"
     assert len(response.json()["block_errors"]) == 0
-    glyphs_resp = backend_client_with_auth.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
+    glyphs_resp = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
     assert glyphs_resp.is_success, glyphs_resp.text
     run_id_glyph = next(g for g in glyphs_resp.json()["glyphs"] if g["name"] == "runId")
     expected_run_id = run_id_glyph["valueExample"]
     assert response.json()["resolved_configuration_options"]["sink_file"]["fname"] == f"{tmpdir}/output{expected_run_id}.main.txt"
 
+    # Clean up the global glyph created in this test
+    del_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/delete",
+        json={"global_glyph_id": post_resp.json()["global_glyph_id"]},
+    )
+    assert del_resp.is_success, del_resp.text
 
-def test_blueprint_basic_execute(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
+
+def test_blueprint_expand_restrictions(backend_client_user: httpx.Client) -> None:
+    """The expand endpoint carries non-empty restrictions from test plugin hooks.
+
+    The test plugin returns enumClosed[int](1,2,3) as a restriction on the 'amount'
+    configuration option when expanding an int-producing block to transform_increment.
+    It also returns the same restriction for transform_increment's own configuration.
+    This test verifies both restrictions survive the full route round-trip.
+    """
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert response.is_success, response.text
+
+    expansions = response.json()["possible_expansions"]["source_42"]
+    increment_expansion = next(e for e in expansions if e["factory"] == "transform_increment")
+    assert increment_expansion["restrictions"] == {"amount": "enumClosed[int](1,2,3)"}, (
+        "transform_increment expansion must carry an enumClosed[int](1,2,3) restriction on 'amount'"
+    )
+
+    transform_increment = RoutableBlock(
+        instance_id=BlockInstanceId("transform_increment"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "2"}),
+            input_ids={"a": BlockInstanceId("source_42")},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+            transform_increment,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert response.is_success, response.text
+    assert response.json()["configuration_restrictions"]["transform_increment"] == {"amount": "enumClosed[int](1,2,3)"}
+
+
+def test_blueprint_expand_missing_glyph_warnings(tmpdir: Any, backend_client_user: httpx.Client) -> None:
+    """Unknown glyph references produce missing_glyph warnings, not block_errors.
+
+    Covers:
+    - A block with a single option referencing one unknown glyph: missing_glyphs is populated
+      for that option, block_errors is not.
+    - After the missing glyph is registered as a global glyph, missing_glyphs clears.
+    - A block with two options where only one references an unknown glyph: the other option
+      is still validated normally.
+    - Malformed glyph expressions (syntax errors) remain hard block_errors.
+    """
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
+    )
+    # sink_file with fname referencing a missing glyph
+    sink_file = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output_${{missingRoot}}.txt"}),
+            input_ids={"data": BlockInstanceId("source_42")},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+            sink_file,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert response.is_success, response.text
+    data = response.json()
+
+    # Unknown glyph → missing_glyphs entry, not a block_error
+    assert "sink_file" not in data["block_errors"]
+    assert data["missing_glyphs"]["sink_file"]["fname"] == ["missingRoot"]
+    # Other blocks remain unaffected
+    assert "source_42" not in data["block_errors"]
+    assert "source_42" not in data["missing_glyphs"]
+
+    # Register the missing glyph and verify the warning clears
+    post_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/post",
+        json={"key": "missingRoot", "value": "resolved_root"},
+    )
+    assert post_resp.is_success, post_resp.text
+    response2 = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert response2.is_success, response2.text
+    data2 = response2.json()
+    assert data2["missing_glyphs"] == {}
+    assert data2["block_errors"] == {}
+    assert data2["resolved_configuration_options"]["sink_file"]["fname"] == f"{tmpdir}/output_resolved_root.txt"
+
+    # Clean up
+    del_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/delete",
+        json={"global_glyph_id": post_resp.json()["global_glyph_id"]},
+    )
+    assert del_resp.is_success, del_resp.text
+
+    # Malformed expression remains a hard block_error
+    sink_file_malformed = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file_malformed"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": "${x |}"}),
+            input_ids={"data": BlockInstanceId("source_42")},
+        ),
+    )
+    builder_malformed = BlueprintBuilder(
+        blocks=[
+            source_42,
+            sink_file_malformed.model_copy(update={"instance_id": BlockInstanceId("sink_file")}),
+        ]
+    )
+    response_malformed = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_malformed.model_dump())
+    assert response_malformed.is_success, response_malformed.text
+    data_malformed = response_malformed.json()
+    assert "sink_file" in data_malformed["block_errors"]
+
     # Set the global glyph that the builder's source_time block references
-    post_resp = backend_client_with_auth.post(
+    post_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "basicExecuteGlobalGlyph", "value": "initial_value"},
     )
     assert post_resp.is_success, post_resp.text
 
     builder = _make_builder_full(tmpdir)
+
+    # Baseline: expand the blueprint before submission, using validate_only=True (the
+    # convenience/perf flag) since we only care about resolved_configuration_options here.
+    expand_before_resp = backend_client_user.put("/blueprint/expand", json=builder.model_dump(), params={"validate_only": True})
+    assert expand_before_resp.is_success, expand_before_resp.text
+    resolved_before = expand_before_resp.json()["resolved_configuration_options"]
+    assert resolved_before["source_time"]["text"].split(";")[2] == "initial_value"
+    assert resolved_before["source_time"]["text"].split(";")[3] == "local_glyph_value"
+
     save_req = BlueprintSaveCommand(builder=builder)
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=save_req.model_dump())
+    save_resp = backend_client_user.post("/blueprint/create", json=save_req.model_dump())
     assert save_resp.is_success, save_resp.text
     blueprint_id = save_resp.json()["blueprint_id"]
-    exec_response = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
+    exec_response = backend_client_user.post("/run/create", json={"blueprint_id": blueprint_id})
     assert exec_response.is_success, exec_response.text
     response = RunCreateResponse(**exec_response.json())
     run_id = response.run_id
     assert response.attempt_count == 1
-    ensure_completed_v2(backend_client_with_auth, run_id, sleep=1, attempts=120)
+    ensure_completed_v2(backend_client_user, run_id, sleep=1, attempts=120)
 
     outputMain = pathlib.Path(f"{tmpdir}/output{run_id}.main.txt")
     assert outputMain.read_text() == "85"  # the output of 42 + 1 + 42, thats what the job is configured to do
     outputMain.unlink()
-    status_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id})
+    status_resp = backend_client_user.get("/run/get", params={"run_id": run_id})
     assert status_resp.is_success, status_resp.text
     created_at = status_resp.json()["created_at"]
     outputTime = pathlib.Path(f"{tmpdir}/output{run_id}.time.txt")
     # Both submitDatetime and startDatetime equal created_at on the first run.
     # created_at is at higher precision than the second-resolution glyph values.
-    created_at_sec = created_at.split(".", 1)[0]
+    # Use fromisoformat + replace to strip sub-second precision while preserving the UTC offset.
+    created_at_sec = _dt.fromisoformat(created_at).replace(microsecond=0).isoformat()
     _time_line = outputTime.read_text()
     _time_parts = _time_line.split(";")
     assert _time_parts[0] == created_at_sec
     assert compare_with_tolerance(_time_parts[1], _dt.fromisoformat(created_at_sec))
     assert _time_parts[2] == "initial_value"
     assert _time_parts[3] == "local_glyph_value"
+    resolution = status_resp.json()["resolution"]
+    # sink_main's fname was resolved with the real runId (not the example value used at expand time).
+    assert resolution["sink_main"]["fname"] == f"{tmpdir}/output{run_id}.main.txt"
+    # source_time's text was resolved with submitDatetime (as-submitted, matching created_at) and
+    # the global/local glyph values actually used at execution time. startDatetime is intentionally
+    # not asserted here, since it is always recomputed fresh on every attempt and never persisted.
+    resolved_time_parts = resolution["source_time"]["text"].split(";")
+    assert resolved_time_parts[0] == created_at
+    assert resolved_time_parts[2] == "initial_value"
+    assert resolved_time_parts[3] == "local_glyph_value"
     outputTime.unlink()
 
-    list_resp = backend_client_with_auth.get("/run/list")
+    list_resp = backend_client_user.get("/run/list")
     assert list_resp.is_success, list_resp.text
     data = list_resp.json()
     assert "runs" in data
@@ -349,38 +849,38 @@ def test_blueprint_basic_execute(tmpdir: Any, backend_client_with_auth: httpx.Cl
 
     # Change the global glyph value before restarting — the restart must use the
     # persisted context from attempt 1 and NOT the updated global value.
-    update_resp = backend_client_with_auth.post(
+    update_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "basicExecuteGlobalGlyph", "value": "changed_value"},
     )
     assert update_resp.is_success, update_resp.text
 
-    restart_resp = backend_client_with_auth.post("/run/restart", json={"run_id": run_id, "attempt_count": 1})
+    restart_resp = backend_client_user.post("/run/restart", json={"run_id": run_id, "attempt_count": 1})
     assert restart_resp.is_success, restart_resp.text
     data = restart_resp.json()
     assert data["run_id"] == run_id
     assert data["attempt_count"] == 2
 
     # Latest-attempt status reflects attempt 2
-    status_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id})
+    status_resp = backend_client_user.get("/run/get", params={"run_id": run_id})
     assert status_resp.is_success, status_resp.text
     assert status_resp.json()["attempt_count"] == 2
 
     # Attempt 1 is still accessible explicitly
-    status_1_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id, "attempt_count": 1})
+    status_1_resp = backend_client_user.get("/run/get", params={"run_id": run_id, "attempt_count": 1})
     assert status_1_resp.is_success, status_1_resp.text
     assert status_1_resp.json()["attempt_count"] == 1
 
-    ensure_completed_v2(backend_client_with_auth, run_id, sleep=1, attempts=120)
+    ensure_completed_v2(backend_client_user, run_id, sleep=1, attempts=120)
     assert outputMain.read_text() == "85"  # the output of 42 + 1 + 42, thats what the job is configured to do
 
     # After restart: submitDatetime must still equal original created_at; startDatetime
     # must reflect the restart's own created_at (attempt 2).  The global glyph value
     # must equal "initial_value" — the persisted context from attempt 1 triumphs over
     # the updated global value "changed_value".
-    status_restarted_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id})
+    status_restarted_resp = backend_client_user.get("/run/get", params={"run_id": run_id})
     assert status_restarted_resp.is_success, status_restarted_resp.text
-    created_at_restarted = status_restarted_resp.json()["created_at"].split(".", 1)[0]
+    created_at_restarted = _dt.fromisoformat(status_restarted_resp.json()["created_at"]).replace(microsecond=0).isoformat()
     _time_line_r = outputTime.read_text()
     _time_parts_r = _time_line_r.split(";")
     assert _time_parts_r[0] == created_at_sec
@@ -388,51 +888,61 @@ def test_blueprint_basic_execute(tmpdir: Any, backend_client_with_auth: httpx.Cl
     assert _time_parts_r[2] == "initial_value"
     assert _time_parts_r[3] == "local_glyph_value"
 
-    get_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id})
+    get_resp = backend_client_user.get("/run/get", params={"run_id": run_id})
     assert get_resp.is_success, get_resp.text
     run_detail = get_resp.json()
     assert run_detail["outputs"] is not None
     available_tasks = [task_id for task_id, char in run_detail["outputs"]["outputs"].items() if char["is_available"]]
     assert isinstance(available_tasks, list)
     assert len(available_tasks) > 0
+    assert run_detail["planned_block_ids"] == None
+    assert run_detail["completed_block_ids"] == None
 
-    logs_resp = backend_client_with_auth.get("/run/logs", params={"run_id": run_id})
+    logs_resp = backend_client_user.get("/run/logs", params={"run_id": run_id})
     assert logs_resp.is_success, logs_resp.text
     assert "zip" in logs_resp.headers["content-type"]
     with zipfile.ZipFile(io.BytesIO(logs_resp.content), "r") as zf:
-        # NOTE dbEntity, gwState, gateway, controller, host0, host0.dsr, host0.shm, host0.w1, host0.w2
-        expected_log_count = 9
+        # NOTE dbEntity, gwState, backend, gateway, controller, host0, host0.dsr, host0.shm, (host0.w1, host0.w2) x (logs, stdout, stderr)
+        expected_log_count = 14
         assert len(zf.namelist()) == expected_log_count or os.getenv("FIAB_LOGSTDOUT", "nay") == "yea"
 
+    # Clean up: delete the global glyph created in this test
+    del_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/delete",
+        json={"global_glyph_id": post_resp.json()["global_glyph_id"]},
+    )
+    assert del_resp.is_success, del_resp.text
 
-def test_submit_job_v2_execute_missing_blueprint_id(backend_client_with_auth: httpx.Client) -> None:
+
+def test_submit_job_v2_execute_missing_blueprint_id(backend_client_user: httpx.Client) -> None:
     """Omitting blueprint_id (required field) returns 422."""
-    response = backend_client_with_auth.post("/run/create", json={})
+    response = backend_client_user.post("/run/create", json={})
     assert response.status_code == 422
 
 
-def test_submit_job_v2_execute_unknown_definition(backend_client_with_auth: httpx.Client) -> None:
+def test_submit_job_v2_execute_unknown_definition(backend_client_user: httpx.Client) -> None:
     """Referencing a non-existent Blueprint returns 404."""
     payload = {"blueprint_id": "does-not-exist"}
-    response = backend_client_with_auth.post("/run/create", json=payload)
+    response = backend_client_user.post("/run/create", json=payload)
     assert response.status_code == 404
 
 
-def test_submit_job_v2_read_status_not_found(backend_client_with_auth: httpx.Client) -> None:
+def test_submit_job_v2_read_status_not_found(backend_client_user: httpx.Client) -> None:
     """GET /execution/get with unknown run_id returns 404."""
-    resp = backend_client_with_auth.get("/run/get", params={"run_id": "nonexistent-exec-id"})
+    resp = backend_client_user.get("/run/get", params={"run_id": "nonexistent-exec-id"})
     assert resp.status_code == 404
 
 
-def test_submit_job_v2_restart_not_found(backend_client_with_auth: httpx.Client) -> None:
+def test_submit_job_v2_restart_not_found(backend_client_user: httpx.Client) -> None:
     """POST /execution/restart with unknown run_id returns 404."""
-    resp = backend_client_with_auth.post("/run/restart", json={"run_id": "nonexistent-exec-id", "attempt_count": 1})
+    resp = backend_client_user.post("/run/restart", json={"run_id": "nonexistent-exec-id", "attempt_count": 1})
     assert resp.status_code == 404
 
 
-def test_list_available_glyphs(backend_client_with_auth: httpx.Client) -> None:
-    """The glyphs/list endpoint returns exactly the set of AvailableIntrinsicGlyphs when glyph_type=intrinsic."""
-    response = backend_client_with_auth.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
+def test_list_available_glyphs(backend_client_user: httpx.Client) -> None:
+    """The glyphs/list endpoint returns intrinsic and global glyphs with correct shape."""
+    # Filter to intrinsic only
+    response = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
     assert response.is_success, response.text
     data = response.json()
     assert "glyphs" in data
@@ -441,20 +951,21 @@ def test_list_available_glyphs(backend_client_with_auth: httpx.Client) -> None:
     expected_names = set(get_args(AvailableIntrinsicGlyphs))
     assert returned_names == expected_names
     for item in data["glyphs"]:
+        assert item["glyph_type"] == "intrinsic"
         assert "display_name" in item
         assert "valueExample" in item
         assert item["display_name"]
         assert item["valueExample"]
 
     # Global glyphs list reflects whatever has been posted by other tests; record the baseline
-    global_resp = backend_client_with_auth.get("/blueprint/glyphs/list", params={"glyph_type": "global"})
+    global_resp = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_type": "global"})
     assert global_resp.is_success, global_resp.text
     global_data = global_resp.json()
     initial_total = global_data["total"]
     assert isinstance(global_data["glyphs"], list)
 
     # Post a new global glyph and verify the count increases and the glyph appears
-    post_resp = backend_client_with_auth.post(
+    post_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "listGlyphsGlobalGlyph", "value": "list_test_value"},
     )
@@ -463,34 +974,43 @@ def test_list_available_glyphs(backend_client_with_auth: httpx.Client) -> None:
     assert posted["key"] == "listGlyphsGlobalGlyph"
     assert posted["value"] == "list_test_value"
     assert "global_glyph_id" in posted
+    assert posted["glyph_type"] == "global"
 
-    global_resp2 = backend_client_with_auth.get("/blueprint/glyphs/list", params={"glyph_type": "global"})
+    global_resp2 = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_type": "global"})
     assert global_resp2.is_success, global_resp2.text
     global_data2 = global_resp2.json()
     assert global_data2["total"] == initial_total + 1
-    names = {item["name"] for item in global_data2["glyphs"]}
-    assert "listGlyphsGlobalGlyph" in names
+    keys = {item["key"] for item in global_data2["glyphs"]}
+    assert "listGlyphsGlobalGlyph" in keys
+    for item in global_data2["glyphs"]:
+        assert item["glyph_type"] == "global"
 
-    get_resp = backend_client_with_auth.get("/blueprint/glyphs/global/get", params={"global_glyph_id": posted["global_glyph_id"]})
-    assert get_resp.is_success, get_resp.text
-    fetched = get_resp.json()
-    assert fetched["key"] == "listGlyphsGlobalGlyph"
-    assert fetched["value"] == "list_test_value"
-    assert fetched["global_glyph_id"] == posted["global_glyph_id"]
+    # Retrieve by key filter via list endpoint (replaces the old GET by id)
+    key_resp = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_key": "listGlyphsGlobalGlyph"})
+    assert key_resp.is_success, key_resp.text
+    key_data = key_resp.json()
+    assert any(g["key"] == "listGlyphsGlobalGlyph" and g["global_glyph_id"] == posted["global_glyph_id"] for g in key_data["glyphs"])
 
     # Non-admin users must not be able to create public global glyphs
-    public_resp = backend_client_with_auth.post(
+    public_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "shouldBeRejected", "value": "v", "public": True, "overriddable": True},
     )
     assert public_resp.status_code == 403
 
+    # Clean up: delete the glyph created in this test
+    delete_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/delete",
+        json={"global_glyph_id": posted["global_glyph_id"]},
+    )
+    assert delete_resp.is_success, delete_resp.text
 
-def test_list_glyph_functions(backend_client_with_auth: httpx.Client) -> None:
+
+def test_list_glyph_functions(backend_client_user: httpx.Client) -> None:
     """The glyphs/functions endpoint returns all registered custom functions with name and description."""
     from forecastbox.domain.glyphs.jinja_interpolation import CUSTOM_FUNCTIONS
 
-    response = backend_client_with_auth.get("/blueprint/glyphs/functions")
+    response = backend_client_user.get("/blueprint/glyphs/functions")
     assert response.is_success, response.text
     data = response.json()
 
@@ -510,81 +1030,236 @@ def test_list_glyph_functions(backend_client_with_auth: httpx.Client) -> None:
         assert fn["description"]
 
 
-def test_blueprint_expand_failure_01(backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_expand_failure_01(backend_client_user: httpx.Client) -> None:
     """Source has an invalid factory; transform referencing it must not generate its own error."""
-    bad_source = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("nonexistent_factory")),
-        configuration_values={},
-        input_ids={},
+    bad_source = RoutableBlock(
+        instance_id=BlockInstanceId("bad_source"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("nonexistent_factory"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    good_transform = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("transform_increment")),
-        configuration_values={"amount": "1"},
-        input_ids={"a": BlockInstanceId("bad_source")},
+    good_transform = RoutableBlock(
+        instance_id=BlockInstanceId("good_transform"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "1"}),
+            input_ids={"a": BlockInstanceId("bad_source")},
+        ),
     )
-    builder = BlueprintBuilder(blocks={BlockInstanceId("bad_source"): bad_source, BlockInstanceId("good_transform"): good_transform})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    builder = BlueprintBuilder(
+        blocks=[
+            bad_source,
+            good_transform,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.is_success, response.text
     block_errors = response.json()["block_errors"]
     assert "bad_source" in block_errors
     assert "good_transform" not in block_errors
 
 
-def test_blueprint_expand_failure_02(backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_expand_failure_02(backend_client_user: httpx.Client) -> None:
     """Transform declares an input id that does not exist in the blueprint; only the transform errors."""
-    source_42 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_42")),
-        configuration_values={},
-        input_ids={},
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    bad_transform = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("transform_increment")),
-        configuration_values={"amount": "1"},
-        input_ids={"a": BlockInstanceId("nonexistent_block")},
+    bad_transform = RoutableBlock(
+        instance_id=BlockInstanceId("bad_transform"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "1"}),
+            input_ids={"a": BlockInstanceId("nonexistent_block")},
+        ),
     )
-    builder = BlueprintBuilder(blocks={BlockInstanceId("source_42"): source_42, BlockInstanceId("bad_transform"): bad_transform})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+            bad_transform,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.is_success, response.text
     block_errors = response.json()["block_errors"]
     assert "source_42" not in block_errors
     assert "bad_transform" in block_errors
 
 
-def test_blueprint_expand_failure_03(backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_expand_failure_03(backend_client_user: httpx.Client) -> None:
     """Bad source and transform with a non-existent input id both report independent errors."""
-    bad_source = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("nonexistent_factory")),
-        configuration_values={},
-        input_ids={},
+    bad_source = RoutableBlock(
+        instance_id=BlockInstanceId("bad_source"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("nonexistent_factory"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    bad_transform = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("transform_increment")),
-        configuration_values={"amount": "1"},
-        input_ids={"a": BlockInstanceId("nonexistent_block")},
+    bad_transform = RoutableBlock(
+        instance_id=BlockInstanceId("bad_transform"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "1"}),
+            input_ids={"a": BlockInstanceId("nonexistent_block")},
+        ),
     )
-    builder = BlueprintBuilder(blocks={BlockInstanceId("bad_source"): bad_source, BlockInstanceId("bad_transform"): bad_transform})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    builder = BlueprintBuilder(
+        blocks=[
+            bad_source,
+            bad_transform,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.is_success, response.text
     block_errors = response.json()["block_errors"]
     assert "bad_source" in block_errors
     assert "bad_transform" in block_errors
 
-    # we now verify that the validation of transform happens in some form, despite parent being invalid
-    bad_transform2 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("transform_increment")),
-        configuration_values={"amount": "${nonExistentGlyph}"},
-        input_ids={"a": BlockInstanceId("bad_source")},
+    # we now verify that the missing-glyph warning for transform is reported, despite parent being invalid
+    bad_transform2 = RoutableBlock(
+        instance_id=BlockInstanceId("bad_transform2"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "${nonExistentGlyph}"}),
+            input_ids={"a": BlockInstanceId("bad_source")},
+        ),
     )
-    builder = BlueprintBuilder(blocks={BlockInstanceId("bad_source"): bad_source, BlockInstanceId("bad_transform"): bad_transform2})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    builder = BlueprintBuilder(
+        blocks=[
+            bad_source,
+            bad_transform2.model_copy(update={"instance_id": BlockInstanceId("bad_transform")}),
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.is_success, response.text
     block_errors = response.json()["block_errors"]
     assert "bad_source" in block_errors
+    missing_glyphs = response.json()["missing_glyphs"]
+    assert "bad_transform" in missing_glyphs
+    assert missing_glyphs["bad_transform"]["amount"] == ["nonExistentGlyph"]
+
+
+def test_blueprint_expand_failure_04_invalid_configuration_type(backend_client_user: httpx.Client) -> None:
+    """Type conversion errors are reported by backend validation before plugin validation."""
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
+    )
+    bad_transform = RoutableBlock(
+        instance_id=BlockInstanceId("bad_transform"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values=_config({"amount": "not_an_int"}),
+            input_ids={"a": BlockInstanceId("source_42")},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+            bad_transform,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert response.is_success, response.text
+    block_errors = response.json()["block_errors"]
     assert "bad_transform" in block_errors
-    assert "nonExistentGlyph" in ";".join(block_errors["bad_transform"])
+    assert any("Invalid value for configuration option 'amount': expected int" in message for message in block_errors["bad_transform"])
 
 
-def test_blueprint_composite_glyph_expand(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_expand_missing_configuration_is_not_error(backend_client_user: httpx.Client) -> None:
+    """Missing values are omitted during validation instead of producing hard errors."""
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
+    )
+    transform_missing_amount = RoutableBlock(
+        instance_id=BlockInstanceId("transform_missing_amount"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={"a": BlockInstanceId("source_42")},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+            transform_missing_amount,
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    assert response.is_success, response.text
+    block_errors = response.json()["block_errors"]
+    assert "transform_missing_amount" not in block_errors
+
+
+def test_blueprint_create_and_update_allow_missing_configuration_values(backend_client_user: httpx.Client) -> None:
+    """Draft blueprints with missing config can be saved, but compilation stays strict."""
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
+    )
+    transform_missing_amount = RoutableBlock(
+        instance_id=BlockInstanceId("transform_missing_amount"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("transform_increment"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={"a": BlockInstanceId("source_42")},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            source_42,
+            transform_missing_amount,
+        ]
+    )
+
+    create_response = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+    assert create_response.is_success, create_response.text
+    saved = create_response.json()
+    update_response = backend_client_user.post(
+        "/blueprint/update",
+        json={
+            **BlueprintSaveCommand(builder=builder).model_dump(),
+            "blueprint_id": saved["blueprint_id"],
+            "version": saved["version"],
+        },
+    )
+    assert update_response.is_success, update_response.text
+
+
+def test_blueprint_composite_glyph_expand(tmpdir: Any, backend_client_user: httpx.Client) -> None:
     """A local glyph value that references other glyphs is expanded end-to-end.
 
     Covers:
@@ -592,62 +1267,84 @@ def test_blueprint_composite_glyph_expand(tmpdir: Any, backend_client_with_auth:
     - A circular glyph reference is reported as a global_error
     """
     # Post a global glyph that the composite local glyph will reference
-    post_resp = backend_client_with_auth.post(
+    post_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "compositeExpandGlobalPart", "value": "global_part"},
     )
     assert post_resp.is_success, post_resp.text
 
     # Build a blueprint whose local glyph composes the global part and a known intrinsic
-    source_text = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_text")),
-        configuration_values={"text": "${compositeLocalGlyph}"},
-        input_ids={},
+    source_text = RoutableBlock(
+        instance_id=BlockInstanceId("source_text"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_text"),
+        instance=BlockInstance(
+            configuration_values=_config({"text": "${compositeLocalGlyph}"}),
+            input_ids={},
+        ),
     )
-    sink_file = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/composite_expand_output.txt"},
-        input_ids={"data": BlockInstanceId("source_text")},
+    sink_file = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/composite_expand_output.txt"}),
+            input_ids={"data": BlockInstanceId("source_text")},
+        ),
     )
     builder = BlueprintBuilder(
-        blocks={BlockInstanceId("source_text"): source_text, BlockInstanceId("sink_file"): sink_file},
+        blocks=[
+            source_text,
+            sink_file,
+        ],
         local_glyphs={"compositeLocalGlyph": "${compositeExpandGlobalPart}/${runId}"},
     )
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert response.is_success, response.text
     data = response.json()
     assert len(data["global_errors"]) == 0
     assert len(data["block_errors"]) == 0
     # Fetch the intrinsic runId example to verify the fully-resolved composite value
-    glyphs_resp = backend_client_with_auth.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
+    glyphs_resp = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
     assert glyphs_resp.is_success, glyphs_resp.text
     run_id_example = next(g["valueExample"] for g in glyphs_resp.json()["glyphs"] if g["name"] == "runId")
     resolved_text = data["resolved_configuration_options"]["source_text"]["text"]
     assert resolved_text == f"global_part/{run_id_example}", f"Unexpected: {resolved_text!r}"
 
-    # A local glyph that references an unknown glyph must surface as a block_error,
+    # A local glyph that references an unknown glyph surfaces as a missing_glyph warning,
     # even though the composite glyph key itself is known.
-    sink_file_missing = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output.txt"},
-        input_ids={"data": BlockInstanceId("source_text")},
+    sink_file_missing = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file_missing"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output.txt"}),
+            input_ids={"data": BlockInstanceId("source_text")},
+        ),
     )
     builder_nested_unknown = BlueprintBuilder(
-        blocks={BlockInstanceId("source_text"): source_text, BlockInstanceId("sink_file"): sink_file_missing},
+        blocks=[
+            source_text,
+            sink_file_missing.model_copy(update={"instance_id": BlockInstanceId("sink_file")}),
+        ],
         local_glyphs={"compositeLocalGlyph": "${compositeExpandGlobalPart}/${notDefinedAnywhere}"},
     )
-    response_nested = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_nested_unknown.model_dump())
+    response_nested = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_nested_unknown.model_dump())
     assert response_nested.is_success, response_nested.text
     nested_data = response_nested.json()
-    assert "source_text" in nested_data["block_errors"]
-    assert any("notDefinedAnywhere" in err for err in nested_data["block_errors"]["source_text"])
+    assert "source_text" not in nested_data["block_errors"]
+    assert "source_text" in nested_data["missing_glyphs"]
+    assert nested_data["missing_glyphs"]["source_text"]["text"] == ["notDefinedAnywhere"]
 
     # A builder with a circular glyph reference must report a global_error
     builder_cyclic = BlueprintBuilder(
-        blocks={BlockInstanceId("source_text"): source_text, BlockInstanceId("sink_file"): sink_file},
+        blocks=[
+            source_text,
+            sink_file,
+        ],
         local_glyphs={"compositeLocalGlyph": "${compositeLocalGlyph}/suffix"},
     )
-    response_cyclic = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_cyclic.model_dump())
+    response_cyclic = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_cyclic.model_dump())
     assert response_cyclic.is_success, response_cyclic.text
     cyclic_data = response_cyclic.json()
     assert len(cyclic_data["global_errors"]) > 0
@@ -656,21 +1353,27 @@ def test_blueprint_composite_glyph_expand(tmpdir: Any, backend_client_with_auth:
     # A local glyph whose value contains a jinja filter expression referencing an intrinsic
     # glyph must be fully evaluated via expand_glyph_values (regression test for the
     # fix that extended expand_glyph_values to handle jinja expressions, not just plain ${var}).
-    glyphs_resp2 = backend_client_with_auth.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
+    glyphs_resp2 = backend_client_user.get("/blueprint/glyphs/list", params={"glyph_type": "intrinsic"})
     assert glyphs_resp2.is_success, glyphs_resp2.text
     submit_example = next(g["valueExample"] for g in glyphs_resp2.json()["glyphs"] if g["name"] == "submitDatetime")
     # floor_day of the example value: strip time component
-    expected_floored = submit_example[:10] + " 00:00:00"
-    source_jinja = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_text")),
-        configuration_values={"text": "${jinjaFilterGlyph}"},
-        input_ids={},
+    expected_floored = submit_example[:10] + "T00:00:00+00:00"
+    source_jinja = RoutableBlock(
+        instance_id=BlockInstanceId("source_jinja"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_text"),
+        instance=BlockInstance(
+            configuration_values=_config({"text": "${jinjaFilterGlyph}"}),
+            input_ids={},
+        ),
     )
     builder_jinja = BlueprintBuilder(
-        blocks={BlockInstanceId("source_jinja"): source_jinja},
+        blocks=[
+            source_jinja,
+        ],
         local_glyphs={"jinjaFilterGlyph": "${submitDatetime | floor_day}"},
     )
-    response_jinja = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_jinja.model_dump())
+    response_jinja = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_jinja.model_dump())
     assert response_jinja.is_success, response_jinja.text
     jinja_data = response_jinja.json()
     assert len(jinja_data["global_errors"]) == 0, jinja_data["global_errors"]
@@ -678,8 +1381,15 @@ def test_blueprint_composite_glyph_expand(tmpdir: Any, backend_client_with_auth:
     resolved_jinja = jinja_data["resolved_configuration_options"]["source_jinja"]["text"]
     assert resolved_jinja == expected_floored, f"Expected {expected_floored!r}, got {resolved_jinja!r}"
 
+    # Clean up the global glyph created in this test
+    del_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/delete",
+        json={"global_glyph_id": post_resp.json()["global_glyph_id"]},
+    )
+    assert del_resp.is_success, del_resp.text
 
-def test_blueprint_jinja_interpolation_expand(backend_client_with_auth: httpx.Client) -> None:
+
+def test_blueprint_jinja_interpolation_expand(backend_client_user: httpx.Client) -> None:
     """Jinja interpolation is validated and resolved via the /expand endpoint.
 
     Covers:
@@ -692,72 +1402,120 @@ def test_blueprint_jinja_interpolation_expand(backend_client_with_auth: httpx.Cl
       resolved value appears in resolved_configuration_options.
     """
     # Malformed: hyphens make `this-is-no-filter` parsed as subtraction; the resulting "glyph"
-    # names (is, no, filter) are unknown, so the block gets an error entry.
-    source_malformed = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_text")),
-        configuration_values={"text": "${startDatetime | this-is-no-filter}"},
-        input_ids={},
+    # names (is, no, filter) are unknown, so the block gets a missing_glyph entry.
+    source_malformed = RoutableBlock(
+        instance_id=BlockInstanceId("source_malformed"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_text"),
+        instance=BlockInstance(
+            configuration_values=_config({"text": "${startDatetime | this-is-no-filter}"}),
+            input_ids={},
+        ),
     )
-    builder_malformed = BlueprintBuilder(blocks={BlockInstanceId("source_text"): source_malformed})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_malformed.model_dump())
+    builder_malformed = BlueprintBuilder(
+        blocks=[
+            source_malformed.model_copy(update={"instance_id": BlockInstanceId("source_text")}),
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_malformed.model_dump())
     assert response.is_success, response.text
     data = response.json()
-    assert "source_text" in data["block_errors"], f"Expected block error for malformed jinja: {data}"
-    assert any("Unknown glyphs referenced" in err for err in data["block_errors"]["source_text"])
+    assert "source_text" not in data["block_errors"], f"Expected no block error, got: {data['block_errors']}"
+    assert "source_text" in data["missing_glyphs"], f"Expected missing_glyphs entry for unknown glyph names: {data}"
 
     # Well-formed: pure jinja arithmetic using registered globals (datetime, timedelta) and filter (floor_day).
     # Parentheses are required because Jinja2's | (filter) has higher precedence than +.
-    # (datetime(2024, 1, 15) + timedelta(days=1)) | floor_day = 2024-01-16 00:00:00
-    source_wellformed = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_text")),
-        configuration_values={"text": "${(datetime(2024, 1, 15) + timedelta(days=1)) | floor_day}"},
-        input_ids={},
+    # (datetime(2024, 1, 15) + timedelta(days=1)) | floor_day = 2024-01-16T00:00:00
+    source_wellformed = RoutableBlock(
+        instance_id=BlockInstanceId("source_wellformed"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_text"),
+        instance=BlockInstance(
+            configuration_values=_config({"text": "${(datetime(2024, 1, 15) + timedelta(days=1)) | floor_day}"}),
+            input_ids={},
+        ),
     )
-    builder_wellformed = BlueprintBuilder(blocks={BlockInstanceId("source_text"): source_wellformed})
-    response = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder_wellformed.model_dump())
+    builder_wellformed = BlueprintBuilder(
+        blocks=[
+            source_wellformed.model_copy(update={"instance_id": BlockInstanceId("source_text")}),
+        ]
+    )
+    response = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_wellformed.model_dump())
     assert response.is_success, response.text
     data = response.json()
     assert len(data["block_errors"]) == 0, data["block_errors"]
     resolved = data["resolved_configuration_options"]["source_text"]["text"]
-    assert resolved == "2024-01-16 00:00:00", f"Unexpected resolved value: {resolved!r}"
+    assert resolved == "2024-01-16T00:00:00", f"Unexpected resolved value: {resolved!r}"
 
 
-def test_blueprint_composite_glyph_execute(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
+def test_blueprint_composite_glyph_execute(tmpdir: Any, backend_client_user: httpx.Client) -> None:
     """Execute a blueprint whose config value is resolved via a composite local glyph.
 
     The composite glyph ``${compositeExecGlobalPart}/${runId}`` must be fully expanded
     at runtime and the output must reflect the expanded value.
     On restart the runId component must remain stable (runId is preserved, not pinned).
     """
-    post_resp = backend_client_with_auth.post(
+    post_resp = backend_client_user.post(
         "/blueprint/glyphs/global/post",
         json={"key": "compositeExecGlobalPart", "value": "exec_global"},
     )
     assert post_resp.is_success, post_resp.text
 
-    source_text = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_text")),
-        configuration_values={"text": "${compositeLocalGlyphExec}"},
-        input_ids={},
+    source_text = RoutableBlock(
+        instance_id=BlockInstanceId("source_text"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_text"),
+        instance=BlockInstance(
+            configuration_values=_config({"text": "${compositeLocalGlyphExec}"}),
+            input_ids={},
+        ),
     )
-    sink_file = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/composite_exec_output.txt"},
-        input_ids={"data": BlockInstanceId("source_text")},
+    sink_file = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/composite_exec_output.txt"}),
+            input_ids={"data": BlockInstanceId("source_text")},
+        ),
+    )
+    sink_file_2 = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file_2"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/composite_exec_output_2.txt"}),
+            input_ids={"data": BlockInstanceId("source_text")},
+        ),
     )
     builder = BlueprintBuilder(
-        blocks={BlockInstanceId("source_text"): source_text, BlockInstanceId("sink_file"): sink_file},
+        blocks=[
+            source_text,
+            sink_file,
+            sink_file_2,
+        ],
         local_glyphs={"compositeLocalGlyphExec": "${compositeExecGlobalPart}/${runId}"},
     )
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+    save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
     assert save_resp.is_success, save_resp.text
     blueprint_id = save_resp.json()["blueprint_id"]
 
-    exec_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
+    exec_resp = backend_client_user.post("/run/create", json={"blueprint_id": blueprint_id})
     assert exec_resp.is_success, exec_resp.text
     run_id = exec_resp.json()["run_id"]
 
-    ensure_completed_v2(backend_client_with_auth, run_id, sleep=1, attempts=120)
+    ensure_completed_v2(backend_client_user, run_id, sleep=1, attempts=120)
+
+    # Verify compilation detail is accessible and has the expected number of tasks
+    detail_resp = backend_client_user.get("/run/getCompilationDetail", params={"run_id": run_id})
+    assert detail_resp.is_success, detail_resp.text
+    detail = CompilationDetailResponse.model_validate(detail_resp.json())
+    assert len(detail.tasks) == 3, f"Expected 3 tasks, got {len(detail.tasks)}: {detail.tasks}"
+    assert {task.block for task in detail.tasks} == {
+        BlockInstanceId("source_text"),
+        BlockInstanceId("sink_file"),
+        BlockInstanceId("sink_file_2"),
+    }
 
     output = pathlib.Path(f"{tmpdir}/composite_exec_output.txt")
     content = output.read_text()
@@ -765,10 +1523,153 @@ def test_blueprint_composite_glyph_execute(tmpdir: Any, backend_client_with_auth
     assert content == f"exec_global/{run_id}", f"Unexpected output: {content!r}"
     output.unlink()
 
+    output_2 = pathlib.Path(f"{tmpdir}/composite_exec_output_2.txt")
+    content_2 = output_2.read_text()
+    assert content_2 == f"exec_global/{run_id}", f"Unexpected output: {content_2!r}"
+    output_2.unlink()
+
+    # Clean up the global glyph created in this test
+    del_resp = backend_client_user.post(
+        "/blueprint/glyphs/global/delete",
+        json={"global_glyph_id": post_resp.json()["global_glyph_id"]},
+    )
+    assert del_resp.is_success, del_resp.text
+
+
+def test_blueprint_nullable_option(tmpdir: Any, backend_client_user: httpx.Client) -> None:
+    """An option declared as ``union[str,none]`` accepts an explicit null, but not a missing value.
+
+    The ``source_text`` block declares its ``text`` option as nullable, and its runtime imputes
+    a default when the value is null. This test covers that:
+    - a *missing* value passes validation but fails compilation,
+    - an *explicit null* passes both, and the runtime default is applied.
+    """
+    fname = f"{tmpdir}/nullable_output_${{runId}}.txt"
+
+    def plugin_status() -> dict:
+        response = backend_client_user.get("/status", timeout=10)
+        assert response.is_success
+        return response.json()
+
+    retry_until(
+        plugin_status,
+        lambda data: data if data.get("plugins") == "ok" else None,
+        attempts=30,
+        sleep=1.0,
+        error_msg="Plugin loader did not reach 'ok' status",
+    )
+
+    def make_builder(configuration_values: dict[ConfigurationOptionId, Any]) -> BlueprintBuilder:
+        source_text = RoutableBlock(
+            instance_id=BlockInstanceId("source_text"),
+            plugin=testPluginId,
+            factory=BlockFactoryId("source_text"),
+            instance=BlockInstance(
+                configuration_values=configuration_values,
+                input_ids={},
+            ),
+        )
+        sink_file = RoutableBlock(
+            instance_id=BlockInstanceId("sink_file"),
+            plugin=testPluginId,
+            factory=BlockFactoryId("sink_file"),
+            instance=BlockInstance(
+                configuration_values=_config({"fname": fname}),
+                input_ids={"data": BlockInstanceId("source_text")},
+            ),
+        )
+        return BlueprintBuilder(blocks=[source_text, sink_file])
+
+    def submit(builder: BlueprintBuilder) -> str:
+        save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+        assert save_resp.is_success, save_resp.text
+        exec_resp = backend_client_user.post("/run/create", json={"blueprint_id": save_resp.json()["blueprint_id"]})
+        assert exec_resp.is_success, exec_resp.text
+        return exec_resp.json()["run_id"]
+
+    def poll_run(run_id: str) -> Any:
+        resp = backend_client_user.get("/run/get", params={"run_id": run_id}, timeout=10)
+        assert resp.is_success, resp.text
+        return resp.json()
+
+    def verify_failed(data: Any) -> bool | None:
+        if data["status"] == "failed":
+            return True
+        if data["status"] == "completed":
+            raise RuntimeError(f"Unexpected successful run: {data}")
+        return None
+
+    # --- Step 1: no value at all -- validation passes, compilation fails on the missing option ---
+    builder_missing = make_builder({})
+    expand_resp = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_missing.model_dump())
+    assert expand_resp.is_success, expand_resp.text
+    assert not expand_resp.json()["block_errors"], expand_resp.text
+
+    run_id_missing = submit(builder_missing)
+    retry_until(
+        lambda: poll_run(run_id_missing),
+        verify_failed,
+        attempts=60,
+        sleep=1.0,
+        error_msg=f"Run {run_id_missing} never failed",
+    )
+    error = poll_run(run_id_missing)["error"]
+    assert "missing configuration options" in error and "text" in error, error
+
+    # --- Step 2: explicit null -- validation and compilation both pass ---
+    builder_null = make_builder({ConfigurationOptionId("text"): None})
+    expand_resp = backend_client_user.request(url="/blueprint/expand", method="put", json=builder_null.model_dump())
+    assert expand_resp.is_success, expand_resp.text
+    assert not expand_resp.json()["block_errors"], expand_resp.text
+    # the null value carries no glyphs, hence it is not part of the glyph resolution
+    assert expand_resp.json()["resolved_configuration_options"].get("source_text", {}).get("text") is None
+
+    run_id_null = submit(builder_null)
+    ensure_completed_v2(backend_client_user, run_id_null, sleep=1, attempts=120)
+
+    output = pathlib.Path(f"{tmpdir}/nullable_output_{run_id_null}.txt")
+    assert output.read_text() == "Hic Sunt Leones", output.read_text()
+    output.unlink()
+
+    # --- Step 3: the run detail reports the resolution, with no value for the nulled option ---
+    detail = poll_run(run_id_null)
+    resolution = detail["resolution"]
+    assert resolution["sink_file"]["fname"] == f"{tmpdir}/nullable_output_{run_id_null}.txt"
+    assert resolution.get("source_text", {}).get("text") is None
+
 
 # ---------------------------------------------------------------------------
 # Run delete and output-content tests
 # ---------------------------------------------------------------------------
+
+
+def _make_builder_sleeper() -> BlueprintBuilder:
+    """A source sleeping for 30s, followed by a sink."""
+    sleeper = RoutableBlock(
+        instance_id=BlockInstanceId("sleeper"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_sleep"),
+        instance=BlockInstance(
+            configuration_values=_config({"text": "hello", "duration": "30"}),
+            input_ids={},
+        ),
+    )
+    sink = RoutableBlock(
+        instance_id=BlockInstanceId("sink"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": "/dev/null"}),
+            input_ids={"data": BlockInstanceId("sleeper")},
+        ),
+    )
+    builder = BlueprintBuilder(
+        blocks=[
+            sleeper,
+            sink.model_copy(update={"instance_id": BlockInstanceId("sleeper_sink")}),
+        ]
+    )
+    return builder
 
 
 def _make_builder_source_and_sink(tmpdir: str) -> BlueprintBuilder:
@@ -777,126 +1678,164 @@ def _make_builder_source_and_sink(tmpdir: str) -> BlueprintBuilder:
     Produces exactly one non-sink task (source_42) whose output is the integer 42,
     and one sink task (sink_file).
     """
-    source_42 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_42")),
-        configuration_values={},
-        input_ids={},
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
     )
-    sink = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output_${{runId}}.txt"},
-        input_ids={"data": BlockInstanceId("source_42")},
-    )
-    return BlueprintBuilder(blocks={BlockInstanceId("source_42"): source_42, BlockInstanceId("my_sink"): sink})
-
-
-def _make_builder_source_and_two_sinks(tmpdir: str) -> BlueprintBuilder:
-    """Blueprint with source_42 → sink_file and source_42 → sink_image."""
-    source_42 = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_42")),
-        configuration_values={},
-        input_ids={},
-    )
-    sink_file = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/output_${{runId}}.txt"},
-        input_ids={"data": BlockInstanceId("source_42")},
-    )
-    sink_image = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_image")),
-        configuration_values={},
-        input_ids={"data": BlockInstanceId("source_42")},
+    sink = RoutableBlock(
+        instance_id=BlockInstanceId("sink"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output_${{runId}}.txt"}),
+            input_ids={"data": BlockInstanceId("source_42")},
+        ),
     )
     return BlueprintBuilder(
-        blocks={
-            BlockInstanceId("source_42"): source_42,
-            BlockInstanceId("my_sink"): sink_file,
-            BlockInstanceId("my_image_sink"): sink_image,
-        }
+        blocks=[
+            source_42,
+            sink.model_copy(update={"instance_id": BlockInstanceId("my_sink")}),
+        ]
     )
 
 
-def test_run_delete_not_found(backend_client_with_auth: httpx.Client) -> None:
+def _make_builder_source_and_two_sinks(tmpdir: str, images: int = 1, filetree: bool = False) -> BlueprintBuilder:
+    """Blueprint with source_42 → sink_file and source_42 → sink_image, the latter producing `images` outputs.
+
+    With `filetree`, a sink_filetree block is added as well."""
+    source_42 = RoutableBlock(
+        instance_id=BlockInstanceId("source_42"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_42"),
+        instance=BlockInstance(
+            configuration_values={},
+            input_ids={},
+        ),
+    )
+    sink_file = RoutableBlock(
+        instance_id=BlockInstanceId("sink_file"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/output_${{runId}}.txt"}),
+            input_ids={"data": BlockInstanceId("source_42")},
+        ),
+    )
+    sink_image = RoutableBlock(
+        instance_id=BlockInstanceId("sink_image"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_image"),
+        instance=BlockInstance(
+            configuration_values=_config({"images": str(images)}),
+            input_ids={"data": BlockInstanceId("source_42")},
+        ),
+    )
+    sink_filetree = RoutableBlock(
+        instance_id=BlockInstanceId("my_tree_sink"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_filetree"),
+        instance=BlockInstance(
+            configuration_values=_config({"path_root": f"{tmpdir}/tree_${{runId}}", "depth": "2"}),
+            input_ids={"data": BlockInstanceId("source_42")},
+        ),
+    )
+    return BlueprintBuilder(
+        blocks=[
+            source_42,
+            sink_file.model_copy(update={"instance_id": BlockInstanceId("my_sink")}),
+            sink_image.model_copy(update={"instance_id": BlockInstanceId("my_image_sink")}),
+            *([sink_filetree] if filetree else []),
+        ]
+    )
+
+
+def test_run_delete_not_found(backend_client_user: httpx.Client) -> None:
     """POST /run/delete with a non-existent run_id returns 404."""
-    resp = backend_client_with_auth.post("/run/delete", json={"run_id": "nonexistent-run-id", "attempt_count": 1})
+    resp = backend_client_user.post("/run/delete", json={"run_id": "nonexistent-run-id", "attempt_count": 1})
     assert resp.status_code == 404
 
 
-def test_run_delete_attempt_conflict(backend_client_with_auth: httpx.Client) -> None:
-    """POST /run/delete with a mismatched attempt_count returns 409."""
-    builder = _make_builder_source_only()
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
-    assert save_resp.is_success, save_resp.text
-    blueprint_id = save_resp.json()["blueprint_id"]
-
-    run_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
-    assert run_resp.is_success, run_resp.text
-    run_id = run_resp.json()["run_id"]
-    attempt_count = run_resp.json()["attempt_count"]
-
-    del_resp = backend_client_with_auth.post("/run/delete", json={"run_id": run_id, "attempt_count": attempt_count + 1})
-    assert del_resp.status_code == 409
-
-
-def test_run_restart_attempt_conflict(backend_client_with_auth: httpx.Client) -> None:
+def test_run_restart_attempt_conflict(backend_client_user: httpx.Client) -> None:
     """POST /run/restart with a mismatched attempt_count returns 409."""
     builder = _make_builder_source_only()
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+    save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
     assert save_resp.is_success, save_resp.text
     blueprint_id = save_resp.json()["blueprint_id"]
 
-    run_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
+    run_resp = backend_client_user.post("/run/create", json={"blueprint_id": blueprint_id})
     assert run_resp.is_success, run_resp.text
     run_id = run_resp.json()["run_id"]
     attempt_count = run_resp.json()["attempt_count"]
 
-    restart_resp = backend_client_with_auth.post("/run/restart", json={"run_id": run_id, "attempt_count": attempt_count + 1})
+    restart_resp = backend_client_user.post("/run/restart", json={"run_id": run_id, "attempt_count": attempt_count + 1})
     assert restart_resp.status_code == 409
 
 
-def test_run_delete_ok(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
-    """Create a run, wait for completion, delete it, verify it disappears."""
-    builder = _make_builder_source_and_sink(tmpdir)
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
-    assert save_resp.is_success, save_resp.text
-    blueprint_id = save_resp.json()["blueprint_id"]
+def test_delete_stop_ok(tmpdir: Any, backend_client_user: httpx.Client) -> None:
+    """Delete and stop of runs, on a short task that completes and on a long task that is stopped."""
 
-    run_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
-    assert run_resp.is_success, run_resp.text
-    run_id = run_resp.json()["run_id"]
-    attempt_count = run_resp.json()["attempt_count"]
+    def assert_gone(run_id: str) -> None:
+        assert backend_client_user.get("/run/get", params={"run_id": run_id}, timeout=30).status_code == 404
+        listed = backend_client_user.get("/run/list", timeout=30).raise_for_status().json()
+        assert run_id not in [r["run_id"] for r in listed["runs"]]
 
-    ensure_completed_v2(backend_client_with_auth, run_id, sleep=1, attempts=120)
+    # --- a) short-task: a completed run cannot be stopped, but can be deleted ---
+    run_id, attempt_count = _create_run(backend_client_user, _make_builder_source_and_sink(tmpdir))
+    ensure_completed_v2(backend_client_user, run_id, sleep=1, attempts=120)
 
-    total_before = backend_client_with_auth.get("/run/list").raise_for_status().json()["total"]
+    refused = backend_client_user.post("/run/stop", json={"run_id": run_id, "attempt_count": attempt_count})
+    assert refused.status_code == 409, refused.text
+    assert _ensure_run_status(backend_client_user, run_id, {"completed"}) == "completed"
 
-    del_resp = backend_client_with_auth.post("/run/delete", json={"run_id": run_id, "attempt_count": attempt_count})
+    del_resp = backend_client_user.post("/run/delete", json={"run_id": run_id, "attempt_count": attempt_count})
     assert del_resp.is_success, del_resp.text
+    assert_gone(run_id)
 
-    # Deleted run is no longer accessible
-    get_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id})
-    assert get_resp.status_code == 404
+    missing = backend_client_user.post("/run/stop", json={"run_id": run_id, "attempt_count": attempt_count})
+    assert missing.status_code == 404, missing.text
 
-    # And no longer appears in the list
-    list_after = backend_client_with_auth.get("/run/list").raise_for_status().json()
-    assert list_after["total"] == total_before - 1
-    assert run_id not in [r["run_id"] for r in list_after["runs"]]
+    # --- b) long-task: a running run cannot be deleted, is stopped (idempotently), retained, and then can be deleted ---
+    # NOTE we dont care whether the stop is applied at compile or at submitted time
+    run_id, attempt_count = _create_run(backend_client_user, _make_builder_sleeper())
+
+    refused = backend_client_user.post("/run/delete", json={"run_id": run_id, "attempt_count": attempt_count})
+    assert refused.status_code == 409, refused.text
+
+    stop_resp = backend_client_user.post("/run/stop", json={"run_id": run_id, "attempt_count": attempt_count})
+    assert stop_resp.is_success, stop_resp.text
+    assert _ensure_run_status(backend_client_user, run_id, {"stopped"}) == "stopped"
+
+    again = backend_client_user.post("/run/stop", json={"run_id": run_id, "attempt_count": attempt_count})
+    assert again.is_success, again.text
+    assert _ensure_run_status(backend_client_user, run_id, {"stopped"}) == "stopped"
+
+    listed = backend_client_user.get("/run/list", timeout=30).raise_for_status().json()["runs"]
+    assert [r["status"] for r in listed if r["run_id"] == run_id] == ["stopped"]
+
+    del_resp = backend_client_user.post("/run/delete", json={"run_id": run_id, "attempt_count": attempt_count}, timeout=30)
+    assert del_resp.is_success, del_resp.text
+    assert_gone(run_id)
 
 
-def test_run_output_content(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
+def test_run_output_content(tmpdir: Any, backend_client_user: httpx.Client) -> None:
     """Execute a run, wait for completion, then retrieve output content via outputContent."""
-    builder = _make_builder_source_and_two_sinks(tmpdir)
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+    builder = _make_builder_source_and_two_sinks(tmpdir, images=3, filetree=True)
+    save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
     assert save_resp.is_success, save_resp.text
     blueprint_id = save_resp.json()["blueprint_id"]
 
-    run_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
+    run_resp = backend_client_user.post("/run/create", json={"blueprint_id": blueprint_id})
     assert run_resp.is_success, run_resp.text
     run_id = run_resp.json()["run_id"]
 
-    ensure_completed_v2(backend_client_with_auth, run_id, sleep=1, attempts=120)
+    ensure_completed_v2(backend_client_user, run_id, sleep=1, attempts=120)
 
-    get_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id})
+    get_resp = backend_client_user.get("/run/get", params={"run_id": run_id})
     assert get_resp.is_success, get_resp.text
     run_detail = get_resp.json()
     assert run_detail["outputs"] is not None
@@ -907,23 +1846,30 @@ def test_run_output_content(tmpdir: Any, backend_client_with_auth: httpx.Client)
     # Cascade only exposes sink tasks as ext_outputs; our blueprint has two sinks.
     # Task IDs encode the runtime function name: fiab_plugin_test.runtime.sink_file:<hash>
     # and fiab_plugin_test.runtime.sink_image:<hash>
-    sink_file_tasks = [t for t in available_tasks if "sink_file" in t]
+    sink_file_tasks = [t for t in available_tasks if "sink_file" in t and "sink_filetree" not in t]
     assert len(sink_file_tasks) == 1, f"Expected exactly one sink_file task, got: {available_tasks}"
     sink_file_task_id = sink_file_tasks[0]
 
     sink_image_tasks = [t for t in available_tasks if "sink_image" in t]
-    assert len(sink_image_tasks) == 1, f"Expected exactly one sink_image task, got: {available_tasks}"
-    sink_image_task_id = sink_image_tasks[0]
+    assert len(sink_image_tasks) == 3, f"Expected exactly three sink_image tasks, got: {available_tasks}"
 
     # Verify original_block points to the correct block instance IDs from the blueprint
     assert output_entries[sink_file_task_id]["original_block"] == "my_sink"
-    assert output_entries[sink_image_task_id]["original_block"] == "my_image_sink"
+    for task_id in sink_image_tasks:
+        assert output_entries[task_id]["original_block"] == "my_image_sink"
 
     # Verify declared mime_type matches the actual content-type returned by outputContent
     assert output_entries[sink_file_task_id]["mime_type"] == "text/plain"
-    assert output_entries[sink_image_task_id]["mime_type"] == "image/png"
+    for task_id in sink_image_tasks:
+        assert output_entries[task_id]["mime_type"] == "image/png"
 
-    content_resp = backend_client_with_auth.get(
+    # Verify display_name and dimension_kvs declared by the plugin are propagated
+    assert output_entries[sink_file_task_id]["display_name"] == "The Display Name"
+    assert output_entries[sink_file_task_id]["dimension_kvs"] == [["dimOne", "valOne"]]
+    image_labels = sorted((output_entries[t]["display_name"], output_entries[t]["dimension_kvs"]) for t in sink_image_tasks)
+    assert image_labels == [(f"Image #{idx}", [["idx", str(idx)]]) for idx in range(3)]
+
+    content_resp = backend_client_user.get(
         "/run/outputContent",
         params={"run_id": run_id, "dataset_id": sink_file_task_id},
         # macOS has a delayed first cloudpickle import under forking; give it more time
@@ -936,17 +1882,40 @@ def test_run_output_content(tmpdir: Any, backend_client_with_auth: httpx.Client)
 
     if sys.platform == "darwin":
         # Re-fetch without an extended timeout to confirm the import delay was a one-off
-        content_resp2 = backend_client_with_auth.get("/run/outputContent", params={"run_id": run_id, "dataset_id": sink_file_task_id})
+        content_resp2 = backend_client_user.get("/run/outputContent", params={"run_id": run_id, "dataset_id": sink_file_task_id})
         assert content_resp2.headers.get("content-type", "").startswith("text/plain")
         assert content_resp2.content.decode("ascii").startswith("file://")
 
-    image_resp = backend_client_with_auth.get(
-        "/run/outputContent",
-        params={"run_id": run_id, "dataset_id": sink_image_task_id},
-    )
-    assert image_resp.is_success, image_resp.text
-    assert image_resp.headers.get("content-type", "").startswith("image/png")
-    assert len(image_resp.content) > 0
+    image_contents = set()
+    for task_id in sink_image_tasks:
+        image_resp = backend_client_user.get(
+            "/run/outputContent",
+            params={"run_id": run_id, "dataset_id": task_id},
+        )
+        assert image_resp.is_success, image_resp.text
+        assert image_resp.headers.get("content-type", "").startswith("image/png")
+        assert len(image_resp.content) > 0
+        image_contents.add(image_resp.content)
+    # Each task index yields a distinct grayscale value
+    assert len(image_contents) == 3
+
+    # Fetchable output is returned as a zip preserving relative paths
+    tree_tasks = [t for t in available_tasks if "sink_filetree" in t]
+    assert len(tree_tasks) == 1, f"Expected exactly one sink_filetree task, got: {available_tasks}"
+    zip_resp = backend_client_user.get("/run/outputZipped", params={"run_id": run_id, "dataset_id": tree_tasks[0]})
+    assert zip_resp.is_success, zip_resp.text
+    assert zip_resp.headers.get("content-type", "").startswith("application/zip")
+    with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+        assert zf.testzip() is None
+        root = f"tree_{run_id}"
+        assert f"{root}/d1/d2/file" in zf.namelist()
+        assert zf.read(f"{root}/d1/d2/file").decode() == "42"
+        assert zip_resp.headers["content-disposition"].endswith(f'{root}.zip"')
+
+    # Non-fetchable outputs are refused
+    for task_id in (sink_file_task_id, sink_image_tasks[0]):
+        refused = backend_client_user.get("/run/outputZipped", params={"run_id": run_id, "dataset_id": task_id})
+        assert refused.status_code == 400, refused.text
 
 
 def _wait_until_running(client: httpx.Client, run_id: str, sleep: float = 1.0, attempts: int = 60) -> None:
@@ -964,46 +1933,109 @@ def _wait_until_running(client: httpx.Client, run_id: str, sleep: float = 1.0, a
     retry_until(do_action, verify_ok, attempts=attempts, sleep=sleep, error_msg=f"Run {run_id} never reached 'running'")
 
 
-@pytest.mark.skip("leaves hanging process behind")
-def test_gateway_restart_with_in_progress_job(backend_client_with_auth: httpx.Client) -> None:
-    """Kill the gateway while a job is active; verify the expected status transitions."""
-    sleeper = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_sleep")),
-        configuration_values={"text": "hello", "duration": "30"},
-        input_ids={},
+def _ensure_run_status(client: httpx.Client, run_id: str, wanted: set[str], sleep: float = 1.0, attempts: int = 60) -> str:
+    """Poll until the run reports one of the wanted statuses.
+
+    While the gateway is busy with a stop, the polls may time out in the gateway and report `unknown`
+    which is a transient state here and is thus retried.
+    """
+
+    def do_action() -> Any:
+        resp = client.get("/run/get", params={"run_id": run_id}, timeout=30)
+        assert resp.is_success, resp.text
+        return resp.json()
+
+    def verify_ok(data: Any) -> str | None:
+        return data["status"] if data["status"] in wanted else None
+
+    return cast(
+        str, retry_until(do_action, verify_ok, attempts=attempts, sleep=sleep, error_msg=f"Run {run_id} never reached any of {wanted}")
     )
-    sink = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": "/dev/null"},
-        input_ids={"data": BlockInstanceId("sleeper")},
-    )
-    builder = BlueprintBuilder(blocks={BlockInstanceId("sleeper"): sleeper, BlockInstanceId("sleeper_sink"): sink})
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+
+
+def _create_run(client: httpx.Client, builder: BlueprintBuilder) -> tuple[str, int]:
+    save_resp = client.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+    assert save_resp.is_success, save_resp.text
+    run_resp = client.post("/run/create", json={"blueprint_id": save_resp.json()["blueprint_id"]})
+    assert run_resp.is_success, run_resp.text
+    return run_resp.json()["run_id"], run_resp.json()["attempt_count"]
+
+
+# @pytest.mark.skip("leaves hanging process behind")
+def test_gateway_restart_with_in_progress_job(tmpdir: Any, backend_client_user: httpx.Client) -> None:
+    """Kill the gateway while a job is active; verify the expected status transitions.
+
+    A simple two-output job is submitted and completed before the gateway is killed.
+    After the restart, its cached text output remains available while the uncached
+    binary output is reported as lost.
+    """
+    # --- Step 1: submit a simple job that completes quickly and has textual and binary outputs ---
+    simple_builder = _make_builder_source_and_two_sinks(str(tmpdir))
+    simple_save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=simple_builder).model_dump())
+    assert simple_save_resp.is_success, simple_save_resp.text
+    simple_blueprint_id = simple_save_resp.json()["blueprint_id"]
+
+    simple_run_resp = backend_client_user.post("/run/create", json={"blueprint_id": simple_blueprint_id})
+    assert simple_run_resp.is_success, simple_run_resp.text
+    simple_run_id = simple_run_resp.json()["run_id"]
+
+    # Wait until the simple job completes (and its textual value is cached in the DB)
+    ensure_completed_v2(backend_client_user, simple_run_id, sleep=1, attempts=120)
+
+    # Identify the sink_file output task id
+    simple_detail = backend_client_user.get("/run/get", params={"run_id": simple_run_id}).raise_for_status().json()
+    simple_outputs = simple_detail["outputs"]["outputs"]
+    simple_available = [tid for tid, char in simple_outputs.items() if char["is_available"] and "sink_file" in tid]
+    assert len(simple_available) == 1, f"Expected exactly one available sink_file task, got: {simple_outputs}"
+    simple_sink_task_id = simple_available[0]
+    simple_image_tasks = [tid for tid, char in simple_outputs.items() if char["is_available"] and "sink_image" in tid]
+    assert len(simple_image_tasks) == 1, f"Expected exactly one available sink_image task, got: {simple_outputs}"
+    simple_image_task_id = simple_image_tasks[0]
+
+    # Sanity check: output is accessible while cascade is still up
+    content_resp = backend_client_user.get("/run/outputContent", params={"run_id": simple_run_id, "dataset_id": simple_sink_task_id})
+    assert content_resp.is_success, content_resp.text
+    assert content_resp.content.decode("utf-8").startswith("file://")
+
+    # --- Step 2: submit a long-running sleeper job ---
+    builder = _make_builder_sleeper()
+    save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
     assert save_resp.is_success, save_resp.text
     blueprint_id = save_resp.json()["blueprint_id"]
 
-    run_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
+    run_resp = backend_client_user.post("/run/create", json={"blueprint_id": blueprint_id})
     assert run_resp.is_success, run_resp.text
     run_id = run_resp.json()["run_id"]
 
-    _wait_until_running(backend_client_with_auth, run_id)
+    _wait_until_running(backend_client_user, run_id)
 
-    # TODO this leaves the workers hanging. We need some solution to collect them properly
-    kill_resp = backend_client_with_auth.post("/gateway/kill")
-    assert kill_resp.is_success, kill_resp.text
+    # --- Step 3: kill the gateway ---
+    # NOTE the kill is processed in the background, and blocks the gateway for a while
+    with connect_notification_websocket(backend_client_user) as websocket:
+        kill_resp = backend_client_user.post("/gateway/kill")
+        assert kill_resp.is_success, kill_resp.text
+        notification, _ = wait_next_notification(websocket, "gateway", "gatewayStopped", total_timeout=60)
+        assert notification.text == "Gateway stopped successfully"
+        assert notification.detailRoute == "/api/v1/gateway/status"
+        assert notification.refreshRoutes == ["/api/v1/gateway/status"]
+
+        # Confirm the notification is consistent with the gateway status endpoint.
+        status_resp = backend_client_user.get("/gateway/status", timeout=10)
+        assert status_resp.is_success, status_resp.text
+        assert status_resp.json() == "not started"
 
     # Polling while the gateway is down returns "unknown"
-    status_resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id}, timeout=30)
+    status_resp = backend_client_user.get("/run/get", params={"run_id": run_id}, timeout=30)
     assert status_resp.is_success, status_resp.text
     assert status_resp.json()["status"] == "unknown"
-    assert "failed to communicate with gateway" in status_resp.json()["error"]
+    assert "internal cascade failure: GatewayNotRunning('Gateway is not running')" in status_resp.json()["error"]
 
-    start_resp = backend_client_with_auth.post("/gateway/start")
+    start_resp = backend_client_user.post("/gateway/start")
     assert start_resp.is_success, start_resp.text
 
-    # After the gateway restarts (fresh, empty), the job is unknown to it → "evicted from gateway"
+    # After the gateway restarts (fresh, empty), the sleeper job is unknown to it → "evicted from gateway"
     def poll_evicted() -> Any:
-        resp = backend_client_with_auth.get("/run/get", params={"run_id": run_id}, timeout=10)
+        resp = backend_client_user.get("/run/get", params={"run_id": run_id}, timeout=10)
         assert resp.is_success, resp.text
         return resp.json()
 
@@ -1016,18 +2048,30 @@ def test_gateway_restart_with_in_progress_job(backend_client_with_auth: httpx.Cl
 
     retry_until(poll_evicted, verify_evicted, attempts=30, sleep=1.0, error_msg=f"Run {run_id} never reached 'evicted from gateway'")
 
+    # The completed job's cached text output remains available, while its uncached binary output is lost.
+    restarted_simple_detail = backend_client_user.get("/run/get", params={"run_id": simple_run_id}).raise_for_status().json()
+    assert restarted_simple_detail["lost_task_ids"] == {simple_image_task_id: "Gateway Proc changed"}
+    assert restarted_simple_detail["outputs"]["outputs"][simple_sink_task_id]["is_available"] is True
+    assert restarted_simple_detail["outputs"]["outputs"][simple_image_task_id]["is_available"] is False
 
-def test_blueprint_artifact_execute(tmpdir: Any, backend_client_with_auth: httpx.Client) -> None:
+    # --- Step 4: verify the completed simple job's text output is still fetchable ---
+    # The gateway no longer holds the result, but it must be served from the local DB cache.
+    cached_content_resp = backend_client_user.get("/run/outputContent", params={"run_id": simple_run_id, "dataset_id": simple_sink_task_id})
+    assert cached_content_resp.is_success, cached_content_resp.text
+    assert cached_content_resp.content.decode("utf-8").startswith("file://")
+
+
+def test_blueprint_artifact_execute(tmpdir: Any, backend_client_user: httpx.Client) -> None:
     """Execute a blueprint whose source reads the size of a runtime-downloaded artifact checkpoint."""
     # Verify that the small checkpoint has not been downloaded yet
-    response = backend_client_with_auth.get("/artifacts/list_models").raise_for_status()
+    response = backend_client_user.get("/artifacts/list_models").raise_for_status()
     models = response.json()
     small_model = next(
         (
             m
             for m in models
             if m["composite_id"]["artifact_store_id"] == fake_artifact_store_id
-            and m["composite_id"]["ml_model_checkpoint_id"] == test_blueprint_artifact_id
+            and m["composite_id"]["artifact_local_id"] == test_blueprint_artifact_id
         ),
         None,
     )
@@ -1036,25 +2080,33 @@ def test_blueprint_artifact_execute(tmpdir: Any, backend_client_with_auth: httpx
 
     checkpoint_composite_id = f"{fake_artifact_store_id}:{test_blueprint_artifact_id}"
 
-    source_filesize = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("source_filesize")),
-        configuration_values={"checkpoint": checkpoint_composite_id},
-        input_ids={},
+    source_filesize = RoutableBlock(
+        instance_id=BlockInstanceId("source_filesize"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("source_filesize"),
+        instance=BlockInstance(
+            configuration_values=_config({"checkpoint": checkpoint_composite_id}),
+            input_ids={},
+        ),
     )
-    sink = BlockInstance(
-        factory_id=PluginBlockFactoryId(plugin=testPluginId, factory=BlockFactoryId("sink_file")),
-        configuration_values={"fname": f"{tmpdir}/filesize_${{runId}}.txt"},
-        input_ids={"data": BlockInstanceId("source_filesize")},
+    sink = RoutableBlock(
+        instance_id=BlockInstanceId("sink"),
+        plugin=testPluginId,
+        factory=BlockFactoryId("sink_file"),
+        instance=BlockInstance(
+            configuration_values=_config({"fname": f"{tmpdir}/filesize_${{runId}}.txt"}),
+            input_ids={"data": BlockInstanceId("source_filesize")},
+        ),
     )
     builder = BlueprintBuilder(
-        blocks={
-            BlockInstanceId("source_filesize"): source_filesize,
-            BlockInstanceId("sink_file"): sink,
-        }
+        blocks=[
+            source_filesize,
+            sink.model_copy(update={"instance_id": BlockInstanceId("sink_file")}),
+        ]
     )
 
     # Validate blueprint via expand
-    expand_resp = backend_client_with_auth.request(url="/blueprint/expand", method="put", json=builder.model_dump())
+    expand_resp = backend_client_user.request(url="/blueprint/expand", method="put", json=builder.model_dump())
     assert expand_resp.is_success, expand_resp.text
     block_errors = expand_resp.json().get("block_errors", {})
     assert not block_errors, f"Blueprint validation errors: {block_errors}"
@@ -1062,24 +2114,24 @@ def test_blueprint_artifact_execute(tmpdir: Any, backend_client_with_auth: httpx
     assert not global_errors, f"Blueprint global errors: {global_errors}"
 
     # Save and submit
-    save_resp = backend_client_with_auth.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
+    save_resp = backend_client_user.post("/blueprint/create", json=BlueprintSaveCommand(builder=builder).model_dump())
     assert save_resp.is_success, save_resp.text
     blueprint_id = save_resp.json()["blueprint_id"]
 
-    exec_resp = backend_client_with_auth.post("/run/create", json={"blueprint_id": blueprint_id})
+    exec_resp = backend_client_user.post("/run/create", json={"blueprint_id": blueprint_id})
     assert exec_resp.is_success, exec_resp.text
     run_id = RunCreateResponse(**exec_resp.json()).run_id
 
-    ensure_completed_v2(backend_client_with_auth, run_id, sleep=1, attempts=120)
+    ensure_completed_v2(backend_client_user, run_id, sleep=1, attempts=120)
 
     # Verify the artifact was downloaded during the run
-    models_after = backend_client_with_auth.get("/artifacts/list_models").raise_for_status().json()
+    models_after = backend_client_user.get("/artifacts/list_models").raise_for_status().json()
     downloaded = next(
         (
             m
             for m in models_after
             if m["composite_id"]["artifact_store_id"] == fake_artifact_store_id
-            and m["composite_id"]["ml_model_checkpoint_id"] == test_blueprint_artifact_id
+            and m["composite_id"]["artifact_local_id"] == test_blueprint_artifact_id
         ),
         None,
     )
@@ -1087,3 +2139,66 @@ def test_blueprint_artifact_execute(tmpdir: Any, backend_client_with_auth: httpx
 
     output = pathlib.Path(f"{tmpdir}/filesize_{run_id}.txt")
     assert output.read_text() == "64", f"Expected file size 64, got: {output.read_text()}"
+
+    # Verify compilation detail is accessible and has the expected number of tasks
+    detail_resp = backend_client_user.get("/run/getCompilationDetail", params={"run_id": run_id})
+    assert detail_resp.is_success, detail_resp.text
+    detail = CompilationDetailResponse.model_validate(detail_resp.json())
+    assert len(detail.tasks) == 2, f"Expected 2 tasks, got {len(detail.tasks)}: {detail.tasks}"
+
+    # Verify the artifact id resolves to its catalog display name
+    resolve_resp = backend_client_user.post(
+        "/blueprint/options/resolveDisplay",
+        json={"elements": [{"typeName": "artifact", "value": checkpoint_composite_id}]},
+    )
+    assert resolve_resp.is_success, resolve_resp.text
+    resolved = resolve_resp.json()["elements"]
+    assert len(resolved) == 1
+    assert resolved[0]["display"] == "Small Test Checkpoint"
+
+
+def test_plugin_disable_removes_templates_and_enable_restores(
+    backend_client_user: httpx.Client, backend_client_admin: httpx.Client
+) -> None:
+    """Disabling the plugin removes its templates from the blueprint list; re-enabling brings them back."""
+    from .conftest import testPluginId
+
+    def plugin_template_names() -> list[str]:
+        # NOTE filter by source, since earlier tests create enough blueprints to push templates off the first page
+        response = backend_client_user.get("/blueprint/list", params={"source": "plugin_template"}, timeout=10)
+        assert response.is_success, response.text
+        return [b.get("display_name") for b in response.json()["blueprints"]]
+
+    def wait_plugins_ok() -> None:
+        def do_action() -> dict:
+            resp = backend_client_user.get("/status", timeout=10)
+            assert resp.is_success
+            return resp.json()
+
+        def verify_ok(data: dict) -> dict | None:
+            return data if data.get("plugins") == "ok" else None
+
+        retry_until(do_action, verify_ok, attempts=30, sleep=1.0, error_msg="Plugins did not reach 'ok' status")
+
+    def set_enabled(enabled: bool) -> None:
+        response = backend_client_admin.post(
+            "/plugin/settings",
+            json={"pluginCompositeId": testPluginId.model_dump(), "isEnabled": enabled},
+            timeout=10,
+        )
+        assert response.status_code in (200, 202), f"Unexpected status from /plugin/settings: {response.status_code} {response.text}"
+        wait_plugins_ok()
+
+    assert "testBasic" in plugin_template_names()
+    try:
+        set_enabled(False)
+        assert plugin_template_names() == [], f"templates should be gone after disable, got: {plugin_template_names()}"
+    finally:
+        set_enabled(True)
+
+    def do_list() -> list[str]:
+        return plugin_template_names()
+
+    retry_until(
+        do_list, lambda names: names if "testBasic" in names else None, attempts=30, sleep=1.0, error_msg="templates did not return"
+    )

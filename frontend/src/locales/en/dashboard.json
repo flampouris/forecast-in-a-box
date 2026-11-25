@@ -2,144 +2,128 @@
   "welcome": {
     "title": "Welcome back, {{name}}",
     "titleAnonymous": "Welcome back",
+    "userFallback": "User",
     "stats": {
-      "systemStatus": "System Status",
+      "systemStatus": "System status",
       "checking": "Checking...",
       "loadingStatus": "Loading status",
       "allOk": "All OK",
       "operational": "Operational",
-      "partialOutage": "Partial Outage",
+      "partialOutage": "Partial outage",
       "someIssues": "Some services unavailable",
-      "systemDown": "System Down",
+      "systemDown": "System down",
       "notOperational": "Not operational",
       "currently": {
-        "running": "Currently Running",
-        "preparing": "Currently Preparing",
-        "submitted": "Currently Submitted"
+        "running": "Currently running",
+        "preparing": "Currently preparing",
+        "submitted": "Currently submitted"
       },
-      "activeForecasts": "Active forecasts",
-      "availableModels": "Available Models",
+      "activeForecasts": "Active runs",
+      "availableModels": "Available models",
       "of": "of {{total}}",
       "downloadedModels": "Downloaded models",
-      "totalForecasts": "Total Forecasts",
-      "thisMonth": "Executed this month",
-      "executionStatus": "Execution Status",
+      "totalForecasts": "Total runs",
+      "toDate": "Forecast runs to date",
+      "trendTitle": "This month against last month, counted over the {{window}} most recent runs",
+      "executionStatus": "Run status",
       "totalJobs": "Total",
-      "noActiveJobs": "No active jobs"
+      "noActiveJobs": "No active runs"
+    },
+    "activity": {
+      "title": "Run activity",
+      "summary_one": "{{count}} run in the last 6 months",
+      "summary_other": "{{count}} runs in the last 6 months",
+      "runCount_one": "{{count}} run",
+      "runCount_other": "{{count}} runs",
+      "windowCapped": "Counted over the {{shown}} most recent runs.",
+      "openRuns": "Open runs"
+    },
+    "models": {
+      "readyToUse": "Ready to use",
+      "incompatible": "Incompatible",
+      "notDownloaded": "Not downloaded",
+      "total": "Total models",
+      "manage": "Manage models"
     },
     "actions": {
-      "managePlugins": "Manage Plugins",
-      "manageSources": "Manage Sources",
-      "manageExecutions": "Manage Job Executions",
-      "myPresets": "Manage Configuration Presets",
-      "scheduledForecasts": "Manage Scheduled Forecasts"
+      "managePlugins": "Manage plugins",
+      "manageExecutions": "Manage runs",
+      "myPresets": "Manage workflows",
+      "scheduledForecasts": "Manage schedules"
     }
   },
   "community": {
-    "title": "Forecast-in-a-Box Community News",
-    "latestModels": "Latest Available Models",
-    "latestTopics": "Latest Forum Topics",
-    "new": "New",
-    "released": "Released {{time}}",
-    "postedBy": "Posted by {{author}} • {{time}}",
-    "viewRegistry": "View Model Registry",
-    "visitForum": "Visit Community Forum"
+    "title": "Forecast-in-a-Box community news",
+    "press": "Press and articles",
+    "materials": "Presentations and materials",
+    "softwareAndCommunity": "Software and community",
+    "unavailable": "The news list could not be loaded."
   },
   "gettingStarted": {
-    "title": "Getting Started Presets",
-    "subtitle": "Choose how to start your forecast configuration",
-    "quickStart": {
-      "title": "Quick Start",
-      "description": "Start with optimised defaults using the ECMWF plugin blocks and run immediately.",
-      "tags": {
-        "blocks": "4 Blocks",
-        "connected": "Pre-connected",
-        "ready": "Run Now"
-      }
-    },
-    "customForecast": {
-      "title": "Custom Forecast",
+    "title": "Workflow templates",
+    "subtitle": "Start from a ready-made workflow",
+    "recommended": "Recommended",
+    "startFromScratch": {
+      "title": "Start from scratch",
       "description": "Build a forecast from scratch with full control over every parameter.",
+      "drop": "Drop to open this workflow",
       "tags": {
-        "canvas": "Blank Canvas",
-        "control": "Full Control",
-        "advanced": "Advanced"
+        "canvas": "Blank canvas",
+        "control": "Full control"
       }
     },
-    "standard": {
-      "title": "Standard Forecast",
-      "description": "Balanced settings for typical weather forecasts with flexible configuration.",
-      "comingSoon": "Coming soon",
-      "tags": {
-        "model": "Choose Model",
-        "time": "120h",
-        "config": "Configurable"
-      }
+    "templates": {
+      "loading": "Loading templates",
+      "emptyTitle": "No workflow templates available",
+      "emptyDescription": "Install a plugin that ships templates, such as the ECMWF plugin, to see ready-made starting points.",
+      "managePlugins": "Manage plugins",
+      "errorTitle": "Couldn't load templates",
+      "errorDescription": "The template list is temporarily unavailable."
     },
-    "dataset": {
-      "title": "Dataset Forecast",
-      "description": "Start with pre-existing forecast data from ECMWF AIFS operational forecasts.",
-      "comingSoon": "Coming soon",
-      "tags": {
-        "data": "AIFS Data",
-        "source": "External Source",
-        "ready": "Ready to Use"
-      }
-    }
-  },
-  "journal": {
-    "title": "Forecast Journal",
-    "searchPlaceholder": "Search or add filters...",
-    "noResults": "No forecasts found matching your criteria.",
-    "loadMore": "Load more history",
-    "filters": {
-      "all": "All",
-      "running": "Running",
-      "completed": "Completed",
-      "failed": "Failed",
-      "bookmarked": "Bookmarked"
-    },
-    "item": {
-      "model": "Model: {{model}}",
-      "started": "Started: {{time}}",
-      "products": "{{count}} products",
-      "scheduled": "Scheduled",
-      "viewResults": "View Results",
-      "viewError": "View Error"
-    }
+    "viewAllTemplates": "View all templates",
+    "bookmarkHint": "Bookmark templates on the Workflows page to show them here first."
   },
   "presets": {
-    "title": "My Configuration Presets",
-    "subtitle": "Your saved forecast configurations",
-    "viewAll": "View all presets",
-    "load": "Use this Preset",
+    "title": "My workflows",
+    "subtitle": "Your saved workflows",
+    "viewAll": "View all workflows",
+    "load": "Use this Workflow",
     "delete": "Delete",
     "bookmark": "Bookmark",
     "rename": "Rename",
-    "renameTitle": "Rename Preset",
-    "renameDescription": "Update the title and comments for this preset.",
-    "searchPlaceholder": "Search presets...",
+    "renameTitle": "Rename workflow",
+    "renameDescription": "Update the title and comments for this workflow.",
+    "searchPlaceholder": "Search workflows...",
     "filters": {
       "all": "All",
-      "bookmarked": "Bookmarked"
+      "bookmarked": "Bookmarked",
+      "templates": "Templates"
     },
     "page": {
-      "title": "Configuration Presets",
-      "description": "Manage your saved forecast configurations"
+      "title": "Workflows",
+      "description": "Your saved workflows and plugin templates"
     },
     "empty": {
-      "title": "No saved presets yet",
-      "description": "Save a configuration from the Fable Builder to see it here.",
-      "filtered": "No presets match your search."
+      "title": "No saved workflows yet",
+      "description": "Save a workflow from Configure to see it here.",
+      "filtered": "No workflows match your search."
     },
     "pagination": {
       "previous": "Previous",
       "next": "Next",
       "page": "Page {{current}} of {{total}}"
-    }
-  },
-  "notification": {
-    "newModels": "New models and model versions have been published in the",
-    "registryLink": "ECMWF registry"
+    },
+    "templates": {
+      "chip": "Template",
+      "fromPlugin": "From plugin: {{plugin}}",
+      "use": "Use template",
+      "empty": {
+        "title": "No templates available",
+        "description": "Installed plugins can ship workflow templates as ready-made starting points."
+      }
+    },
+    "basedOn": "Based on: {{name}}",
+    "deleted": "Workflow deleted",
+    "removeBookmark": "Remove bookmark"
   }
 }

@@ -15,14 +15,14 @@
  * Covers page loading, status filtering, search, and detail navigation.
  */
 
-import { expect, test } from '@playwright/test'
+import { expect, test } from './fixtures'
 import type { Page } from '@playwright/test'
 
 async function navigateTo(page: Page, path: string) {
   await page.goto('/')
-  await page.waitForURL(/dashboard/, { timeout: 15000 })
+  await page.waitForURL(/overview/, { timeout: 15000 })
   await page.waitForLoadState('networkidle')
-  if (path !== '/dashboard') {
+  if (path !== '/overview') {
     await page.goto(path)
     await page.waitForURL(new RegExp(path.replace('/', '\\/')), {
       timeout: 10000,
@@ -34,16 +34,16 @@ async function navigateTo(page: Page, path: string) {
 
 test.describe('Executions List Page', () => {
   test.beforeEach(async ({ page }) => {
-    await navigateTo(page, '/executions')
+    await navigateTo(page, '/execute')
   })
 
   test('executions page loads with heading', async ({ page }) => {
-    const heading = page.getByRole('heading', { name: /executions/i })
+    const heading = page.getByRole('heading', { name: /^runs$/i })
     await expect(heading.first()).toBeVisible({ timeout: 10000 })
   })
 
   test('search input is visible', async ({ page }) => {
-    const searchInput = page.getByPlaceholder(/search executions/i)
+    const searchInput = page.getByPlaceholder(/search runs/i)
     if (await searchInput.isVisible({ timeout: 5000 }).catch(() => false)) {
       await expect(searchInput).toBeVisible()
     }
@@ -73,7 +73,7 @@ test.describe('Executions List Page', () => {
   })
 
   test('job items display when executions exist', async ({ page }) => {
-    // Look for job ID pills (font-mono spans starting with #)
+    // Job ID pills render the run_id in a font-mono span
     const jobPills = page.locator('.font-mono')
     if (
       await jobPills
@@ -88,7 +88,7 @@ test.describe('Executions List Page', () => {
 
   test('empty state shows when no executions', async ({ page }) => {
     // If no jobs exist, an empty message should appear
-    const emptyMessage = page.getByText(/haven't run any forecast/i)
+    const emptyMessage = page.getByText(/haven't run a forecast/i)
     const jobItems = page.locator('.font-mono')
 
     const hasJobs = await jobItems
@@ -106,7 +106,7 @@ test.describe('Executions List Page', () => {
 
 test.describe('Executions Status Filtering', () => {
   test.beforeEach(async ({ page }) => {
-    await navigateTo(page, '/executions')
+    await navigateTo(page, '/execute')
   })
 
   test('clicking a status filter updates the list', async ({ page }) => {
@@ -128,7 +128,7 @@ test.describe('Executions Status Filtering', () => {
   })
 
   test('search filters the list', async ({ page }) => {
-    const searchInput = page.getByPlaceholder(/search executions/i)
+    const searchInput = page.getByPlaceholder(/search runs/i)
     if (await searchInput.isVisible({ timeout: 5000 }).catch(() => false)) {
       await searchInput.fill('test')
       await page.waitForTimeout(500)
@@ -145,12 +145,12 @@ test.describe('Executions Status Filtering', () => {
 
 test.describe('Execution Detail Page', () => {
   test('navigates to detail page from list', async ({ page }) => {
-    await navigateTo(page, '/executions')
+    await navigateTo(page, '/execute')
 
     // Verify we're on the executions page
-    await expect(page).toHaveURL(/executions/)
+    await expect(page).toHaveURL(/execute/)
 
-    // Find a job detail link — use exact match to avoid "View Results" etc.
+    // Find a job detail link — use exact match to avoid "View results" etc.
     const viewLink = page.getByRole('link', { name: 'View', exact: true })
     const inspectLink = page.getByRole('link', {
       name: 'Inspect',
@@ -164,8 +164,8 @@ test.describe('Execution Detail Page', () => {
         .catch(() => false)
     ) {
       await viewLink.first().click()
-      await page.waitForURL(/executions\/[^/]+/, { timeout: 10000 })
-      await expect(page).toHaveURL(/executions\/[^/]+/)
+      await page.waitForURL(/execute\/[^/]+/, { timeout: 10000 })
+      await expect(page).toHaveURL(/execute\/[^/]+/)
     } else if (
       await inspectLink
         .first()
@@ -173,13 +173,13 @@ test.describe('Execution Detail Page', () => {
         .catch(() => false)
     ) {
       await inspectLink.first().click()
-      await page.waitForURL(/executions\/[^/]+/, { timeout: 10000 })
-      await expect(page).toHaveURL(/executions\/[^/]+/)
+      await page.waitForURL(/execute\/[^/]+/, { timeout: 10000 })
+      await expect(page).toHaveURL(/execute\/[^/]+/)
     }
   })
 
   test('detail page shows back link', async ({ page }) => {
-    await navigateTo(page, '/executions')
+    await navigateTo(page, '/execute')
 
     // Navigate to first available job
     const viewLink = page.getByText('View')
@@ -207,7 +207,7 @@ test.describe('Execution Detail Page', () => {
     await page.waitForTimeout(1000)
 
     // Back link should be visible
-    const backLink = page.getByText('Executions')
+    const backLink = page.getByText('Execute')
     if (
       await backLink
         .first()
@@ -219,7 +219,7 @@ test.describe('Execution Detail Page', () => {
   })
 
   test('detail page shows tab controls', async ({ page }) => {
-    await navigateTo(page, '/executions')
+    await navigateTo(page, '/execute')
 
     const viewLink = page.getByText('View')
     const inspectLink = page.getByText('Inspect')
@@ -262,7 +262,7 @@ test.describe('Execution Detail Page', () => {
   })
 
   test('back link navigates to executions list', async ({ page }) => {
-    await navigateTo(page, '/executions')
+    await navigateTo(page, '/execute')
 
     const viewLink = page.getByText('View')
     if (
@@ -276,7 +276,7 @@ test.describe('Execution Detail Page', () => {
       await page.waitForTimeout(1000)
 
       // Click back link
-      const backLink = page.getByRole('link', { name: /executions/i })
+      const backLink = page.getByRole('link', { name: /runs/i })
       if (
         await backLink
           .first()
@@ -286,8 +286,8 @@ test.describe('Execution Detail Page', () => {
         await backLink.first().click()
         await page.waitForLoadState('networkidle')
 
-        // Should be back on executions list
-        await expect(page).toHaveURL(/\/executions$/)
+        // Should be back on the executions list (the /execute route)
+        await expect(page).toHaveURL(/\/execute$/)
       }
     }
   })

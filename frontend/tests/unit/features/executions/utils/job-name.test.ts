@@ -8,19 +8,20 @@
  * does it submit to any jurisdiction.
  */
 
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import type {
   BlockFactoryCatalogue,
   FableBuilderV1,
 } from '@/api/types/fable.types'
 import { buildDefaultJobName } from '@/features/executions/utils/job-name'
+import { useUiStore } from '@/stores/uiStore'
 
 const CATALOGUE: BlockFactoryCatalogue = {
   'ecmwf/ecmwf-base': {
     factories: {
-      ekdSource: {
+      operationalForecastSource: {
         kind: 'source',
-        title: 'Earthkit Data Source',
+        title: 'Operational forecast source',
         description: '',
         configuration_options: {},
         inputs: [],
@@ -50,7 +51,7 @@ const CATALOGUE: BlockFactoryCatalogue = {
   },
 }
 
-const FIXED_NOW = new Date('2026-04-24T14:40:00')
+const FIXED_NOW = new Date('2026-04-24T14:40:00Z')
 const TIMESTAMP_LABEL = '2026-04-24 14:40'
 
 function source(factory: string): FableBuilderV1['blocks'][string] {
@@ -70,6 +71,10 @@ function sink(factory: string): FableBuilderV1['blocks'][string] {
 }
 
 describe('buildDefaultJobName', () => {
+  afterEach(() => {
+    useUiStore.getState().reset()
+  })
+
   it('falls back to "Run · <timestamp>" for an empty fable', () => {
     expect(
       buildDefaultJobName({
@@ -131,11 +136,11 @@ describe('buildDefaultJobName', () => {
   it('drops a missing sink gracefully', () => {
     expect(
       buildDefaultJobName({
-        fable: { blocks: { src_1: source('ekdSource') } },
+        fable: { blocks: { src_1: source('operationalForecastSource') } },
         catalogue: CATALOGUE,
         now: FIXED_NOW,
       }),
-    ).toBe(`Earthkit Data Source · ${TIMESTAMP_LABEL}`)
+    ).toBe(`Operational forecast source · ${TIMESTAMP_LABEL}`)
   })
 
   it('truncates very long names to 72 characters', () => {
@@ -148,5 +153,31 @@ describe('buildDefaultJobName', () => {
     })
     expect(result.length).toBeLessThanOrEqual(72)
     expect(result.endsWith('…')).toBe(true)
+  })
+
+  it('renders the run timestamp in the application timezone', () => {
+    useUiStore.setState({ timeZone: 'Europe/Berlin' })
+    // FIXED_NOW is 14:40 UTC, which is 16:40 CEST.
+    expect(
+      buildDefaultJobName({
+        fable: { blocks: {} },
+        catalogue: CATALOGUE,
+        now: FIXED_NOW,
+      }),
+    ).toBe('Run · 2026-04-24 16:40')
+  })
+
+  it('shows a datetime config value as its date in the application timezone', () => {
+    useUiStore.setState({ timeZone: 'Asia/Tokyo' })
+    const src = source('anemoiSource')
+    // 2025-12-01 23:30 UTC is 2025-12-02 08:30 in Tokyo (+9).
+    src.configuration_values = { base_time: '2025-12-01T23:30' }
+    expect(
+      buildDefaultJobName({
+        fable: { blocks: { src_1: src, snk_1: sink('zarrSink') } },
+        catalogue: CATALOGUE,
+        now: FIXED_NOW,
+      }),
+    ).toBe('Anemoi Source · Zarr Output · 2025-12-02')
   })
 })

@@ -1,0 +1,1071 @@
+# (C) Copyright 2026- ECMWF.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
+"""Unit tests for FableType and its subclasses."""
+
+import math
+from datetime import date, datetime, timedelta
+
+import pytest
+
+from fiab_core.types.definitions import (
+    BoundingBoxWSENType,
+    ClosedEnumType,
+    DatetimeType,
+    DateType,
+    FableType,
+    FloatType,
+    GeoDomainSingleType,
+    GeoDomainType,
+    GridType,
+    IntType,
+    ListType,
+    NoneType,
+    OpenEnumType,
+    StringType,
+    TimeDeltaType,
+    UnionType,
+)
+from fiab_core.types.exceptions import (
+    NotFableType,
+    NotNoneInput,
+    NotStringInput,
+    WrongType,
+)
+from fiab_core.types.parser import _parse, parse
+
+
+class TestStringType:
+    """Tests for StringType"""
+
+    def test_convert_valid_string(self) -> None:
+        t = StringType()
+        assert t.validate_convert("hello") == "hello"
+        assert t.validate_convert("") == ""
+        assert t.validate_convert("123") == "123"
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = StringType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(123)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(["hello"])
+
+
+class TestNoneType:
+    """Tests for NoneType"""
+
+    def test_convert_none(self) -> None:
+        assert NoneType().validate_convert(None) is None
+
+    def test_convert_non_none_raises_type_error(self) -> None:
+        t = NoneType()
+        with pytest.raises(NotNoneInput):
+            t.validate_convert("")
+        with pytest.raises(NotNoneInput):
+            t.validate_convert("None")
+        with pytest.raises(NotNoneInput):
+            t.validate_convert(123)
+
+    def test_serialize(self) -> None:
+        assert NoneType().serialize() == "none"
+
+    def test_parse_and_round_trip(self) -> None:
+        t = parse("none")
+        assert isinstance(t, NoneType)
+        assert t.serialize() == "none"
+
+
+class TestNullableUnion:
+    """Tests for unions containing NoneType"""
+
+    def test_convert_none_and_member(self) -> None:
+        t = parse("union[int,none]")
+        assert t.validate_convert("42") == 42
+        assert t.validate_convert(None) is None
+
+    def test_convert_invalid_string(self) -> None:
+        t = parse("union[int,none]")
+        with pytest.raises(WrongType):
+            t.validate_convert("not_an_int")
+
+    def test_serialize_round_trip(self) -> None:
+        assert parse("union[str,none]").serialize() == "union[str,none]"
+
+
+class TestIntType:
+    """Tests for IntType"""
+
+    def test_convert_valid_strings(self) -> None:
+        t = IntType()
+        assert t.validate_convert("42") == 42
+        assert t.validate_convert("-42") == -42
+        assert t.validate_convert("0") == 0
+
+    def test_convert_invalid_string_raises_value_error(self) -> None:
+        t = IntType()
+        with pytest.raises(WrongType):
+            t.validate_convert("not_an_int")
+        with pytest.raises(WrongType):
+            t.validate_convert("42.5")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = IntType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(42)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+
+class TestFloatType:
+    """Tests for FloatType"""
+
+    def test_convert_valid_strings(self) -> None:
+        t = FloatType()
+        assert t.validate_convert("42.5") == 42.5
+        assert t.validate_convert("-42.5") == -42.5
+        assert t.validate_convert("0.0") == 0.0
+        assert t.validate_convert("42") == 42.0
+
+    def test_convert_accepts_non_finite_without_trait(self) -> None:
+        t = FloatType()
+        assert math.isnan(t.validate_convert("nan"))
+        assert t.validate_convert("inf") == math.inf
+        assert t.validate_convert("-inf") == -math.inf
+
+    def test_convert_invalid_string_raises_value_error(self) -> None:
+        t = FloatType()
+        with pytest.raises(WrongType):
+            t.validate_convert("not_a_float")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = FloatType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(42.5)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+
+class TestDateType:
+    """Tests for DateType"""
+
+    def test_convert_valid_iso_date(self) -> None:
+        t = DateType()
+        result = t.validate_convert("2026-05-08")
+        assert result == date(2026, 5, 8)
+
+    def test_convert_invalid_format_raises_value_error(self) -> None:
+        t = DateType()
+        with pytest.raises(WrongType):
+            t.validate_convert("05/08/2026")
+        with pytest.raises(WrongType):
+            t.validate_convert("2026-05-08 10:30:00")
+        with pytest.raises(WrongType):
+            t.validate_convert("invalid_date")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = DateType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(date(2026, 5, 8))
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+
+class TestDatetimeType:
+    """Tests for DatetimeType"""
+
+    def test_convert_valid_iso_datetime(self) -> None:
+        t = DatetimeType()
+        result = t.validate_convert("2026-05-08T10:30:45")
+        assert result == datetime(2026, 5, 8, 10, 30, 45)
+
+    def test_convert_iso_datetime_with_microseconds(self) -> None:
+        t = DatetimeType()
+        result = t.validate_convert("2026-05-08T10:30:45.123456")
+        assert result == datetime(2026, 5, 8, 10, 30, 45, 123456)
+
+    def test_convert_iso_datetime_with_timezone(self) -> None:
+        t = DatetimeType()
+        result = t.validate_convert("2026-05-08T10:30:45+00:00")
+        assert result.year == 2026
+        assert result.month == 5
+        assert result.day == 8
+
+    def test_convert_invalid_format_raises_value_error(self) -> None:
+        t = DatetimeType()
+        with pytest.raises(WrongType):
+            t.validate_convert("2026-05-08")
+        with pytest.raises(WrongType):
+            t.validate_convert("invalid_datetime")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = DatetimeType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(datetime.now())
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+
+class TestTimeDeltaType:
+    """Tests for TimeDeltaType"""
+
+    def test_serialize(self) -> None:
+        assert TimeDeltaType().serialize() == "timedelta"
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("P1D", timedelta(days=1)),
+            ("P3D", timedelta(days=3)),
+            ("P1W", timedelta(weeks=1)),
+            ("P2W3D", timedelta(weeks=2, days=3)),
+            ("PT12H", timedelta(hours=12)),
+            ("PT30M", timedelta(minutes=30)),
+            ("PT45S", timedelta(seconds=45)),
+            ("PT1.5S", timedelta(seconds=1.5)),
+            ("P3DT12H", timedelta(days=3, hours=12)),
+            ("P3DT1M", timedelta(days=3, minutes=1)),
+            ("PT1H30M15S", timedelta(hours=1, minutes=30, seconds=15)),
+            ("P0D", timedelta(0)),
+        ],
+    )
+    def test_convert_valid_iso8601_with_p_prefix(self, value: str, expected: timedelta) -> None:
+        assert TimeDeltaType().validate_convert(value) == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("T12H", timedelta(hours=12)),
+            ("3DT1M", timedelta(days=3, minutes=1)),
+            ("1W", timedelta(weeks=1)),
+            ("3D", timedelta(days=3)),
+            ("T30M15S", timedelta(minutes=30, seconds=15)),
+        ],
+    )
+    def test_convert_valid_iso8601_without_p_prefix(self, value: str, expected: timedelta) -> None:
+        assert TimeDeltaType().validate_convert(value) == expected
+
+    def test_convert_empty_string_raises(self) -> None:
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("")
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("P")
+
+    def test_convert_no_components_raises(self) -> None:
+        # a bare 'T' (with or without the 'P') carries no actual duration
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("PT")
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("T")
+
+    def test_convert_unsupported_calendar_components_raises(self) -> None:
+        # years and months are deliberately unsupported: not a fixed duration
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("P1Y")
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("P1M")
+
+    def test_convert_garbage_raises(self) -> None:
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("not_a_duration")
+        with pytest.raises(WrongType):
+            TimeDeltaType().validate_convert("P3Dfoo")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = TimeDeltaType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(timedelta(days=1))
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+    def test_parse_and_round_trip(self) -> None:
+        t = parse("timedelta")
+        assert isinstance(t, TimeDeltaType)
+        assert t.validate_convert("P3DT12H") == timedelta(days=3, hours=12)
+        assert t.serialize() == "timedelta"
+
+
+class TestTimeDeltaCombinations:
+    """Tests combining TimeDeltaType with other types (list, union)."""
+
+    def test_list_of_timedelta(self) -> None:
+        t = parse("list[timedelta]")
+        assert isinstance(t, ListType)
+        assert isinstance(t.item_type, TimeDeltaType)
+        assert t.validate_convert("P1D,PT12H,T30M") == [
+            timedelta(days=1),
+            timedelta(hours=12),
+            timedelta(minutes=30),
+        ]
+
+    def test_union_timedelta_and_string(self) -> None:
+        t = parse("union[timedelta,str]")
+        assert isinstance(t, UnionType)
+        assert t.validate_convert("P1D") == timedelta(days=1)
+        assert t.validate_convert("hello") == "hello"
+
+    def test_union_timedelta_and_datetime(self) -> None:
+        t = parse("union[timedelta,datetime]")
+        assert isinstance(t, UnionType)
+        assert t.validate_convert("P1DT12H") == timedelta(days=1, hours=12)
+        assert t.validate_convert("2026-05-08T10:30:45") == datetime(2026, 5, 8, 10, 30, 45)
+
+    def test_union_datetime_and_timedelta(self) -> None:
+        t = parse("union[datetime,timedelta]")
+        assert isinstance(t, UnionType)
+        assert t.validate_convert("2026-05-08T10:30:45") == datetime(2026, 5, 8, 10, 30, 45)
+        assert t.validate_convert("P1DT12H") == timedelta(days=1, hours=12)
+
+    def test_serialize_round_trip(self) -> None:
+        assert parse("list[timedelta]").serialize() == "list[timedelta]"
+        assert parse("union[timedelta,str]").serialize() == "union[timedelta,str]"
+        assert parse("union[timedelta,datetime]").serialize() == "union[timedelta,datetime]"
+        assert parse("union[datetime,timedelta]").serialize() == "union[datetime,timedelta]"
+
+
+class TestClosedEnumType:
+    """Tests for ClosedEnumType"""
+
+    def test_serialize_quotes_items(self) -> None:
+        assert ClosedEnumType(["option1", "option2"]).serialize() == "enumClosed[str]('option1','option2')"
+
+    def test_convert_valid_enum_value(self) -> None:
+        t = ClosedEnumType(["option1", "option2", "option3"])
+        assert t.validate_convert("option1") == "option1"
+        assert t.validate_convert("option2") == "option2"
+
+    def test_convert_invalid_enum_value_raises_value_error(self) -> None:
+        t = ClosedEnumType(["option1", "option2"])
+        with pytest.raises(WrongType):
+            t.validate_convert("invalid_option")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = ClosedEnumType(["option1", "option2"])
+        with pytest.raises(NotStringInput):
+            t.validate_convert(123)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+    def test_enum_is_case_sensitive(self) -> None:
+        t = ClosedEnumType(["Option1", "Option2"])
+        assert t.validate_convert("Option1") == "Option1"
+        with pytest.raises(WrongType):
+            t.validate_convert("option1")
+
+    def test_int_subtype_converts_and_validates(self) -> None:
+        t = ClosedEnumType(["1", "2", "3"], subtype=IntType())
+        assert t.items == [1, 2, 3]
+        assert t.validate_convert("2") == 2
+        with pytest.raises(WrongType):
+            t.validate_convert("4")
+
+    def test_serialize_with_int_subtype(self) -> None:
+        t = ClosedEnumType(["1", "2"], subtype=IntType())
+        assert t.serialize() == "enumClosed[int](1,2)"
+
+
+class TestOpenEnumType:
+    """Tests for OpenEnumType"""
+
+    def test_serialize_quotes_items(self) -> None:
+        assert OpenEnumType(["option1", "option2"]).serialize() == "enumOpen[str]('option1','option2')"
+
+    def test_convert_any_string(self) -> None:
+        t = OpenEnumType(["option1", "option2"])
+        assert t.validate_convert("option1") == "option1"
+        assert t.validate_convert("any_value") == "any_value"
+        assert t.validate_convert("") == ""
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = OpenEnumType(["option1", "option2"])
+        with pytest.raises(NotStringInput):
+            t.validate_convert(123)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+    def test_int_subtype_converts(self) -> None:
+        t = OpenEnumType(["1", "2"], subtype=IntType())
+        assert t.items == [1, 2]
+        assert t.validate_convert("99") == 99
+
+    def test_serialize_with_int_subtype(self) -> None:
+        t = OpenEnumType(["1", "2"], subtype=IntType())
+        assert t.serialize() == "enumOpen[int](1,2)"
+
+
+class TestListType:
+    """Tests for ListType"""
+
+    def test_convert_valid_int_list(self) -> None:
+        t = ListType(IntType())
+        assert t.validate_convert("1,2,3") == [1, 2, 3]
+        assert t.validate_convert("42") == [42]
+
+    def test_convert_empty_string_to_empty_list(self) -> None:
+        t = ListType(IntType())
+        assert t.validate_convert("") == []
+
+    def test_convert_list_with_whitespace(self) -> None:
+        t = ListType(IntType())
+        assert t.validate_convert("1, 2, 3") == [1, 2, 3]
+        assert t.validate_convert(" 1 , 2 , 3 ") == [1, 2, 3]
+
+    def test_convert_list_with_invalid_item_raises_error(self) -> None:
+        t = ListType(IntType())
+        with pytest.raises(WrongType):
+            t.validate_convert("1,not_an_int,3")
+
+    def test_convert_list_of_strings(self) -> None:
+        t = ListType(StringType())
+        assert t.validate_convert("a,b,c") == ["a", "b", "c"]
+
+    def test_convert_list_of_floats(self) -> None:
+        t = ListType(FloatType())
+        assert t.validate_convert("1.5,2.5,3.5") == [1.5, 2.5, 3.5]
+
+    def test_convert_list_of_enum_values(self) -> None:
+        t = ListType(ClosedEnumType(["option1", "option2"]))
+        assert t.validate_convert("option1,option2,option1") == [
+            "option1",
+            "option2",
+            "option1",
+        ]
+        with pytest.raises(WrongType):
+            t.validate_convert("option1,invalid,option2")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = ListType(IntType())
+        with pytest.raises(NotStringInput):
+            t.validate_convert(["1", "2", "3"])
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+
+class TestGeoDomainType:
+    """GeoDomainType: comma-separated names, or a west,south,east,north integer bbox validated via BoundingBoxWSENType."""
+
+    def test_parses_as_a_list_type(self) -> None:
+        t = parse("geodomain")
+        assert isinstance(t, GeoDomainType)
+        assert isinstance(t, UnionType)
+
+    def test_serialize(self) -> None:
+        assert GeoDomainType().serialize() == "geodomain"
+        assert parse("geodomain").serialize() == "geodomain"
+
+    def test_convert_names(self) -> None:
+        assert GeoDomainType().validate_convert("Germany,France,Italy") == ["Germany", "France", "Italy"]
+
+    def test_convert_bbox(self) -> None:
+        # west,south,east,north
+        assert GeoDomainType().validate_convert("-10,35,30,60") == [-10, 35, 30, 60]
+
+    def test_bbox_crossing_antimeridian_is_valid(self) -> None:
+        # west > east is a valid box crossing the antimeridian
+        assert GeoDomainType().validate_convert("170,-10,-170,10") == [170, -10, -170, 10]
+
+    def test_numeric_float_resolves(self) -> None:
+        # a float bbox is valid,  we can resolve it to a list of four floats
+        assert GeoDomainType().validate_convert("-10.25,35.5,30,60") == [-10.25, 35.5, 30.0, 60.0]
+
+    def test_bbox_south_greater_than_north_raises(self) -> None:
+        with pytest.raises(WrongType, match="Cannot convert"):
+            GeoDomainType().validate_convert("-10,60,30,35")
+
+    def test_bbox_latitude_out_of_range_raises(self) -> None:
+        with pytest.raises(WrongType, match="Cannot convert"):
+            GeoDomainType().validate_convert("-10,-100,30,60")
+
+    def test_numeric_but_not_integer_bbox_raises(self) -> None:
+        # an almost-bbox must fail loudly instead of being resolved as four region names
+        with pytest.raises(WrongType, match="Cannot convert"):
+            GeoDomainType().validate_convert("nan,35,30,60")
+        with pytest.raises(WrongType, match="Cannot convert"):
+            GeoDomainType().validate_convert("-10,35,inf,60")
+
+    def test_four_non_numeric_tokens_are_names(self) -> None:
+        value = "Germany,France,Italy,Spain"
+        assert GeoDomainType().validate_convert(value) == ["Germany", "France", "Italy", "Spain"]
+
+    @pytest.mark.parametrize("value", ["auto", "global", "datadefined"])
+    def test_no_restriction_sentinel_alone_is_valid(self, value: str) -> None:
+        assert GeoDomainType().validate_convert(value) == value
+
+    @pytest.mark.parametrize("value", ["auto,Germany", "Germany,auto", "global,Europe"])
+    def test_no_restriction_sentinel_is_exclusive(self, value: str) -> None:
+        with pytest.raises(WrongType, match=r"Cannot convert.*to any of.*"):
+            GeoDomainType().validate_convert(value)
+
+    def test_convert_empty_string_to_empty_list(self) -> None:
+        assert GeoDomainType().validate_convert("") == []
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        with pytest.raises(NotStringInput):
+            GeoDomainType().validate_convert(["Germany"])
+
+
+class TestFableTypeParse:
+    """Tests for parse"""
+
+    def test_parse_atomic_types(self) -> None:
+        assert isinstance(parse("str"), StringType)
+        assert isinstance(parse("int"), IntType)
+        assert isinstance(parse("float"), FloatType)
+        assert isinstance(parse("date"), DateType)
+        assert isinstance(parse("datetime"), DatetimeType)
+        assert isinstance(parse("timedelta"), TimeDeltaType)
+
+    def test_parse_whitespace_handling(self) -> None:
+        assert isinstance(parse("  str  "), StringType)
+        assert isinstance(parse(" int "), IntType)
+
+    def test_parse_closed_enum(self) -> None:
+        t = parse("enumClosed[str](option1,option2,option3)")
+        assert isinstance(t, ClosedEnumType)
+        assert t.serialize() == "enumClosed[str]('option1','option2','option3')"
+        assert t.validate_convert("option1") == "option1"
+        with pytest.raises(WrongType):
+            t.validate_convert("invalid")
+
+    def test_parse_open_enum(self) -> None:
+        t = parse("enumOpen[str](option1,option2)")
+        assert isinstance(t, OpenEnumType)
+        assert t.serialize() == "enumOpen[str]('option1','option2')"
+        assert t.validate_convert("any_value") == "any_value"
+
+    def test_parse_closed_enum_with_int_subtype(self) -> None:
+        t = parse("enumClosed[int](1,2,3)")
+        assert isinstance(t, ClosedEnumType)
+        assert isinstance(t.subtype, IntType)
+        assert t.items == [1, 2, 3]
+        assert t.serialize() == "enumClosed[int](1,2,3)"
+        assert t.validate_convert("2") == 2
+        with pytest.raises(WrongType):
+            t.validate_convert("4")
+
+    def test_parse_open_enum_with_int_subtype(self) -> None:
+        t = parse("enumOpen[int](1,2)")
+        assert isinstance(t, OpenEnumType)
+        assert t.items == [1, 2]
+        assert t.validate_convert("99") == 99
+
+    def test_parse_enum_missing_parens_raises_error(self) -> None:
+        with pytest.raises(ValueError):
+            parse("enumClosed[int]")
+
+    def test_parse_list_of_int(self) -> None:
+        t = parse("list[int]")
+        assert isinstance(t, ListType)
+        assert t.validate_convert("1,2,3") == [1, 2, 3]
+
+    def test_parse_list_of_string(self) -> None:
+        t = parse("list[str]")
+        assert isinstance(t, ListType)
+        assert t.validate_convert("a,b,c") == ["a", "b", "c"]
+
+    def test_parse_list_of_enum(self) -> None:
+        t = parse("list[enumClosed[str](a,b)]")
+        assert isinstance(t, ListType)
+        assert isinstance(t.item_type, ClosedEnumType)
+        assert t.validate_convert("a,b,a") == ["a", "b", "a"]
+        assert t.serialize() == "list[enumClosed[str]('a','b')]"
+
+    def test_parse_nested_list_now_supported(self) -> None:
+        t = parse("list[list[int]]")
+        assert isinstance(t, ListType)
+        assert isinstance(t.item_type, ListType)
+        # outer comma-split means each inner list gets one element
+        assert t.validate_convert("1,2,3") == [[1], [2], [3]]
+
+    def test_parse_invalid_type_raises_error(self) -> None:
+        with pytest.raises(ValueError):
+            parse("invalid_type")
+        with pytest.raises(ValueError, match="Unexpected trailing content"):
+            parse("string")
+
+    def test_parse_empty_enum_raises_error(self) -> None:
+        with pytest.raises(ValueError):
+            parse("enumClosed[str]()")
+        with pytest.raises(ValueError):
+            parse("enumOpen[str]()")
+
+    def test_parse_list_with_whitespace(self) -> None:
+        t = parse("list[ int ]")
+        assert isinstance(t, ListType)
+
+    def test_parse_enum_with_whitespace(self) -> None:
+        t = parse("enumClosed[str]( a , b , c )")
+        assert isinstance(t, ClosedEnumType)
+        assert t.validate_convert("a") == "a"
+
+    def test_parse_enum_with_quoted_items(self) -> None:
+        t = parse("enumClosed[str]('a', 'b', 'c')")
+        assert isinstance(t, ClosedEnumType)
+        assert t.serialize() == "enumClosed[str]('a','b','c')"
+        assert t.validate_convert("b") == "b"
+
+
+class TestValidateConvertIntegration:
+    """Integration tests for validate_convert with various types"""
+
+    def test_round_trip_conversion(self) -> None:
+        cases = [
+            ("str", "hello world", "hello world"),
+            ("int", "42", 42),
+            ("float", "3.14", 3.14),
+            ("date", "2026-05-08", date(2026, 5, 8)),
+            ("datetime", "2026-05-08T10:30:45", datetime(2026, 5, 8, 10, 30, 45)),
+            ("enumClosed[str](a,b,c)", "b", "b"),
+            ("enumOpen[str](x,y)", "any_value", "any_value"),
+            ("list[int]", "1,2,3", [1, 2, 3]),
+            ("list[str]", "a,b,c", ["a", "b", "c"]),
+        ]
+
+        for type_expr, input_val, expected in cases:
+            fable_type = parse(type_expr)
+            result = fable_type.validate_convert(input_val)
+            assert result == expected, f"Failed for {type_expr}"
+
+    def test_error_propagation(self) -> None:
+        """Test that type errors and value errors propagate correctly"""
+        t = parse("list[int]")
+        with pytest.raises(WrongType):
+            t.validate_convert("1,not_int,3")
+
+        with pytest.raises(NotStringInput):
+            t.validate_convert(123)
+
+
+class TestGeoDomainSingleType:
+    """Tests for GeoDomainSingleType"""
+
+    def test_convert_valid_string(self) -> None:
+        t = GeoDomainSingleType()
+        assert t.validate_convert("France") == "France"
+        assert t.validate_convert("GB") == "GB"
+        assert t.validate_convert("") == ""
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = GeoDomainSingleType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert(123)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+    def test_convert_unrestricted_raises_wrong_type(self) -> None:
+        t = GeoDomainSingleType()
+        with pytest.raises(WrongType):
+            t.validate_convert("auto")
+
+    def test_serialize(self) -> None:
+        assert GeoDomainSingleType().serialize() == "geodomainSingle"
+
+    def test_parse_and_round_trip(self) -> None:
+        t = parse("geodomainSingle")
+        assert isinstance(t, GeoDomainSingleType)
+        assert t.validate_convert("Germany") == "Germany"
+        assert t.serialize() == "geodomainSingle"
+
+
+class TestBoundingBoxWSENType:
+    """Tests for BoundingBoxWSENType"""
+
+    def test_convert_valid_bbox(self) -> None:
+        t = BoundingBoxWSENType()
+        assert t.validate_convert("-10,40,30,70") == [-10, 40, 30, 70]
+        assert t.validate_convert("0,0,0,0") == [0, 0, 0, 0]
+
+    def test_convert_wrong_element_count_raises_error(self) -> None:
+        t = BoundingBoxWSENType()
+        with pytest.raises(WrongType):
+            t.validate_convert("1,2,3")
+        with pytest.raises(WrongType):
+            t.validate_convert("1,2,3,4,5")
+        with pytest.raises(WrongType):
+            t.validate_convert("")
+
+    def test_convert_float_elements(self) -> None:
+        t = BoundingBoxWSENType()
+        assert t.validate_convert("-10.5,40.2,30.1,70.9") == [-10.5, 40.2, 30.1, 70.9]
+
+    def test_convert_non_numeric_elements_raises_error(self) -> None:
+        t = BoundingBoxWSENType()
+        with pytest.raises(WrongType):
+            t.validate_convert("a,b,c,d")
+
+    @pytest.mark.parametrize("value", ["nan,0,10,10", "0,0,inf,10", "-inf,0,10,10", "0,0,10,nan", "0,0,10,inf"])
+    def test_convert_non_finite_elements_raises_error(self, value: str) -> None:
+        t = BoundingBoxWSENType()
+        with pytest.raises(WrongType):
+            t.validate_convert(value)
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = BoundingBoxWSENType()
+        with pytest.raises(NotStringInput):
+            t.validate_convert([1, 2, 3, 4])
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+    def test_serialize(self) -> None:
+        assert BoundingBoxWSENType().serialize() == "bboxWSEN"
+
+    def test_parse_and_round_trip(self) -> None:
+        t = parse("bboxWSEN")
+        assert isinstance(t, BoundingBoxWSENType)
+        assert t.validate_convert("10,20,30,40") == [10, 20, 30, 40]
+        assert t.serialize() == "bboxWSEN"
+
+    def test_list_of_bbox_now_supported(self) -> None:
+        t = parse("list[bboxWSEN]")
+        assert isinstance(t, ListType)
+        assert isinstance(t.item_type, BoundingBoxWSENType)
+        # list[bboxWSEN] always fails at validate_convert: outer comma-split leaves
+        # single-element slots that cannot satisfy bbox's 4-element requirement
+        with pytest.raises(WrongType):
+            t.validate_convert("1,2,3,4")
+
+
+class TestUnionType:
+    """Tests for UnionType"""
+
+    def test_convert_greedy_first_match(self) -> None:
+        t = UnionType([IntType(), FloatType()])
+        assert t.validate_convert("42") == 42
+        assert isinstance(t.validate_convert("42"), int)
+
+    def test_convert_falls_through_to_second_type(self) -> None:
+        t = UnionType([IntType(), FloatType()])
+        assert t.validate_convert("3.14") == 3.14
+
+    def test_convert_all_fail_raises_error(self) -> None:
+        t = UnionType([IntType(), FloatType()])
+        with pytest.raises(WrongType):
+            t.validate_convert("not_a_number")
+
+    def test_convert_non_string_raises_type_error(self) -> None:
+        t = UnionType([IntType(), StringType()])
+        with pytest.raises(NotStringInput):
+            t.validate_convert(42)
+        with pytest.raises(NotStringInput):
+            t.validate_convert(None)
+
+    def test_serialize(self) -> None:
+        t = UnionType([IntType(), StringType()])
+        assert t.serialize() == "union[int,str]"
+
+    def test_serialize_multi_type(self) -> None:
+        t = UnionType([IntType(), FloatType(), DateType()])
+        assert t.serialize() == "union[int,float,date]"
+
+    def test_parse_and_round_trip(self) -> None:
+        t = parse("union[int,str]")
+        assert isinstance(t, UnionType)
+        assert len(t.types) == 2
+        assert isinstance(t.types[0], IntType)
+        assert isinstance(t.types[1], StringType)
+        assert t.serialize() == "union[int,str]"
+
+    def test_parse_union_with_date_and_datetime(self) -> None:
+        t = parse("union[date,datetime]")
+        assert isinstance(t, UnionType)
+        assert t.validate_convert("2026-05-08T10:30:45") == datetime(2026, 5, 8, 10, 30, 45)
+
+    def test_parse_union_with_country(self) -> None:
+        t = parse("union[int,geodomainSingle]")
+        assert isinstance(t, UnionType)
+        assert t.validate_convert("42") == 42
+        assert t.validate_convert("France") == "France"
+
+    def test_parse_empty_union_raises_error(self) -> None:
+        with pytest.raises(ValueError):
+            parse("union[]")
+
+    def test_parse_union_of_unions_now_supported(self) -> None:
+        t = parse("union[union[int,str],float]")
+        assert isinstance(t, UnionType)
+        assert isinstance(t.types[0], UnionType)
+        assert isinstance(t.types[1], FloatType)
+        assert t.validate_convert("42") == 42
+
+    def test_parse_union_with_list_now_supported(self) -> None:
+        t = parse("union[list[int],str]")
+        assert isinstance(t, UnionType)
+        assert isinstance(t.types[0], ListType)
+        assert t.validate_convert("1,2,3") == [1, 2, 3]
+        assert t.validate_convert("hello") == "hello"
+
+    def test_parse_union_with_bbox_now_supported(self) -> None:
+        t = parse("union[bboxWSEN,str]")
+        assert isinstance(t, UnionType)
+        assert isinstance(t.types[0], BoundingBoxWSENType)
+        assert t.validate_convert("1,2,3,4") == [1, 2, 3, 4]
+        assert t.validate_convert("hello") == "hello"
+
+    def test_parse_list_of_union_now_supported(self) -> None:
+        t = parse("list[union[int,str]]")
+        assert isinstance(t, ListType)
+        assert isinstance(t.item_type, UnionType)
+        assert t.validate_convert("42,hello,3") == [42, "hello", 3]
+
+    def test_parse_union_of_lists(self) -> None:
+        t = parse("union[list[int],list[float]]")
+        assert isinstance(t, UnionType)
+        assert t.validate_convert("1,2,3") == [1, 2, 3]
+        assert t.validate_convert("1.5,2.5") == [1.5, 2.5]
+
+    def test_parse_union_with_enum(self) -> None:
+        t = parse("union[enumClosed[str](a,b),str]")
+        assert isinstance(t, UnionType)
+        assert isinstance(t.types[0], ClosedEnumType)
+        assert t.validate_convert("a") == "a"
+        assert t.validate_convert("anything") == "anything"
+
+    def test_parse_union_with_whitespace(self) -> None:
+        t = parse("union[ int , str ]")
+        assert isinstance(t, UnionType)
+        assert isinstance(t.types[0], IntType)
+        assert isinstance(t.types[1], StringType)
+
+
+class TestFableTypeParseRemainder:
+    """Tests for the remainder returned by the internal parser."""
+
+    def test_atomic_type_returns_remainder(self) -> None:
+        t, remainder = _parse("int,str")
+        assert isinstance(t, IntType)
+        assert remainder == ",str"
+
+    def test_list_type_returns_remainder(self) -> None:
+        t, remainder = _parse("list[int],more")
+        assert isinstance(t, ListType)
+        assert remainder == ",more"
+
+    def test_enum_type_returns_remainder(self) -> None:
+        t, remainder = _parse("enumClosed[str](a,b),extra")
+        assert isinstance(t, ClosedEnumType)
+        assert remainder == ",extra"
+
+    def test_union_type_returns_remainder(self) -> None:
+        t, remainder = _parse("union[int,str],extra")
+        assert isinstance(t, UnionType)
+        assert remainder == ",extra"
+
+    def test_nested_brackets_in_list_parsed_correctly(self) -> None:
+        t, remainder = _parse("list[enumClosed[str](a,b)]suffix")
+        assert isinstance(t, ListType)
+        assert isinstance(t.item_type, ClosedEnumType)
+        assert remainder == "suffix"
+
+    def test_unmatched_bracket_in_list_raises_error(self) -> None:
+        with pytest.raises(NotFableType):
+            _parse("list[int")
+
+    def test_unmatched_bracket_in_union_raises_error(self) -> None:
+        with pytest.raises(NotFableType):
+            _parse("union[int,str")
+
+    def test_unmatched_bracket_in_enum_raises_error(self) -> None:
+        with pytest.raises(NotFableType):
+            _parse("enumClosed[a,b")
+
+    def test_union_with_enum_member(self) -> None:
+        t, remainder = _parse("union[enumClosed[str](x,y),int]")
+        assert isinstance(t, UnionType)
+        assert remainder == ""
+        assert isinstance(t.types[0], ClosedEnumType)
+        assert isinstance(t.types[1], IntType)
+        assert t.validate_convert("x") == "x"
+        assert t.validate_convert("42") == 42
+
+    def test_extra_content_in_list_raises_error(self) -> None:
+        with pytest.raises(NotFableType):
+            _parse("list[int garbage]")
+
+
+class TestGridType:
+    """GridType: union over named Gaussian grid (e.g. 'N320', 'F320', 'O96'), single positive
+    resolution, and a two-element [west_east, south_north] pair of resolutions."""
+
+    def test_serialize(self) -> None:
+        assert GridType().serialize() == "grid"
+
+    @pytest.mark.parametrize("value", ["N320", "O96", "F80", "N32", "O1280", "O8000", "F8000"])
+    def test_convert_named_gaussian_grid(self, value: str) -> None:
+        assert GridType().validate_convert(value) == value
+
+    @pytest.mark.parametrize(("value", "expected"), [("n320", "N320"), ("o96", "O96"), ("n1280", "N1280"), ("o48", "O48"), ("f80", "F80")])
+    def test_gaussian_grid_name_is_converted_to_upper_case(self, value: str, expected: str) -> None:
+        assert GridType().validate_convert(value) == expected
+
+    @pytest.mark.parametrize("value", ["N0", "O0", "n0", "N1", "O100", "F90", "N1281", "O2560", "O8001", "O100000"])
+    def test_gaussian_grid_number_not_listed_raises(self, value: str) -> None:
+        with pytest.raises(WrongType, match="must be one of 32, 48, .*, 1280, 8000"):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["O096", "N00320", "o01"])
+    def test_gaussian_grid_number_with_leading_zeros_raises(self, value: str) -> None:
+        with pytest.raises(WrongType, match="leading zeros"):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["O\u0663\u0662", "N\u00b2"])
+    def test_gaussian_grid_number_with_non_ascii_digits_raises(self, value: str) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["0.1", 0.1, "0.1/0.1", [0.1, 0.1], "0.25/0.1", 1e-1])
+    def test_finest_resolution_is_accepted(self, value: object) -> None:
+        GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["0.099", "0.05", "0.01", 0.01, 0.099, "0.25/0.01", "0.01/0.25", [0.25, 0.01], [0.01, 0.25], "1e-5"])
+    def test_resolution_finer_than_minimum_raises(self, value: object) -> None:
+        with pytest.raises(WrongType, match="finer than the minimum of 0.1 degrees"):
+            GridType().validate_convert(value)
+
+    def test_value_to_str_is_canonical_and_converts_back(self) -> None:
+        grid_type = GridType()
+        for text, expected in [
+            ("auto", "auto"),
+            ("n320", "N320"),
+            ("0.25", "0.25"),
+            ("1", "1"),
+            ("1.0", "1"),
+            ("0.1", "0.1"),
+            ("0.25/0.5", "0.25/0.5"),
+            ("1/2", "1/2"),
+            ("0.5/1.0", "0.5/1"),
+        ]:
+            converted = grid_type.validate_convert(text)
+            assert GridType.value_to_str(converted) == expected
+            assert grid_type.validate_convert(expected) == converted
+
+    def test_convert_string_single_resolution(self) -> None:
+        assert GridType().validate_convert("0.25") == 0.25
+        assert GridType().validate_convert("1") == 1.0
+
+    def test_convert_string_slash_pair_resolution(self) -> None:
+        assert GridType().validate_convert("0.25/0.5") == [0.25, 0.5]
+        assert GridType().validate_convert("1/2") == [1.0, 2.0]
+
+    def test_convert_list_pair_resolution(self) -> None:
+        assert GridType().validate_convert([0.25, 0.5]) == [0.25, 0.5]
+        assert GridType().validate_convert([1, 2]) == [1, 2]
+
+    def test_convert_numeric_single_resolution(self) -> None:
+        assert GridType().validate_convert(0.25) == 0.25
+        assert GridType().validate_convert(1) == 1
+
+    def test_auto_sentinel_returns_none(self) -> None:
+        assert GridType().validate_convert("auto") is None
+
+    @pytest.mark.parametrize("value", ["X320", "N", "N-1", "Nabc", "grid", "AUTO", "auto,N320"])
+    def test_invalid_named_grid_string_raises(self, value: str) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["0", "-0.25", "0.25/-0.5", "0.25/x", "abc"])
+    def test_invalid_string_resolution_raises(self, value: str) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", [[0.25], [0.25, 0.5, 0.75], [0.25, -0.5], [-0.25, 0.5], [0.25, "x"]])
+    def test_invalid_list_resolution_raises(self, value: list) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", [0, -1, -0.25])
+    def test_non_positive_numeric_raises(self, value: float) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["inf", "-inf", "nan", "infinity", "1e999", "inf/1", "1/inf", "nan/nan", "0.25/nan"])
+    def test_non_finite_string_resolution_raises(self, value: str) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", [math.inf, -math.inf, math.nan])
+    def test_non_finite_numeric_raises(self, value: float) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", [[math.inf, 1.0], [1.0, math.nan]])
+    def test_non_finite_list_resolution_raises(self, value: list) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", ["1/2/3", "0.25/0.5/1", "1//2", "1/", "/1", "/"])
+    def test_wrong_number_of_string_parts_raises(self, value: str) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    @pytest.mark.parametrize("value", [True, False, [True, 1.0], [1.0, False]])
+    def test_bool_raises(self, value: object) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    def test_string_pair_keeps_west_east_first(self) -> None:
+        assert GridType().validate_convert("0.5/1") == [0.5, 1.0]
+
+    @pytest.mark.parametrize("value", [None, {"grid": "N320"}, (0.25, 0.5)])
+    def test_unsupported_type_raises(self, value: object) -> None:
+        with pytest.raises(WrongType):
+            GridType().validate_convert(value)
+
+    def test_parse_and_round_trip(self) -> None:
+        t = parse("grid")
+        assert isinstance(t, GridType)
+        assert t.validate_convert("N320") == "N320"
+        assert t.validate_convert("0.25/0.5") == [0.25, 0.5]
+        assert t.serialize() == "grid"
+
+
+class TestGridEnum:
+    """enumOpen[grid]: suggestions of grids with free entry allowed."""
+
+    TERM = "enumOpen[grid](auto,0.25,0.5,1,O96,O320,N320)"
+
+    def test_parse_and_serialize_round_trip(self) -> None:
+        t = parse(self.TERM)
+        assert isinstance(t, OpenEnumType)
+        assert isinstance(t.subtype, GridType)
+        assert t.serialize() == self.TERM
+        assert parse(t.serialize()).serialize() == self.TERM
+
+    def test_items_are_converted_by_the_grid_type(self) -> None:
+        t = parse(self.TERM)
+        assert isinstance(t, OpenEnumType)
+        assert t.items == [None, 0.25, 0.5, 1.0, "O96", "O320", "N320"]
+
+    def test_items_with_pairs_and_lower_case_names_serialize_canonically(self) -> None:
+        t = parse("enumOpen[grid](auto,0.5/1.0,n320)")
+        assert t.serialize() == "enumOpen[grid](auto,0.5/1,N320)"
+
+    def test_suggestions_are_converted(self) -> None:
+        t = parse(self.TERM)
+        assert t.validate_convert("auto") is None
+        assert t.validate_convert("0.25") == 0.25
+        assert t.validate_convert("1") == 1.0
+        assert t.validate_convert("O96") == "O96"
+
+    def test_free_entries_are_converted(self) -> None:
+        t = parse(self.TERM)
+        assert t.validate_convert("0.1") == 0.1
+        assert t.validate_convert("0.25/0.5") == [0.25, 0.5]
+        assert t.validate_convert("n1280") == "N1280"
+        assert t.validate_convert("O48") == "O48"
+
+    @pytest.mark.parametrize("value", ["0.01", "O0", "O100", "N1281", "abc", "1/2/3", "inf", ""])
+    def test_invalid_free_entries_are_rejected(self, value: str) -> None:
+        with pytest.raises(WrongType):
+            parse(self.TERM).validate_convert(value)
+
+    def test_invalid_item_is_rejected_at_parse_time(self) -> None:
+        with pytest.raises(WrongType):
+            parse("enumOpen[grid](auto,0.001)")

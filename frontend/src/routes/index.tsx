@@ -10,6 +10,7 @@
 
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useEffect } from 'react'
+import { useTranslation } from 'react-i18next'
 import { P } from '@/components/base/typography'
 import { FiabStackSection } from '@/features/landing/components/FiabStackSection.tsx'
 import { IntroGlobeSection } from '@/features/landing/components/IntroGlobeSection.tsx'
@@ -27,13 +28,14 @@ export const Route = createFileRoute('/')({
 })
 
 function Index() {
+  const { t } = useTranslation('common')
   const { isAuthenticated, isLoading } = useAuth()
   const navigate = useNavigate()
 
-  // Redirect authenticated users to dashboard
+  // Redirect authenticated users to the overview
   useEffect(() => {
     if (!isLoading && isAuthenticated) {
-      log.info('User is authenticated, redirecting to dashboard')
+      log.info('User is authenticated, redirecting to overview')
 
       // Check for stored redirect (validate to prevent open redirect attacks)
       const storedRedirect = localStorage.getItem(STORAGE_KEYS.auth.redirectUrl)
@@ -41,15 +43,17 @@ function Index() {
 
       if (storedRedirect && isValidInternalRedirect(storedRedirect)) {
         log.info('Redirecting to stored location:', storedRedirect)
-        navigate({ to: storedRedirect })
+        // replace: drop the landing page from history so Back does not
+        // re-trigger this redirect (history trap).
+        navigate({ to: storedRedirect, replace: true })
         return
       }
       if (storedRedirect) {
         log.warn('Invalid redirect URL blocked:', storedRedirect)
       }
 
-      log.info('Redirecting to /dashboard')
-      navigate({ to: '/dashboard' })
+      log.info('Redirecting to /overview')
+      navigate({ to: '/overview', replace: true })
     }
   }, [isLoading, isAuthenticated, navigate])
 
@@ -62,7 +66,7 @@ function Index() {
           <div className="mb-4">
             <div className="inline-block h-8 w-8 animate-spin rounded-full border-4 border-solid border-current border-r-transparent motion-reduce:animate-[spin_1.5s_linear_infinite]" />
           </div>
-          <P className="text-muted-foreground">Loading...</P>
+          <P className="text-muted-foreground">{t('loading')}</P>
         </div>
       </div>
     )

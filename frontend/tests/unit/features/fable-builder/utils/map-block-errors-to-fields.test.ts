@@ -9,86 +9,92 @@
  */
 
 import { describe, expect, it } from 'vitest'
+import type { FieldErrorMessages } from '@/features/fable-builder/utils/map-block-errors-to-fields'
 import { mapBlockErrorsToFields } from '@/features/fable-builder/utils/map-block-errors-to-fields'
 
+const messages: FieldErrorMessages = {
+  unknownConfigKey: 'Unknown configuration key',
+  missingRequiredValue: 'Missing required value',
+  unknownGlyph: (name) => `Unknown glyph: \${${name}}`,
+  jinjaReservedReference: (name) => `Reserved jinja name: ${name}`,
+}
+
 describe('mapBlockErrorsToFields', () => {
-  it('returns empty result for empty errors', () => {
-    const result = mapBlockErrorsToFields([], { foo: 'bar' })
-    expect(result).toEqual({ byConfigKey: {}, unmapped: [] })
-  })
-
-  describe('Unknown glyphs referenced', () => {
-    it('attaches unknown glyph to matching config key', () => {
-      const result = mapBlockErrorsToFields(
-        ["Unknown glyphs referenced: {'runtd'}"],
-        { expver: '${runtd}', date: '2026-04-15' },
-      )
-      expect(result.byConfigKey).toEqual({
-        expver: ['Unknown glyph: ${runtd}'],
-      })
-      expect(result.unmapped).toEqual([])
-    })
-
-    it('attaches to every config key that references an unknown glyph', () => {
-      const result = mapBlockErrorsToFields(
-        ["Unknown glyphs referenced: {'foo'}"],
-        { a: 'prefix-${foo}', b: '${foo}-suffix', c: 'plain' },
-      )
-      expect(result.byConfigKey).toEqual({
-        a: ['Unknown glyph: ${foo}'],
-        b: ['Unknown glyph: ${foo}'],
-      })
-    })
-
-    it('handles multiple unknown glyphs in one error', () => {
-      const result = mapBlockErrorsToFields(
-        ["Unknown glyphs referenced: {'foo', 'bar'}"],
-        { a: '${foo}', b: '${bar}', c: '${foo}-${bar}' },
-      )
-      expect(result.byConfigKey).toEqual({
-        a: ['Unknown glyph: ${foo}'],
-        b: ['Unknown glyph: ${bar}'],
-        c: ['Unknown glyph: ${foo}', 'Unknown glyph: ${bar}'],
-      })
-    })
-
-    it('falls back to unmapped when no config value references the unknown glyph', () => {
-      const result = mapBlockErrorsToFields(
-        ["Unknown glyphs referenced: {'ghost'}"],
-        { expver: '${runId}' },
-      )
-      expect(result.byConfigKey).toEqual({})
-      expect(result.unmapped).toEqual(["Unknown glyphs referenced: {'ghost'}"])
-    })
-
-    it('falls back to unmapped when the set literal is malformed', () => {
-      const result = mapBlockErrorsToFields(
-        ['Unknown glyphs referenced: not-a-set'],
-        { expver: '${runtd}' },
-      )
-      expect(result.unmapped).toEqual(['Unknown glyphs referenced: not-a-set'])
+  it('returns empty result for empty inputs', () => {
+    const result = mapBlockErrorsToFields([], {}, messages)
+    expect(result).toEqual({
+      byConfigKey: {},
+      unmapped: [],
+      invalidGlyphNames: [],
     })
   })
 
   describe('Block contains extra / missing config', () => {
-    it('attaches "Unknown configuration key" for extra config', () => {
+    it('attaches the unknownConfigKey message for extra config', () => {
       const result = mapBlockErrorsToFields(
         ["Block contains extra config: {'orphan'}"],
         {},
+        messages,
       )
       expect(result.byConfigKey).toEqual({
         orphan: ['Unknown configuration key'],
       })
     })
 
-    it('attaches "Missing required value" for missing config', () => {
+    it('attaches the missingRequiredValue message for missing config', () => {
       const result = mapBlockErrorsToFields(
         ["Block contains missing config: {'needed', 'also_needed'}"],
         {},
+        messages,
       )
       expect(result.byConfigKey).toEqual({
         needed: ['Missing required value'],
         also_needed: ['Missing required value'],
+      })
+    })
+
+    it('falls back to unmapped when the set literal is malformed', () => {
+      const result = mapBlockErrorsToFields(
+        ['Block contains missing config: not-a-set'],
+        {},
+        messages,
+      )
+      expect(result.unmapped).toEqual([
+        'Block contains missing config: not-a-set',
+      ])
+    })
+  })
+
+  describe('Missing glyphs (structured)', () => {
+    it('attaches an unknown-glyph message per (configKey, glyphName) entry', () => {
+      const result = mapBlockErrorsToFields([], { expver: ['runtd'] }, messages)
+      expect(result.byConfigKey).toEqual({
+        expver: ['Unknown glyph: ${runtd}'],
+      })
+      expect(result.unmapped).toEqual([])
+    })
+
+    it('handles multiple glyphs on the same option and multiple options', () => {
+      const result = mapBlockErrorsToFields(
+        [],
+        {
+          fname: ['missingRoot'],
+          suffix: ['missingRoot', 'env'],
+        },
+        messages,
+      )
+      expect(result.byConfigKey).toEqual({
+        fname: ['Unknown glyph: ${missingRoot}'],
+        suffix: ['Unknown glyph: ${missingRoot}', 'Unknown glyph: ${env}'],
+      })
+    })
+
+    it('treats an empty missingGlyphs map as a no-op', () => {
+      const result = mapBlockErrorsToFields([], {}, messages)
+      expect(result).toEqual({
+        byConfigKey: {},
+        unmapped: [],
+        invalidGlyphNames: [],
       })
     })
   })
@@ -96,7 +102,8 @@ describe('mapBlockErrorsToFields', () => {
   it('passes through unrecognised errors as unmapped', () => {
     const result = mapBlockErrorsToFields(
       ['Plugin not found', 'BlockFactory not found in the catalogue'],
-      { expver: '${runId}' },
+      {},
+      messages,
     )
     expect(result.byConfigKey).toEqual({})
     expect(result.unmapped).toEqual([
@@ -105,19 +112,213 @@ describe('mapBlockErrorsToFields', () => {
     ])
   })
 
-  it('mixes mapped and unmapped in a single call', () => {
+  describe('root-cause dedup for unresolvable glyphs', () => {
+    it('maps a lone "Configuration option ... is missing" to the field', () => {
+      const result = mapBlockErrorsToFields(
+        ["Configuration option 'path' is missing for block factory 'gribSink'"],
+        {},
+        messages,
+      )
+      expect(result.byConfigKey).toEqual({
+        path: ['Missing required value'],
+      })
+      expect(result.unmapped).toEqual([])
+    })
+
+    it('maps "Configuration option ... cannot be empty" to the field', () => {
+      const result = mapBlockErrorsToFields(
+        ["Configuration option 'param' cannot be empty"],
+        {},
+        messages,
+      )
+      expect(result.byConfigKey).toEqual({
+        param: ['Missing required value'],
+      })
+      expect(result.unmapped).toEqual([])
+    })
+
+    it('reports the same message on a field once', () => {
+      const result = mapBlockErrorsToFields(
+        [
+          "Block contains missing config: {'param'}",
+          "Configuration option 'param' cannot be empty",
+        ],
+        {},
+        messages,
+      )
+      expect(result.byConfigKey).toEqual({
+        param: ['Missing required value'],
+      })
+    })
+
+    it('drops "Configuration option ... is missing" when the key has an unknown glyph', () => {
+      const result = mapBlockErrorsToFields(
+        ["Configuration option 'path' is missing for block factory 'gribSink'"],
+        { path: ['dataRoot'] },
+        messages,
+      )
+      expect(result.byConfigKey).toEqual({
+        path: ['Unknown glyph: ${dataRoot}'],
+      })
+      expect(result.unmapped).toEqual([])
+    })
+
+    it('drops the missing-config set entry when the key has an unknown glyph', () => {
+      const result = mapBlockErrorsToFields(
+        ["Block contains missing config: {'path', 'format'}"],
+        { path: ['dataRoot'] },
+        messages,
+      )
+      expect(result.byConfigKey).toEqual({
+        path: ['Unknown glyph: ${dataRoot}'],
+        format: ['Missing required value'],
+      })
+    })
+  })
+
+  it('combines parsed errors, structured missing glyphs, and unmapped errors', () => {
     const result = mapBlockErrorsToFields(
-      [
-        "Unknown glyphs referenced: {'runtd'}",
-        'Plugin not found',
-        "Block contains missing config: {'date'}",
-      ],
-      { expver: '${runtd}' },
+      ["Block contains missing config: {'date'}", 'Plugin not found'],
+      { expver: ['runtd'] },
+      messages,
     )
     expect(result.byConfigKey).toEqual({
-      expver: ['Unknown glyph: ${runtd}'],
       date: ['Missing required value'],
+      expver: ['Unknown glyph: ${runtd}'],
     })
     expect(result.unmapped).toEqual(['Plugin not found'])
+  })
+
+  it('uses the provided messages object verbatim (caller-supplied i18n)', () => {
+    const localized: FieldErrorMessages = {
+      unknownConfigKey: 'Schlüssel unbekannt',
+      missingRequiredValue: 'Wert fehlt',
+      unknownGlyph: (name) => `Unbekannter Glyph: ${name}`,
+      jinjaReservedReference: (name) => `Reservierter Name: ${name}`,
+    }
+    const result = mapBlockErrorsToFields(
+      ["Block contains missing config: {'date'}"],
+      { expver: ['runtd'] },
+      localized,
+    )
+    expect(result.byConfigKey).toEqual({
+      date: ['Wert fehlt'],
+      expver: ['Unbekannter Glyph: runtd'],
+    })
+  })
+
+  describe('invalid configuration values', () => {
+    it('attributes the verbatim error to the named key', () => {
+      const error =
+        "Invalid value for configuration option 'format': expected enumClosed[str]('png','pdf','svg'). 'x' is not a valid option. Valid options are: png, pdf, svg"
+      const result = mapBlockErrorsToFields([error], {}, messages, {})
+      expect(result.byConfigKey).toEqual({ format: [error] })
+      expect(result.unmapped).toEqual([])
+    })
+  })
+
+  describe('invalid glyph names', () => {
+    // #630 rewrites a filter/intrinsic clash into this, naming its options.
+    const error =
+      "Invalid glyph name: format (due to clashes with jinja keyword 'format'); appears in [format, path]"
+
+    it('attributes the verbatim error to every option it names', () => {
+      const result = mapBlockErrorsToFields([error], {}, messages, {})
+      expect(result.byConfigKey).toEqual({ format: [error], path: [error] })
+      expect(result.unmapped).toEqual([])
+    })
+
+    it('handles a single option', () => {
+      const single =
+        "Invalid glyph name: runId (due to clashes with intrinsic glyph 'runId'); appears in [path]"
+      const result = mapBlockErrorsToFields([single], {}, messages, {})
+      expect(result.byConfigKey).toEqual({ path: [single] })
+    })
+
+    it('reports the rejected name so it cannot be offered for definition', () => {
+      const result = mapBlockErrorsToFields([error], {}, messages, {})
+      expect(result.invalidGlyphNames).toEqual(['format'])
+    })
+
+    it('suppresses the unknown-glyph message for a rejected name', () => {
+      // The backend still lists it as missing (#630 does not strip it yet).
+      const result = mapBlockErrorsToFields(
+        [error],
+        { format: ['format'] },
+        messages,
+        {},
+      )
+      expect(result.byConfigKey.format).toEqual([error])
+    })
+
+    it('stays unmapped when it names no option', () => {
+      const empty = 'Invalid glyph name: x (due to y); appears in []'
+      const result = mapBlockErrorsToFields([empty], {}, messages, {})
+      expect(result.byConfigKey).toEqual({})
+      expect(result.unmapped).toEqual([empty])
+    })
+  })
+
+  describe('jinja expression errors', () => {
+    const error = "Jinja expression error: 'format' is undefined"
+
+    it('attributes the verbatim error to keys whose value uses the glyph', () => {
+      const result = mapBlockErrorsToFields([error], {}, messages, {
+        format: '${format}',
+        domain: 'global',
+      })
+      expect(result.byConfigKey).toEqual({ format: [error] })
+      expect(result.unmapped).toEqual([])
+    })
+
+    it('attributes to every key referencing the glyph inside an expression', () => {
+      const result = mapBlockErrorsToFields([error], {}, messages, {
+        path: '${outputRoot}/x.${format}',
+        format: '${format | upper}',
+      })
+      expect(result.byConfigKey).toEqual({
+        path: [error],
+        format: [error],
+      })
+    })
+
+    it('stays unmapped when no configuration value uses the glyph', () => {
+      const result = mapBlockErrorsToFields([error], {}, messages, {
+        domain: 'global',
+      })
+      expect(result.byConfigKey).toEqual({})
+      expect(result.unmapped).toEqual([error])
+    })
+
+    it('does not match the bare name outside a ${...} expression', () => {
+      const result = mapBlockErrorsToFields([error], {}, messages, {
+        note: 'output format is png',
+      })
+      expect(result.unmapped).toEqual([error])
+    })
+
+    it('swaps in the reserved-name message when the name is jinja-reserved', () => {
+      const result = mapBlockErrorsToFields(
+        [error],
+        {},
+        messages,
+        { format: '${format}' },
+        (name) => name === 'format',
+      )
+      expect(result.byConfigKey).toEqual({
+        format: ['Reserved jinja name: format'],
+      })
+    })
+
+    it('uses the reserved-name message even when unattributed', () => {
+      const result = mapBlockErrorsToFields(
+        [error],
+        {},
+        messages,
+        {},
+        (name) => name === 'format',
+      )
+      expect(result.unmapped).toEqual(['Reserved jinja name: format'])
+    })
   })
 })

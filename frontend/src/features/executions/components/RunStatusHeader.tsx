@@ -1,0 +1,418 @@
+/*
+ * (C) Copyright 2026- ECMWF and individual contributors.
+ *
+ * This software is licensed under the terms of the Apache Licence Version 2.0
+ * which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+ * In applying this licence, ECMWF does not waive the privileges and immunities
+ * granted to it by virtue of its status as an intergovernmental organisation nor
+ * does it submit to any jurisdiction.
+ */
+
+/** Status header: name, badge, elapsed timer, progress bar, action menu. */
+
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import {
+  CircleStop,
+  Loader2,
+  MoreVertical,
+  Pencil,
+  RotateCcw,
+  Settings2,
+  Trash2,
+} from 'lucide-react'
+import type { ReactNode } from 'react'
+import type { JobStatus } from '@/api/types/job.types'
+import { isStoppableStatus, isTerminalStatus } from '@/api/types/job.types'
+import { useServerTime } from '@/api/hooks/useSchedules'
+import { formatInZoneWithOffset, useAppTimeZone } from '@/lib/datetime'
+import {
+  getStatusBadgeClasses,
+  getStatusBarColor,
+} from '@/features/executions/utils/job-status'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { H1, P } from '@/components/base/typography'
+import { cn } from '@/lib/utils'
+
+interface RunStatusHeaderProps {
+  jobId: string
+  name: string
+  description?: string
+  status: JobStatus
+  progress: string
+  createdAt: string | null
+  /** Last status change; for a stopped run, when it stopped. */
+  updatedAt?: string | null
+  onRestart: () => void
+  onStop: () => void
+  onDelete: () => void
+  /** Open the fable's source configuration in the builder. */
+  onEditConfig?: () => void
+  /** Open the run-metadata edit dialog (name, description, tags). */
+  onEditMetadata?: () => void
+  isRestartPending: boolean
+  isStopPending: boolean
+  isDeletePending: boolean
+  /** Subtext hidden when planned is null/undefined/empty. */
+  completedBlockCount?: number | null
+  plannedBlockCount?: number | null
+  /** Shown after the run id, e.g. the attempt history. */
+  idLineExtra?: ReactNode
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.floor(ms / 1000)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`
+  }
+  return `${minutes}m ${seconds}s`
+}
+
+/** Live-only: null for terminal runs — now−createdAt is not their duration. */
+function useElapsedTime(createdAt: string | null, isTerminal: boolean) {
+  const { serverTimeToLocal } = useServerTime()
+  const [elapsed, setElapsed] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (!createdAt || isTerminal) {
+      setElapsed(null)
+      return
+    }
+
+    const startTime = serverTimeToLocal(createdAt).getTime()
+
+    const update = () => setElapsed(Date.now() - startTime)
+    update()
+
+    const interval = setInterval(update, 1000)
+    return () => clearInterval(interval)
+  }, [createdAt, isTerminal, serverTimeToLocal])
+
+  return elapsed
+}
+
+function RestartDialog({
+  onRestart,
+  isRestartPending,
+}: {
+  onRestart: () => void
+  isRestartPending: boolean
+}) {
+  const { t } = useTranslation('executions')
+  const [open, setOpen] = useState(false)
+
+  return (
+    <AlertDialog open={open} onOpenChange={setOpen}>
+      <AlertDialogTrigger
+        render={
+          <Button variant="outline" size="sm" disabled={isRestartPending}>
+            <RotateCcw className="mr-1.5 h-4 w-4" />
+            {t('actions.restart')}
+          </Button>
+        }
+      />
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{t('actions.restartJob')}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {t('actions.confirmRestart')}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>{t('submit.cancel')}</AlertDialogCancel>
+          <AlertDialogAction
+            onClick={() => {
+              onRestart()
+              setOpen(false)
+            }}
+          >
+            {t('actions.restart')}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+function StopDialog({
+  onStop,
+  isStopPending,
+}: {
+  onStop: () => void
+  isStopPending: boolean
+}) {
+  const { t } = useTranslation('executions')
+  const [open, setOpen] = useState(false)
+
+  return (
+    <AlertDialog open={open} onOpenChange={setOpen}>
+      <AlertDialogTrigger
+        render={
+          <Button variant="outline" size="sm" disabled={isStopPending}>
+            <CircleStop className="mr-1.5 h-4 w-4" />
+            {t('actions.stop')}
+          </Button>
+        }
+      />
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>{t('actions.stopJob')}</AlertDialogTitle>
+          <AlertDialogDescription>
+            {t('actions.confirmStop')}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>{t('actions.keepRunning')}</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            onClick={() => {
+              onStop()
+              setOpen(false)
+            }}
+          >
+            {t('actions.stopRun')}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+export function RunStatusHeader({
+  jobId,
+  name,
+  description,
+  status,
+  progress,
+  createdAt,
+  updatedAt,
+  onRestart,
+  onStop,
+  onDelete,
+  onEditConfig,
+  onEditMetadata,
+  isRestartPending,
+  isStopPending,
+  isDeletePending,
+  completedBlockCount,
+  plannedBlockCount,
+  idLineExtra,
+}: RunStatusHeaderProps) {
+  const { t } = useTranslation(['executions', 'journal'])
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const terminal = isTerminalStatus(status)
+  const elapsed = useElapsedTime(createdAt, terminal)
+  const timeZone = useAppTimeZone()
+  const { serverTimeToLocal } = useServerTime()
+  const startedAt =
+    terminal && createdAt
+      ? formatInZoneWithOffset(
+          serverTimeToLocal(createdAt),
+          timeZone,
+          'yyyy-MM-dd HH:mm',
+        )
+      : null
+
+  const stoppedAt =
+    status === 'stopped' && updatedAt
+      ? formatInZoneWithOffset(
+          serverTimeToLocal(updatedAt),
+          timeZone,
+          'yyyy-MM-dd HH:mm',
+        )
+      : null
+
+  const progressPercent = parseFloat(progress) || 0
+  const showBlockCount =
+    typeof plannedBlockCount === 'number' &&
+    plannedBlockCount > 0 &&
+    typeof completedBlockCount === 'number'
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <H1 className="text-2xl">{name}</H1>
+            {onEditMetadata && (
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-6 w-6"
+                onClick={onEditMetadata}
+                aria-label={t('journal:item.editMetadata')}
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </Button>
+            )}
+          </div>
+          {description && (
+            <P className="line-clamp-2 text-muted-foreground">{description}</P>
+          )}
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3">
+            <P className="truncate text-muted-foreground">{jobId}</P>
+            {idLineExtra}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <span
+            className={cn(
+              'rounded-full px-2.5 py-0.5 text-sm font-medium',
+              getStatusBadgeClasses(status),
+              status === 'stopping' && 'animate-pulse',
+            )}
+          >
+            {t(`status.${status}`)}
+          </span>
+
+          {startedAt !== null ? (
+            <span className="text-sm text-muted-foreground">
+              {t('detail.startedAt', { date: startedAt })}
+            </span>
+          ) : (
+            elapsed !== null && (
+              <span className="text-sm text-muted-foreground">
+                {formatElapsed(elapsed)}
+              </span>
+            )
+          )}
+
+          {showBlockCount && (
+            <span className="text-sm text-muted-foreground">
+              {t('progress.blocksComplete', {
+                completed: completedBlockCount,
+                total: plannedBlockCount,
+              })}
+            </span>
+          )}
+
+          {isStoppableStatus(status) && (
+            <StopDialog onStop={onStop} isStopPending={isStopPending} />
+          )}
+
+          {status === 'stopping' && (
+            <Button variant="outline" size="sm" disabled>
+              <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+              {t('actions.stopping')}
+            </Button>
+          )}
+
+          {terminal && (
+            <RestartDialog
+              onRestart={onRestart}
+              isRestartPending={isRestartPending}
+            />
+          )}
+
+          {/* Surfaced as a button where there's room; in the menu otherwise. */}
+          {onEditConfig && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onEditConfig}
+              className="hidden lg:inline-flex"
+            >
+              <Settings2 className="mr-1.5 h-4 w-4" />
+              {t('actions.editConfiguration')}
+            </Button>
+          )}
+
+          <DropdownMenu>
+            {/* Active runs keep only Edit workflow, itself a button at lg+. */}
+            <DropdownMenuTrigger
+              render={
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label={t('journal:item.moreOptions')}
+                  className={cn(
+                    !terminal && (onEditConfig ? 'lg:hidden' : 'hidden'),
+                  )}
+                />
+              }
+            >
+              <MoreVertical className="h-5 w-5" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-auto min-w-fit">
+              {/* Hidden at lg+, where it is shown as a button instead. */}
+              {onEditConfig && (
+                <DropdownMenuItem
+                  onClick={onEditConfig}
+                  className="whitespace-nowrap lg:hidden"
+                >
+                  <Settings2 className="mr-2 h-4 w-4" />
+                  {t('actions.editConfiguration')}
+                </DropdownMenuItem>
+              )}
+              {/* Only finished runs can be deleted; active ones are stopped. */}
+              {terminal && (
+                <DropdownMenuItem
+                  variant="destructive"
+                  disabled={isDeletePending}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  <Trash2 className="mr-2 h-4 w-4" />
+                  {t('actions.delete')}
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>{t('actions.deleteJob')}</AlertDialogTitle>
+                <AlertDialogDescription>
+                  {t('actions.confirmDelete')}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>{t('submit.cancel')}</AlertDialogCancel>
+                <AlertDialogAction variant="destructive" onClick={onDelete}>
+                  {t('actions.delete')}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </div>
+      </div>
+
+      {stoppedAt !== null && (
+        <P className="text-sm text-muted-foreground">
+          {t('detail.stoppedNotice', { date: stoppedAt })}
+        </P>
+      )}
+
+      <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
+        <div
+          className={cn(
+            'h-full rounded-full transition-all duration-300',
+            getStatusBarColor(status),
+          )}
+          style={{ width: `${Math.min(progressPercent, 100)}%` }}
+        />
+      </div>
+    </div>
+  )
+}

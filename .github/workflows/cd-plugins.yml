@@ -1,0 +1,98 @@
+name: CD for plugins (demo+ecmwf)
+
+# Releases fiab-plugin-ecmwf and fiab-plugin-demo.
+#
+# It pushes a new tag pX.Y.Z.0, either provided on input, or derived from
+# the git repo as the highest existing tag + 0.0.1.
+# It builds and then tests the two wheels in isolation, each versioned X.Y.Z,
+# then pushes to PyPI.
+# The fiab-core version used for testing is taken to be cX.?.?, ie, the major
+# version is matching, others don't matter.
+# The fiab-core requirements constraints are >=X,<X+1.
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Explicit tag. Use pX.Y.Z, make sure its free on pypi
+        type: string
+        required: false
+      testpypi:
+        description: Whether to upload to testpypi instead of pypi.
+        type: boolean
+        required: false
+        default: false
+
+
+jobs:
+  buildupload:
+    name: "Build and upload"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: astral-sh/setup-uv@v7
+      - uses: extractions/setup-just@v3
+      - run: |
+          # NOTE dont use action checkout, doesnt coop with auth
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          git clone -b $BRANCH --single-branch https://$GH_USER:$GH_TOKEN@github.com/ecmwf/forecast-in-a-box.git .
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://$GH_USER:$GH_TOKEN@github.com/ecmwf/forecast-in-a-box.git
+          git fetch --tags origin # NOTE dont use with: fetch-tags: true, the clone is still shallow
+
+          source scripts/cicd/scripts.sh
+          setupBash "${{ inputs.testpypi }}" 
+          REPO_ROOT=$(pwd)
+
+          TAG_PREF="p"
+          TAG=$(tagFromInputOrLatest "${{ inputs.tag }}" $TAG_PREF)
+
+          preparePythonWheelVersion $TAG
+          TAG_FIABCORE=$(extractFiabCoreTag "$TAG")
+          TAG_FIABCORE_MAJ=$(majorFromVersion "$TAG_FIABCORE")
+          TAG_MAJ=$(majorFromVersion "$TAG")
+
+          cd backend/packages
+          mkdir packagesDist
+
+          pushd fiab-plugin-ecmwf
+          patchFiabCoreDep "$TAG_FIABCORE_MAJ"
+          patchFallbackVersion "$TAG_MAJ"
+          git add pyproject.toml
+          source $REPO_ROOT/scripts/cicd/prepareBuildVenv.sh
+          uv pip install "fiab-core==${TAG_FIABCORE}"
+          just build
+          source $REPO_ROOT/scripts/cicd/tearDownVenv.sh
+          whl=$(ls dist/*whl)
+          source $REPO_ROOT/scripts/cicd/prepareValVenv.sh "$whl"[runtime]
+          just test
+          source $REPO_ROOT/scripts/cicd/tearDownVenv.sh
+          mv dist/* ../packagesDist
+          popd
+
+          pushd fiab-plugin-demo
+          patchFiabCoreDep "$TAG_FIABCORE_MAJ"
+          patchFallbackVersion "$TAG_MAJ"
+          git add pyproject.toml
+          source $REPO_ROOT/scripts/cicd/prepareBuildVenv.sh
+          uv pip install "fiab-core==${TAG_FIABCORE}"
+          just build
+          source $REPO_ROOT/scripts/cicd/tearDownVenv.sh
+          source $REPO_ROOT/scripts/cicd/prepareValVenv.sh dist/*whl
+          just test
+          source $REPO_ROOT/scripts/cicd/tearDownVenv.sh
+          mv dist/* ../packagesDist
+          popd
+
+          uploadPypi "${{ inputs.testpypi }}" 'packagesDist/*'
+          git commit -m "Plugin Release $TAG" --allow-empty # NOTE we allow empty because the FIABCORE_MAJ possibly didnt change
+          git push
+          gitTagAndPush "${{ inputs.testpypi }}" $TAG
+
+        env:
+          TWINE_PASSWORD_PROD: ${{ secrets.PYPI_API_TOKEN }}
+          TWINE_PASSWORD_TEST: ${{ secrets.PYPI_TEST_API_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_REPO_READ_TOKEN }} # says read but actually is write -- and we need that
+          GH_USER: deploy

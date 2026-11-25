@@ -11,10 +11,12 @@
 Base definitions pertaining to artifacts such as ml model checkpoints
 """
 
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from fiab_core.artifacts import CompositeArtifactId, MlModelCheckpoint, MlModelCheckpointId, Platform
+from fiab_core.artifacts import ArtifactResolved, CompositeArtifactId, Platform
 from pyrsistent.typing import PMap
 
 
@@ -27,7 +29,10 @@ class MlModelOverview:
     display_author: str
     disk_size_bytes: int
     supported_platforms: list[Platform]
+    tags: dict[str, str | None]
     is_available: bool
+    is_locally_compatible: bool
+    local_compatibility_detail: str | None
 
 
 @dataclass(frozen=True, eq=True, slots=True)
@@ -42,26 +47,34 @@ class MlModelDetail:
     disk_size_bytes: int
     pip_package_constraints: list[str]
     supported_platforms: list[Platform]
-    output_characteristics: list[str]
+    tags: dict[str, str | None]
+    input_qube: dict[str, Any]
+    output_qube: dict[str, Any]
     input_characteristics: list[str]
     is_available: bool
+    is_locally_compatible: bool
+    local_compatibility_detail: str | None
 
 
-ArtifactCatalog = PMap[CompositeArtifactId, MlModelCheckpoint]
+ArtifactCatalog = PMap[CompositeArtifactId, ArtifactResolved]
 
 artifacts_subdir = "artifacts"
 
 
-def get_artifact_local_path(composite_id: CompositeArtifactId, data_dir: Path) -> Path:
+def get_artifact_local_path(composite_id: CompositeArtifactId, data_dir_url: str) -> Path:
     """Get the local filesystem path for an artifact file, raising ValueError if the composite ID contains invalid path characters.
-    The Path is not checked for existence, only for validity (ie invalid chars)"""
+    The Path is not checked for existence, only for validity (ie invalid chars). For remote paths (ssh:// scheme), resolves
+    from the PoV of the remote host."""
     store_id = composite_id.artifact_store_id
-    checkpoint_id = composite_id.ml_model_checkpoint_id
+    artifact_local_id = composite_id.artifact_local_id
 
     invalid_chars = {"..", "/", "\\", "\0"}
-    if any(char in store_id for char in invalid_chars) or any(char in checkpoint_id for char in invalid_chars):
+    if any(char in store_id for char in invalid_chars) or any(char in artifact_local_id for char in invalid_chars):
         raise ValueError(f"Invalid characters in artifact ID: {composite_id}")
 
-    artifact_path = data_dir / artifacts_subdir / store_id / checkpoint_id
+    parsed = urllib.parse.urlparse(data_dir_url)
+    data_dir = Path(parsed.path)
+
+    artifact_path = data_dir / artifacts_subdir / store_id / artifact_local_id
 
     return artifact_path
